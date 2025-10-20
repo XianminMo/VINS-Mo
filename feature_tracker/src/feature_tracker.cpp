@@ -33,6 +33,8 @@ FeatureTracker::FeatureTracker()
 {
 }
 
+// 根据跟踪次数排序 → 优先处理高质量点 → 每保留一个点就在它周围画个圈（禁区）→ 
+// 后续点如果落在圈里就被跳过 → 最终实现‘质量优先 + 空间均匀
 void FeatureTracker::setMask()
 {
     if(FISHEYE)
@@ -129,15 +131,15 @@ void FeatureTracker::readImage(const cv::Mat &_img, double _cur_time)
 
     if (PUB_THIS_FRAME)
     {
-        rejectWithF();
+        rejectWithF(); // 用基础矩阵F剔除误匹配
         ROS_DEBUG("set mask begins");
         TicToc t_m;
-        setMask();
+        setMask(); // 在已有特征点周围画“禁区”
         ROS_DEBUG("set mask costs %fms", t_m.toc());
 
         ROS_DEBUG("detect feature begins");
         TicToc t_t;
-        int n_max_cnt = MAX_CNT - static_cast<int>(forw_pts.size());
+        int n_max_cnt = MAX_CNT - static_cast<int>(forw_pts.size()); // 计算还需要多少个点
         if (n_max_cnt > 0)
         {
             if(mask.empty())

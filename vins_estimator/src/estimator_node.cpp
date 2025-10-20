@@ -127,7 +127,7 @@ getMeasurements()
             IMUs.emplace_back(imu_buf.front());
             imu_buf.pop();
         }
-        IMUs.emplace_back(imu_buf.front());
+        IMUs.emplace_back(imu_buf.front()); // 用于插值计算，使得imu与img时间严格对齐
         if (IMUs.empty())
             ROS_WARN("no imu between two image");
         measurements.emplace_back(IMUs, img_msg);
@@ -229,7 +229,7 @@ void process()
                 if (t <= img_t)
                 { 
                     if (current_time < 0)
-                        current_time = t;
+                        current_time = t;   
                     double dt = t - current_time;
                     ROS_ASSERT(dt >= 0);
                     current_time = t;
@@ -243,7 +243,7 @@ void process()
                     //printf("imu: dt:%f a: %f %f %f w: %f %f %f\n",dt, dx, dy, dz, rx, ry, rz);
 
                 }
-                else
+                else // 线性插值到img_t时刻的imu数据
                 {
                     double dt_1 = img_t - current_time;
                     double dt_2 = t - img_t;
@@ -294,6 +294,9 @@ void process()
 
             TicToc t_s;
             map<int, vector<pair<int, Eigen::Matrix<double, 7, 1>>>> image;
+            // 构建image数据结构
+            // feature_id -> (camera_id, [x,y,z,u,v,velocity_x,velocity_y])
+            // x,y,z: 归一化坐标
             for (unsigned int i = 0; i < img_msg->points.size(); i++)
             {
                 int v = img_msg->channels[0].values[i] + 0.5;
@@ -340,24 +343,45 @@ void process()
 
 int main(int argc, char **argv)
 {
+    // 初始化ROS节点，节点名称为"vins_estimator"
     ros::init(argc, argv, "vins_estimator");
+    // 创建ROS节点句柄，"~"表示节点的私有命名空间
     ros::NodeHandle n("~");
+    // 设置ROS日志级别为INFO（只输出INFO及以上级别的日志）
     ros::console::set_logger_level(ROSCONSOLE_DEFAULT_NAME, ros::console::levels::Info);
+    // 从ROS参数服务器读取配置参数（如相机内参、IMU参数等）
     readParameters(n);
+    // 为状态估计器(estimator)设置参数（基于读取的配置）
     estimator.setParameter();
+
+    // 如果定义了EIGEN_DONT_PARALLELIZE宏（禁用Eigen并行计算），输出调试日志
 #ifdef EIGEN_DONT_PARALLELIZE
     ROS_DEBUG("EIGEN_DONT_PARALLELIZE");
 #endif
+
+    // 输出警告日志，提示系统正在等待图像和IMU数据
     ROS_WARN("waiting for image and imu...");
 
+    // 注册ROS发布者（用于发布估计结果，如位姿、点云等可视化或调试信息）
     registerPub(n);
 
+    // 订阅IMU数据：话题名为IMU_TOPIC（配置文件中定义），队列长度2000，回调函数为imu_callback
+    // 使用tcpNoDelay()优化TCP传输，减少延迟
     ros::Subscriber sub_imu = n.subscribe(IMU_TOPIC, 2000, imu_callback, ros::TransportHints().tcpNoDelay());
+
+    // 订阅特征跟踪器输出的特征点数据：话题为"/feature_tracker/feature"，回调函数为feature_callback
     ros::Subscriber sub_image = n.subscribe("/feature_tracker/feature", 2000, feature_callback);
+
+    // 订阅重启信号：话题为"/feature_tracker/restart"，回调函数为restart_callback
     ros::Subscriber sub_restart = n.subscribe("/feature_tracker/restart", 2000, restart_callback);
+
+    // 订阅回环检测匹配点数据：话题为"/pose_graph/match_points"，回调函数为relocalization_callback
     ros::Subscriber sub_relo_points = n.subscribe("/pose_graph/match_points", 2000, relocalization_callback);
 
+    // 启动一个独立线程运行process函数（核心处理逻辑，负责视觉-惯性数据融合）
     std::thread measurement_process{process};
+
+    // ROS消息循环：阻塞等待并处理订阅的消息（回调函数在该循环中执行）
     ros::spin();
 
     return 0;
