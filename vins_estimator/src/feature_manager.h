@@ -23,7 +23,7 @@ using namespace Eigen;
 class FeaturePerFrame
 {
   public:
-    FeaturePerFrame(const Eigen::Matrix<double, 7, 1> &_point, double td)
+    FeaturePerFrame(const Eigen::Matrix<double, 7, 1> &_point, double td, int _frame_id = -1)
     {
         point.x() = _point(0);
         point.y() = _point(1);
@@ -33,8 +33,10 @@ class FeaturePerFrame
         velocity.x() = _point(5); 
         velocity.y() = _point(6); 
         cur_td = td;
+        frame_id = _frame_id;
     }
     double cur_td;
+    int frame_id; // <-- 新增成员
     Vector3d point;
     Vector2d uv;
     Vector2d velocity;
@@ -98,6 +100,7 @@ class FeatureManager
 
     //void updateDepth(const VectorXd &x);
     void setDepth(const VectorXd &x);
+    void setFeatureDepth(int feature_id, double depth); // <-- 新增
     void removeFailures();
     void clearDepth(const VectorXd &x);
     VectorXd getDepthVector();

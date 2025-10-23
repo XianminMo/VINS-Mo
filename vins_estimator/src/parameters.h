@@ -32,11 +32,15 @@ extern int NUM_ITERATIONS;
 extern std::string EX_CALIB_RESULT_PATH;
 extern std::string VINS_RESULT_PATH;
 extern std::string IMU_TOPIC;
+extern std::string IMAGE_TOPIC; // <-- 新增
 extern double TD;
 extern double TR;
 extern int ESTIMATE_TD;
 extern int ROLLING_SHUTTER;
 extern double ROW, COL;
+
+extern std::string DEPTH_MODEL_PATH;
+extern int USE_FAST_INIT;
 
 
 void readParameters(ros::NodeHandle &n);

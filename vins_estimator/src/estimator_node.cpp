@@ -11,10 +11,6 @@
 #include "estimator.h"
 #include "parameters.h"
 #include "utility/visualization.h"
-
-
-Estimator estimator;
-
 std::condition_variable con;
 double current_time = -1;
 queue<sensor_msgs::ImuConstPtr> imu_buf;
@@ -22,10 +18,16 @@ queue<sensor_msgs::PointCloudConstPtr> feature_buf;
 queue<sensor_msgs::PointCloudConstPtr> relo_buf;
 int sum_of_wait = 0;
 
+// --- MODIFICATION START ---
+// 用于缓存第一帧原始图像
+cv::Mat first_image_mat;
+bool first_image_received = false;
+// --- MODIFICATION END ---
+
 std::mutex m_buf;
 std::mutex m_state;
 std::mutex i_buf;
-std::mutex m_estimator;
+std::mutex m_estimator; // This mutex is used to protect the estimator object
 
 double latest_time;
 Eigen::Vector3d tmp_P;
@@ -38,7 +40,7 @@ Eigen::Vector3d gyr_0;
 bool init_feature = 0;
 bool init_imu = 1;
 double last_imu_t = 0;
-
+Estimator* estimator_ptr; // Use a global pointer instead of a global object
 void predict(const sensor_msgs::ImuConstPtr &imu_msg)
 {
     double t = imu_msg->header.stamp.toSec();
@@ -60,13 +62,12 @@ void predict(const sensor_msgs::ImuConstPtr &imu_msg)
     double ry = imu_msg->angular_velocity.y;
     double rz = imu_msg->angular_velocity.z;
     Eigen::Vector3d angular_velocity{rx, ry, rz};
-
-    Eigen::Vector3d un_acc_0 = tmp_Q * (acc_0 - tmp_Ba) - estimator.g;
+    Eigen::Vector3d un_acc_0 = tmp_Q * (acc_0 - tmp_Ba) - estimator_ptr->g;
 
     Eigen::Vector3d un_gyr = 0.5 * (gyr_0 + angular_velocity) - tmp_Bg;
     tmp_Q = tmp_Q * Utility::deltaQ(un_gyr * dt);
 
-    Eigen::Vector3d un_acc_1 = tmp_Q * (linear_acceleration - tmp_Ba) - estimator.g;
+    Eigen::Vector3d un_acc_1 = tmp_Q * (linear_acceleration - tmp_Ba) - estimator_ptr->g;
 
     Eigen::Vector3d un_acc = 0.5 * (un_acc_0 + un_acc_1);
 
@@ -81,13 +82,13 @@ void update()
 {
     TicToc t_predict;
     latest_time = current_time;
-    tmp_P = estimator.Ps[WINDOW_SIZE];
-    tmp_Q = estimator.Rs[WINDOW_SIZE];
-    tmp_V = estimator.Vs[WINDOW_SIZE];
-    tmp_Ba = estimator.Bas[WINDOW_SIZE];
-    tmp_Bg = estimator.Bgs[WINDOW_SIZE];
-    acc_0 = estimator.acc_0;
-    gyr_0 = estimator.gyr_0;
+    tmp_P = estimator_ptr->Ps[WINDOW_SIZE];
+    tmp_Q = estimator_ptr->Rs[WINDOW_SIZE];
+    tmp_V = estimator_ptr->Vs[WINDOW_SIZE];
+    tmp_Ba = estimator_ptr->Bas[WINDOW_SIZE];
+    tmp_Bg = estimator_ptr->Bgs[WINDOW_SIZE];
+    acc_0 = estimator_ptr->acc_0;
+    gyr_0 = estimator_ptr->gyr_0;
 
     queue<sensor_msgs::ImuConstPtr> tmp_imu_buf = imu_buf;
     for (sensor_msgs::ImuConstPtr tmp_imu_msg; !tmp_imu_buf.empty(); tmp_imu_buf.pop())
@@ -104,15 +105,14 @@ getMeasurements()
     {
         if (imu_buf.empty() || feature_buf.empty())
             return measurements;
-
-        if (!(imu_buf.back()->header.stamp.toSec() > feature_buf.front()->header.stamp.toSec() + estimator.td))
+        if (!(imu_buf.back()->header.stamp.toSec() > feature_buf.front()->header.stamp.toSec() + estimator_ptr->td))
         {
             //ROS_WARN("wait for imu, only should happen at the beginning");
             sum_of_wait++;
             return measurements;
         }
 
-        if (!(imu_buf.front()->header.stamp.toSec() < feature_buf.front()->header.stamp.toSec() + estimator.td))
+        if (!(imu_buf.front()->header.stamp.toSec() < feature_buf.front()->header.stamp.toSec() + estimator_ptr->td))
         {
             ROS_WARN("throw img, only should happen at the beginning");
             feature_buf.pop();
@@ -122,7 +122,7 @@ getMeasurements()
         feature_buf.pop();
 
         std::vector<sensor_msgs::ImuConstPtr> IMUs;
-        while (imu_buf.front()->header.stamp.toSec() < img_msg->header.stamp.toSec() + estimator.td)
+        while (imu_buf.front()->header.stamp.toSec() < img_msg->header.stamp.toSec() + estimator_ptr->td)
         {
             IMUs.emplace_back(imu_buf.front());
             imu_buf.pop();
@@ -154,9 +154,9 @@ void imu_callback(const sensor_msgs::ImuConstPtr &imu_msg)
     {
         std::lock_guard<std::mutex> lg(m_state);
         predict(imu_msg);
-        std_msgs::Header header = imu_msg->header;
+        std_msgs::Header header = imu_msg->header; // NOLINT
         header.frame_id = "world";
-        if (estimator.solver_flag == Estimator::SolverFlag::NON_LINEAR)
+        if (estimator_ptr->solver_flag == Estimator::SolverFlag::NON_LINEAR)
             pubLatestOdometry(tmp_P, tmp_Q, tmp_V, header);
     }
 }
@@ -176,6 +176,43 @@ void feature_callback(const sensor_msgs::PointCloudConstPtr &feature_msg)
     con.notify_one();
 }
 
+// --- MODIFICATION START ---
+/**
+ * @brief 订阅原始图像的回调函数
+ * 
+ * 仅在启用快速初始化时，缓存收到的第一帧图像。
+ * @param img_msg 原始图像消息
+ */
+void raw_image_callback(const sensor_msgs::ImageConstPtr &img_msg)
+{
+    // 仅在启用快速初始化且尚未收到第一帧图像时执行
+    if (USE_FAST_INIT && !first_image_received)
+    {
+        try
+        {
+            // 1. 先将 ROS 图像消息安全地转换为 OpenCV Mat (mono8)
+            cv_bridge::CvImageConstPtr cv_ptr = cv_bridge::toCvCopy(img_msg, sensor_msgs::image_encodings::MONO8);
+            
+            // 2. 创建一个三通道的 BGR 图像
+            cv::Mat bgr_image;
+            cv::cvtColor(cv_ptr->image, bgr_image, cv::COLOR_GRAY2BGR);
+
+            // 3. 缓存转换后的 BGR 图像
+            m_buf.lock(); // 使用与 process 线程相同的锁来确保线程安全
+            first_image_mat = bgr_image.clone();
+            first_image_received = true;
+            m_buf.unlock();
+            ROS_INFO("Fast-Init: Successfully cached and converted the first raw image (mono8 -> bgr8).");
+        }
+        catch (cv_bridge::Exception& e)
+        {
+            ROS_ERROR("cv_bridge exception: %s", e.what());
+            return;
+        }
+    }
+}
+// --- MODIFICATION END ---
+
 void restart_callback(const std_msgs::BoolConstPtr &restart_msg)
 {
     if (restart_msg->data == true)
@@ -188,11 +225,18 @@ void restart_callback(const std_msgs::BoolConstPtr &restart_msg)
             imu_buf.pop();
         m_buf.unlock();
         m_estimator.lock();
-        estimator.clearState();
-        estimator.setParameter();
+        estimator_ptr->clearState();
+        estimator_ptr->setParameter();
         m_estimator.unlock();
         current_time = -1;
         last_imu_t = 0;
+        // --- MODIFICATION START ---
+        // 重启时也要重置第一帧图像的缓存
+        m_buf.lock();
+        first_image_received = false;
+        first_image_mat.release();
+        m_buf.unlock();
+        // --- MODIFICATION END ---
     }
     return;
 }
@@ -218,6 +262,20 @@ void process()
                  });
         lk.unlock();
         m_estimator.lock();
+
+        // --- MODIFICATION START ---
+        // 如果启用了快速初始化，并且收到了第一帧图像，则将其传递给 estimator
+        if (USE_FAST_INIT && first_image_received)
+        {
+            // 检查 estimator_ptr 是否是第一次处理图像 (frame_count == 0)
+            if (estimator_ptr->solver_flag == Estimator::SolverFlag::INITIAL && estimator_ptr->frame_count == 0)
+            {
+                estimator_ptr->setFirstImage(first_image_mat);
+                first_image_mat.release(); // 传递后释放内存，防止重复传递
+            }
+        }
+        // --- MODIFICATION END ---
+
         for (auto &measurement : measurements)
         {
             auto img_msg = measurement.second;
@@ -225,7 +283,7 @@ void process()
             for (auto &imu_msg : measurement.first)
             {
                 double t = imu_msg->header.stamp.toSec();
-                double img_t = img_msg->header.stamp.toSec() + estimator.td;
+                double img_t = img_msg->header.stamp.toSec() + estimator_ptr->td;
                 if (t <= img_t)
                 { 
                     if (current_time < 0)
@@ -239,7 +297,7 @@ void process()
                     rx = imu_msg->angular_velocity.x;
                     ry = imu_msg->angular_velocity.y;
                     rz = imu_msg->angular_velocity.z;
-                    estimator.processIMU(dt, Vector3d(dx, dy, dz), Vector3d(rx, ry, rz));
+                    estimator_ptr->processIMU(dt, Vector3d(dx, dy, dz), Vector3d(rx, ry, rz));
                     //printf("imu: dt:%f a: %f %f %f w: %f %f %f\n",dt, dx, dy, dz, rx, ry, rz);
 
                 }
@@ -259,7 +317,7 @@ void process()
                     rx = w1 * rx + w2 * imu_msg->angular_velocity.x;
                     ry = w1 * ry + w2 * imu_msg->angular_velocity.y;
                     rz = w1 * rz + w2 * imu_msg->angular_velocity.z;
-                    estimator.processIMU(dt_1, Vector3d(dx, dy, dz), Vector3d(rx, ry, rz));
+                    estimator_ptr->processIMU(dt_1, Vector3d(dx, dy, dz), Vector3d(rx, ry, rz));
                     //printf("dimu: dt:%f a: %f %f %f w: %f %f %f\n",dt_1, dx, dy, dz, rx, ry, rz);
                 }
             }
@@ -286,8 +344,8 @@ void process()
                 Quaterniond relo_q(relo_msg->channels[0].values[3], relo_msg->channels[0].values[4], relo_msg->channels[0].values[5], relo_msg->channels[0].values[6]);
                 Matrix3d relo_r = relo_q.toRotationMatrix();
                 int frame_index;
-                frame_index = relo_msg->channels[0].values[7];
-                estimator.setReloFrame(frame_stamp, frame_index, match_points, relo_t, relo_r);
+                frame_index = static_cast<int>(relo_msg->channels[0].values[7]);
+                estimator_ptr->setReloFrame(frame_stamp, frame_index, match_points, relo_t, relo_r);
             }
 
             ROS_DEBUG("processing vision data with stamp %f \n", img_msg->header.stamp.toSec());
@@ -314,27 +372,27 @@ void process()
                 xyz_uv_velocity << x, y, z, p_u, p_v, velocity_x, velocity_y;
                 image[feature_id].emplace_back(camera_id,  xyz_uv_velocity);
             }
-            estimator.processImage(image, img_msg->header);
+            estimator_ptr->processImage(image, img_msg->header);
 
             double whole_t = t_s.toc();
-            printStatistics(estimator, whole_t);
+            printStatistics(*estimator_ptr, whole_t);
             std_msgs::Header header = img_msg->header;
             header.frame_id = "world";
 
-            pubOdometry(estimator, header);
-            pubKeyPoses(estimator, header);
-            pubCameraPose(estimator, header);
-            pubPointCloud(estimator, header);
-            pubTF(estimator, header);
-            pubKeyframe(estimator);
+            pubOdometry(*estimator_ptr, header);
+            pubKeyPoses(*estimator_ptr, header);
+            pubCameraPose(*estimator_ptr, header);
+            pubPointCloud(*estimator_ptr, header);
+            pubTF(*estimator_ptr, header);
+            pubKeyframe(*estimator_ptr);
             if (relo_msg != NULL)
-                pubRelocalization(estimator);
+                pubRelocalization(*estimator_ptr);
             //ROS_ERROR("end: %f, at %f", img_msg->header.stamp.toSec(), ros::Time::now().toSec());
         }
         m_estimator.unlock();
         m_buf.lock();
         m_state.lock();
-        if (estimator.solver_flag == Estimator::SolverFlag::NON_LINEAR)
+        if (estimator_ptr->solver_flag == Estimator::SolverFlag::NON_LINEAR)
             update();
         m_state.unlock();
         m_buf.unlock();
@@ -351,7 +409,12 @@ int main(int argc, char **argv)
     ros::console::set_logger_level(ROSCONSOLE_DEFAULT_NAME, ros::console::levels::Info);
     // 从ROS参数服务器读取配置参数（如相机内参、IMU参数等）
     readParameters(n);
-    // 为状态估计器(estimator)设置参数（基于读取的配置）
+    
+    // 在读取参数后创建 Estimator 对象
+    Estimator estimator;
+    estimator_ptr = &estimator;
+    // 初始化深度估计器（如果启用）
+    estimator.initDepthEstimator();
     estimator.setParameter();
 
     // 如果定义了EIGEN_DONT_PARALLELIZE宏（禁用Eigen并行计算），输出调试日志
@@ -371,6 +434,16 @@ int main(int argc, char **argv)
 
     // 订阅特征跟踪器输出的特征点数据：话题为"/feature_tracker/feature"，回调函数为feature_callback
     ros::Subscriber sub_image = n.subscribe("/feature_tracker/feature", 2000, feature_callback);
+
+    // --- MODIFICATION START ---
+    // 如果启用了快速初始化，则额外订阅原始图像话题
+    ros::Subscriber sub_raw_image;
+    if (USE_FAST_INIT)
+    {
+        sub_raw_image = n.subscribe(IMAGE_TOPIC, 100, raw_image_callback);
+        ROS_INFO("Fast-Init: Subscribing to raw image topic: %s", IMAGE_TOPIC.c_str());
+    }
+    // --- MODIFICATION END ---
 
     // 订阅重启信号：话题为"/feature_tracker/restart"，回调函数为restart_callback
     ros::Subscriber sub_restart = n.subscribe("/feature_tracker/restart", 2000, restart_callback);

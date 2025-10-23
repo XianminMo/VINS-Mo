@@ -9,3 +9,14 @@ A3_rs.launch
 test/
 test.launch
 .vscode/
+# 忽略 ONNX 模型
+*.onnx
+vins_estimator/models/Midas-V2.onnx
+
+# 忽略 ONNX Runtime 库
+*.so
+vins_estimator/third_party/
+
+
+# Snyk Security Extension - AI Rules (auto-generated)
+.github/instructions/snyk_rules.instructions.md

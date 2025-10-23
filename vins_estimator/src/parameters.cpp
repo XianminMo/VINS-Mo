@@ -20,8 +20,11 @@ int ROLLING_SHUTTER;
 std::string EX_CALIB_RESULT_PATH;
 std::string VINS_RESULT_PATH;
 std::string IMU_TOPIC;
+std::string IMAGE_TOPIC; // <-- 新增
 double ROW, COL;
 double TD, TR;
+std::string DEPTH_MODEL_PATH;
+int USE_FAST_INIT; // <-- 添加这行定义
 
 template <typename T>
 T readParam(ros::NodeHandle &n, std::string name)
@@ -50,6 +53,7 @@ void readParameters(ros::NodeHandle &n)
     }
 
     fsSettings["imu_topic"] >> IMU_TOPIC;
+    fsSettings["image_topic"] >> IMAGE_TOPIC; // <-- 新增
 
     SOLVER_TIME = fsSettings["max_solver_time"];
     NUM_ITERATIONS = fsSettings["max_num_iterations"];
@@ -131,6 +135,33 @@ void readParameters(ros::NodeHandle &n)
     else
     {
         TR = 0;
+    }
+
+    fsSettings["use_fast_init"] >> USE_FAST_INIT;
+    fsSettings["depth_model_path"] >> DEPTH_MODEL_PATH;
+    if (USE_FAST_INIT)
+    {
+        ROS_INFO("Fast Monocular Initialization ENABLED.");
+        if (DEPTH_MODEL_PATH.empty())
+        {
+            ROS_FATAL("Fast Init is enabled, but 'deep_model' path is not set in config file!");
+        }
+        else
+        {
+            std::ifstream f(DEPTH_MODEL_PATH.c_str());
+            if (!f.good())
+            {
+                ROS_FATAL("Fast Init enabled, but deep_model file not found at: %s", DEPTH_MODEL_PATH.c_str());
+            }
+            else
+            {
+                ROS_INFO("Fast Init will use model: %s", DEPTH_MODEL_PATH.c_str());
+            }
+        }
+    }
+    else
+    {
+        ROS_INFO("Using standard VINS-Mono SFM Initialization.");
     }
     
     fsSettings.release();

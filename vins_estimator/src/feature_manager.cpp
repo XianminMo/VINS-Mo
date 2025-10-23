@@ -49,21 +49,25 @@ bool FeatureManager::addFeatureCheckParallax(int frame_count, const map<int, vec
     double parallax_sum = 0;
     int parallax_num = 0;
     last_track_num = 0; // 记录从历史帧到当前帧成功追踪的特征点数量
+
+    // 1. 将当前帧的特征点添加到管理器中
     for (auto &id_pts : image)
     {
-        FeaturePerFrame f_per_fra(id_pts.second[0].second, td); // [0] 是指第一个相机
+        FeaturePerFrame f_per_fra(id_pts.second[0].second, td, frame_count); // [0] 是指第一个相机
 
         int feature_id = id_pts.first;
         auto it = find_if(feature.begin(), feature.end(), [feature_id](const FeaturePerId &it)
                           {
             return it.feature_id == feature_id;
                           });
-
+        
+        // 如果是新特征，则创建新的 FeaturePerId
         if (it == feature.end())
         {
             feature.push_back(FeaturePerId(feature_id, frame_count));
             feature.back().feature_per_frame.push_back(f_per_fra);
         }
+        // 如果是已存在的特征，则添加到观测序列中
         else if (it->feature_id == feature_id)
         {
             it->feature_per_frame.push_back(f_per_fra);
@@ -71,11 +75,15 @@ bool FeatureManager::addFeatureCheckParallax(int frame_count, const map<int, vec
         }
     }
 
-    if (frame_count < 2 || last_track_num < 20)
+    // 2. 提前判断：如果帧数太少或跟踪点太少，则直接接受为关键帧
+    const int MIN_TRACK_FOR_PARALLAX = 20;
+    if (frame_count < 2 || last_track_num < MIN_TRACK_FOR_PARALLAX)
         return true;
 
+    // 3. 计算当前帧与上一帧之间的平均视差
     for (auto &it_per_id : feature)
-    {
+    {   
+        // 确保特征点在上一帧和当前帧都被观测到
         if (it_per_id.start_frame <= frame_count - 2 &&
             it_per_id.start_frame + int(it_per_id.feature_per_frame.size()) - 1 >= frame_count - 1)
         {
@@ -84,6 +92,7 @@ bool FeatureManager::addFeatureCheckParallax(int frame_count, const map<int, vec
         }
     }
 
+    // 4. 根据平均视差决定是否为关键帧
     if (parallax_num == 0)
     {
         return true;
@@ -157,6 +166,26 @@ void FeatureManager::setDepth(const VectorXd &x)
             it_per_id.solve_flag = 1;
     }
 }
+
+// --- MODIFICATION START: Add setFeatureDepth implementation ---
+/**
+ * @brief 设置单个特征点的估计深度
+ * @param feature_id 要设置深度的特征点ID
+ * @param depth 估计的深度值
+ */
+void FeatureManager::setFeatureDepth(int feature_id, double depth)
+{
+    auto it = find_if(feature.begin(), feature.end(), [feature_id](const FeaturePerId &it)
+                      {
+        return it.feature_id == feature_id;
+                      });
+    if (it != feature.end())
+    {
+        it->estimated_depth = depth;
+        it->solve_flag = (depth > 0) ? 1 : 2; // 1: succ, 2: fail
+    }
+}
+// --- MODIFICATION END ---
 
 void FeatureManager::removeFailures()
 {

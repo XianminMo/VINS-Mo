@@ -22,6 +22,12 @@
 #include <queue>
 #include <opencv2/core/eigen.hpp>
 
+// --- MODIFICATION START: Break circular dependency ---
+#include "initial/depth_estimator.h"
+#include "initial/initial_fast_mono.h"
+#include <memory> // for std::unique_ptr
+// class FastInitializer; // Forward declaration
+
 
 class Estimator
 {
@@ -33,10 +39,12 @@ class Estimator
     // interface
     void processIMU(double t, const Vector3d &linear_acceleration, const Vector3d &angular_velocity);
     void processImage(const map<int, vector<pair<int, Eigen::Matrix<double, 7, 1>>>> &image, const std_msgs::Header &header);
+    void setFirstImage(const cv::Mat &img); // <-- 新增：设置第一帧图像的接口
     void setReloFrame(double _frame_stamp, int _frame_index, vector<Vector3d> &_match_points, Vector3d _relo_t, Matrix3d _relo_r);
 
     // internal
     void clearState();
+    void initDepthEstimator();
     bool initialStructure();
     bool visualInitialAlign();
     bool relativePose(Matrix3d &relative_R, Vector3d &relative_T, int &l);
@@ -116,11 +124,11 @@ class Estimator
 
     int loop_window_index;
 
-    MarginalizationInfo *last_marginalization_info;
+    MarginalizationInfo *last_marginalization_info = nullptr;
     vector<double *> last_marginalization_parameter_blocks;
 
     map<double, ImageFrame> all_image_frame;
-    IntegrationBase *tmp_pre_integration;
+    IntegrationBase *tmp_pre_integration = nullptr;
 
     //relocalization variable
     bool relocalization_info;
@@ -136,4 +144,13 @@ class Estimator
     Vector3d relo_relative_t;
     Quaterniond relo_relative_q;
     double relo_relative_yaw;
+
+    // deep estimation module
+    std::unique_ptr<DepthEstimator> mp_depth_estimator;
+    cv::Mat m_first_frame_depth_map; // 存储第一帧的归一化逆深度图
+    cv::Mat m_first_raw_image; // <-- 新增：存储第一帧的原始图像
+    bool m_first_frame_depth_computed;
+    std::mutex m_depth_mutex;
+
+    std::unique_ptr<FastInitializer> mp_fast_initializer;
 };
