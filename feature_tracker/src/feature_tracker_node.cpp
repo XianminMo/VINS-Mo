@@ -73,7 +73,7 @@ void img_callback(const sensor_msgs::ImageConstPtr &img_msg)
         PUB_THIS_FRAME = false;
 
     // 4. 将 ROS 图像消息转换为 OpenCV 图像格式
-        cv_bridge::CvImageConstPtr ptr;
+    cv_bridge::CvImageConstPtr ptr;
     if (img_msg->encoding == "8UC1")
     {
         sensor_msgs::Image img;

@@ -84,7 +84,7 @@ bool DepthEstimator::init(const std::string& model_path)
     return true;
 }
 
-// 预处理函数 (直接从 Demo 复制)
+// 预处理函数 
 void DepthEstimator::preprocess(const cv::Mat& image, std::vector<float>& input_tensor_values)
 {
     cv::Mat resized_image;
@@ -113,7 +113,7 @@ void DepthEstimator::preprocess(const cv::Mat& image, std::vector<float>& input_
     }
 }
 
-// 预测函数 (核心)
+// 预测函数
 bool DepthEstimator::predict(const cv::Mat& image, cv::Mat& norm_inv_depth_map)
 {
     if (!m_session)

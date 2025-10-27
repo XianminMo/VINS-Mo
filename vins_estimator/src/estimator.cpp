@@ -234,14 +234,15 @@ void Estimator::processIMU(double dt, const Vector3d &linear_acceleration, const
 /**
  * @brief 处理新的图像帧和其中的特征点
  * 
- * @param image 图像数据，包含特征点ID及其在图像中的位置
+ * @param image 图像数据，包含特征点ID及其在图像中的位置 image: feature_id -> (camera_id, [x,y,z,u,v,velocity_x,velocity_y])
  * @param header ROS消息头，包含时间戳等信息
  * 
  * 这是VIO系统的核心驱动函数之一。它负责决定当前帧是否为关键帧，
  * 触发VIO初始化、后端优化和滑动窗口操作。
  */
 void Estimator::processImage(const map<int, vector<pair<int, Eigen::Matrix<double, 7, 1>>>> &image, const std_msgs::Header &header)
-{
+{   
+    // image数据结构: feature_id -> (camera_id, [x,y,z,u,v,velocity_x,velocity_y])
     ROS_DEBUG("new image coming ------------------------------------------");
     ROS_DEBUG("Adding feature points %lu", image.size());
     
@@ -318,7 +319,7 @@ void Estimator::processImage(const map<int, vector<pair<int, Eigen::Matrix<doubl
                         ROS_INFO("Fast-Init: Calculating depth for the first frame...");
                         TicToc t_depth;
                         cv::Mat depth_map;
-                        // 调用深度学习模型进行深度预测
+                        // 调用深度学习模型进行深度预测, first_img 为 bgr
                         bool success = mp_depth_estimator->predict(first_img, depth_map);
                         if (success)
                         {

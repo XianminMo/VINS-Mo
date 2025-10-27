@@ -84,8 +84,8 @@ bool FastInitializer::initialize(const std::map<double, ImageFrame>& image_frame
             Eigen::Vector3d z_i0 = obs_frame_0.point; // VINS-Mono 已存储为 [x, y, 1]
 
             // 获取归一化逆深度 d_hat_i
-            // !! 关键假设 !!: 这里的 uv 是原始图像坐标，且 first_frame_norm_inv_depth
-            // 已经被 resize 到了原始图像尺寸 (这应该在 DepthEstimator::predict 中完成)
+            // 这里的 uv 是原始图像坐标，且 first_frame_norm_inv_depth
+            // 已经被 resize 到了原始图像尺寸 (在 DepthEstimator::predict 中完成)
             int u = static_cast<int>(round(obs_frame_0.uv.x()));
             int v = static_cast<int>(round(obs_frame_0.uv.y()));
 
@@ -440,7 +440,6 @@ void FastInitializer::buildLinearSystemRow(const IntegrationBase* pre_int_k, // 
 
     // 4.1. 计算 M1 和 M2 (论文中的 M3) - 涉及 a 和 b 的项
     // 这两项主要来源于公式右侧表示特征点在 C0 系下位置 p_c0 的项，经过一系列坐标变换和线性化得到。
-    // p_c0 = (1 / (a*d_hat_i + b)) * z_i0
     // 论文通过复杂的代数运算（见附录推导），将包含 p_c0 的项线性化，直接给出了 M1 和 M2 (对应代码 M2_3d) 的表达式。
     
     // 公共部分: [z_ik]_x * R_i0_ck * R_c0_i0
@@ -453,7 +452,7 @@ void FastInitializer::buildLinearSystemRow(const IntegrationBase* pre_int_k, // 
     
     // M1 (对 a 的系数) 的 3D 向量: common_term * (d_hat_i * z_i0)
     // 这个对应论文公式中与 a 相关的部分。注意它与 M2 很像，只是多乘了一个 d_hat_i。
-    Eigen::Vector3d M1_3d = common_term * (d_hat_i * z_i0);
+    Eigen::Vector3d M1_3d = common_term * (1 / d_hat_i * z_i0);
 
     // 4.2. 计算 Tv - 涉及 v_I0 (第一帧 IMU 速度) 的项
     // 经过坐标变换和叉乘操作后，提取出 v_I0 的系数矩阵：
