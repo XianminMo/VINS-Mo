@@ -559,13 +559,11 @@ bool FastInitializer::solveRANSAC(const std::vector<ObservationData>& all_observ
             b_min.block<2, 1>(i * 2, 0) = b_row;
         }
 
-        // 使用 SVD 求解 (对于小系统，QR 或 SVD 都可以)
-        // 使用 SVD (奇异值分解) 求解这个 8x8 的线性方程组 A_min * x = b_min。
-        // SVD 对于可能接近奇异 (ill-conditioned) 的矩阵比较稳定。
-        // .jacobiSvd(...) 计算 SVD 分解。
-        // Eigen::ComputeThinU | Eigen::ComputeThinV 是计算选项，表示计算瘦 U 和 V 矩阵。
-        // .solve(b_min) 使用 SVD 分解来求解 x。
-        Eigen::Matrix<double, 8, 1> x_candidate = A_min.jacobiSvd(Eigen::ComputeThinU | Eigen::ComputeThinV).solve(b_min);
+        // --- MODIFICATION START: Remove ThinU/ThinV for fixed-size matrix ---
+        // 使用 SVD 求解这个 8x8 的线性方程组 A_min * x = b_min。
+        // 对于固定大小的方阵，不能使用 ComputeThinU 或 ComputeThinV 选项。
+        Eigen::Matrix<double, 8, 1> x_candidate = A_min.jacobiSvd(Eigen::ComputeFullU | Eigen::ComputeFullV).solve(b_min);
+        // --- MODIFICATION END ---
 
         // (可选) 检查解是否有效 (例如，重力幅度)
         double g_norm_cand = x_candidate.segment<3>(5).norm();
