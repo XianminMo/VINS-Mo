@@ -389,7 +389,8 @@ void FastInitializer::buildLinearSystemRow(const IntegrationBase* pre_int_k, // 
     Eigen::Vector3d T_i_c_in_C = -R_c_i * T_c_i_in_I;
 
     // --- 2. 提取 IMU 预积分信息 (I0 -> Ik) ---
-    Eigen::Matrix3d R_I0_Ik = pre_int_k->delta_q.toRotationMatrix();
+    Eigen::Matrix3d R_Ik_I0 = pre_int_k->delta_q.toRotationMatrix();
+    Eigen::Matrix3d R_I0_Ik = R_Ik_I0.transpose();
     Eigen::Vector3d I0_alpha_Ik = pre_int_k->delta_p;
     double delta_t = pre_int_k->sum_dt;
     double delta_t_sq = delta_t * delta_t;
