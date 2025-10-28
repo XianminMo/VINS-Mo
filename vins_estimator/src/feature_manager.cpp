@@ -167,7 +167,6 @@ void FeatureManager::setDepth(const VectorXd &x)
     }
 }
 
-// --- MODIFICATION START: Add setFeatureDepth implementation ---
 /**
  * @brief 设置单个特征点的估计深度
  * @param feature_id 要设置深度的特征点ID
@@ -185,7 +184,6 @@ void FeatureManager::setFeatureDepth(int feature_id, double depth)
         it->solve_flag = (depth > 0) ? 1 : 2; // 1: succ, 2: fail
     }
 }
-// --- MODIFICATION END ---
 
 void FeatureManager::removeFailures()
 {

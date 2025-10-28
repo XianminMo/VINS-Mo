@@ -201,20 +201,17 @@ bool FastInitializer::initialize(const std::map<double, ImageFrame>& image_frame
             if (v >= 0 && v < first_frame_rows && u >= 0 && u < first_frame_cols)
             {
                 // 从输入的归一化逆深度图 (CV_32F, 范围 [0,1]) 中获取对应的预测值 d_hat_i。
-                double d_hat_i = static_cast<double>(first_frame_norm_inv_depth.at<float>(v, u));
+                double d_hat_i_inv = static_cast<double>(first_frame_norm_inv_depth.at<float>(v, u));
                 
                 // 检查预测的逆深度值是否有效 (例如大于一个很小的正数，避免除零)。
                 if (d_hat_i > 1e-6)
                 {
-                    // 应用核心公式: 1/z = a * d_hat + b，计算估计的逆深度。
-                    double estimated_inv_depth = a * d_hat_i + b;
+                    // 应用核心公式: z = a * d_hat_inv + b 计算估计的深度。
+                    double estimated_depth = a * 1.0 / d_hat_i_inv + b;
                     
                     // 检查估计的逆深度是否为正数 (因为深度 z 必须为正)。
                     if (estimated_inv_depth > 1e-6)
-                    {
-                        // 计算最终的深度值 z = 1 / estimated_inv_depth。
-                        double estimated_depth = 1.0 / estimated_inv_depth;
-                        
+                    {                       
                         // 对计算出的深度值进行范围检查，剔除过近或过远的点。
                         // 0.1m 到 50m 是一个常用的经验范围。
                         if (estimated_depth > 0.1 && estimated_depth < 50.0)
@@ -293,14 +290,11 @@ bool FastInitializer::initialize(const std::map<double, ImageFrame>& image_frame
 
     k_index = 0; // 窗口内帧的索引。
     
-    // R_prev, p_prev, v_prev 存储的是上一帧 (k-1) 在 W' 系下的状态。
+    // R_prev, p_prev, v_prev 存储的是上一帧 (k-1) 在 W 系下的状态。
     // 初始化为第 0 帧的状态。
-    // 注意 VINS-Mono 的 Rs 数组存储的是从 World 到 Body 的旋转 R_wb。
-    // R_I0_to_W_prime 是从 I0 (Body) 到 W' (World) 的旋转 R_wi。
-    // 所以，第一帧的 R_wb_0 应该是 R_I0_to_W_prime 的逆，即 R_W_prime_to_I0。
-    // 这里可能需要根据 VINS-Mono 的 Rs 约定调整 R_prev 的初始值
-    // 假设 VINS Rs 就是 R_wb:
-    Eigen::Quaterniond R_prev = R_W_prime_to_I0; // R_wb_0
+    // 注意 VINS-Mono 的 Rs 数组存储的是从 Body 到 World 的旋转 R_{b}^{w}。
+    // R_I0_to_W_prime 是从 I0 (Body) 到 W (World) 的旋转 R_{I0}^{w}。
+    Eigen::Quaterniond R_prev = R_I0_to_W_prime; // R_wb_0
     Eigen::Vector3d p_prev = p_I0_in_W_prime;   // p_w_0
     Eigen::Vector3d v_prev = v_I0_in_W_prime;   // v_w_0
 
@@ -330,19 +324,19 @@ bool FastInitializer::initialize(const std::map<double, ImageFrame>& image_frame
             double dt = pre_int_delta->sum_dt;
 
             // --- 状态传播公式 ---
-            // R_{w}^{k} 表示w到I_{k-1}的旋转
-            // R_{w}^{k} = delta_R_{k-1}^{k} * R_{w}^{k-1}
+            // R_{k}^{w} 表示I_{k}到w的旋转
+            // R_{k}^{w} = R_{k-1}^{w} * delta_R_{k}^{k-1} * 
             Eigen::Quaterniond R_curr = R_prev * pre_int_delta->delta_q ;
 
 
-            // p_k = p_{k-1} + v_{k-1} * dt - 0.5*g*dt^2 + R_{w}^{k-1} * delta_p
+            // p_k = p_{k-1} + v_{k-1} * dt - 0.5*g*dt^2 + R_{k-1}^{w} * delta_p
             // 所有向量都在 W' (World) 系下。
-            // delta_p 是在 Body(k-1) 系下表示的位移。需要用 R_bw_k-1 (即 R_prev 的逆) 转换到世界系。
-            Eigen::Vector3d p_curr = p_prev + v_prev * dt - 0.5 * G_gravity_world * dt * dt + R_prev.inverse() * pre_int_delta->delta_p;
+            // delta_p 是在 Body(k-1) 系下表示的位移。需要用 R_{k-1}^{w} (即 R_prev) 转换到世界系。
+            Eigen::Vector3d p_curr = p_prev + v_prev * dt - 0.5 * G_gravity_world * dt * dt + R_prev * pre_int_delta->delta_p;
 
-            // v_k = v_{k-1} - g * dt + R_{w}^{k-1} * delta_v
-            // delta_v 是在 Body(k-1) 系下表示的速度变化。需要用 R_bw_k-1 (即 R_prev 的逆) 转换到世界系。
-            Eigen::Vector3d v_curr = v_prev - G_gravity_world * dt + R_prev.inverse() * pre_int_delta->delta_v;
+            // v_k = v_{k-1} - g * dt + R_{k-1}^{w} * delta_v
+            // delta_v 是在 Body(k-1) 系下表示的速度变化。需要用 R_{k-1}^{w} (即 R_prev) 转换到世界系。
+            Eigen::Vector3d v_curr = v_prev - G_gravity_world * dt + R_prev * pre_int_delta->delta_v;
 
             // 存储计算出的第 k 帧的状态。
             Rs_out[k_index] = R_curr;
