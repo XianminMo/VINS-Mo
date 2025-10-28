@@ -453,304 +453,316 @@ void FastInitializer::buildLinearSystemRow(const IntegrationBase* pre_int_k, // 
 
 // RANSAC 求解器
 bool FastInitializer::solveRANSAC(const std::vector<ObservationData>& all_observations,
-                                Eigen::Matrix<double, 8, 1>& best_x)
-{   
-    // 获取总观测数量 (N)。每个观测对应一对 (特征点 i, 图像帧 k)
+                                Eigen::Matrix<double, 8, 1>& best_x_out) // 输出最终拟合后的解
+{
     int num_observations = all_observations.size();
-    // 用于存储迄今为止找到的最佳模型所对应的内点的索引
     std::vector<int> best_inlier_indices;
-    // RANSAC 通常只关心内点的数量，而不是残差总和。这行可以忽略
-    // double min_residual_sum = std::numeric_limits<double>::max(); // Or just track max inliers
+    // 初始化 best_x_ransac 为无效值，存储 RANSAC 迭代中找到的最佳候选解
+    Eigen::Matrix<double, 8, 1> best_x_ransac = Eigen::Matrix<double, 8, 1>::Constant(std::numeric_limits<double>::quiet_NaN());
+    double best_condition_number = std::numeric_limits<double>::max();
 
-    // 创建一个均匀分布的随机数生成器，用于从 [0, N-1] 的范围内随机抽取观测的索引
+    // 检查是否有足够的观测数据来进行最小集采样
+    // 建议 RANSAC_MIN_MEASUREMENTS 设回 4 或 5
+    const int current_min_measurements = fast_mono::RANSAC_MIN_MEASUREMENTS;
+    if (num_observations < current_min_measurements) {
+        ROS_WARN("RANSAC Error: Not enough observations (%d) available to form a minimal set (%d required).",
+                 num_observations, current_min_measurements);
+        return false;
+    }
+
     std::uniform_int_distribution<int> distribution(0, num_observations - 1);
 
+    // --- RANSAC 主循环 ---
     for (int iter = 0; iter < fast_mono::RANSAC_MAX_ITERATIONS; ++iter)
     {
-        // 1. 随机采样最小集 (4 对观测, 8 个方程)
-        // 用于存储当前选中的观测索引
+        // 1. 随机采样最小集
         std::vector<int> current_indices;
-        // 用于存储实际选中的观测数据
         std::vector<ObservationData> minimal_set;
-
-        // 循环直到选够最小集所需的观测数量。
-        // 我们有 8 个未知数 (a, b, v_x, v_y, v_z, g_x, g_y, g_z)。
-        // 每个 (i, k) 观测提供了 2 个线性方程 (来自 buildLinearSystemRow)。
-        // 因此，我们需要 8 / 2 = 4 个观测来构成一个恰定方程组 (8x8)。
-        while (minimal_set.size() < fast_mono::RANSAC_MIN_MEASUREMENTS) // RANSAC_MIN_MEASUREMENTS 通常为 4
+        while (minimal_set.size() < current_min_measurements)
         {
-            // 从 [0, N-1] 中随机抽取一个索引。
             int rand_idx = distribution(m_random_generator);
-            
-            // 检查这个索引是否已经被选过了，以避免重复选择同一个观测。
             bool found = false;
             for(int idx : current_indices) if(idx == rand_idx) found = true;
-            
-            // 如果没选过，就加入当前索引列表和最小集数据列表。
             if(!found) {
+                if (!all_observations[rand_idx].pre_integration_k) continue; // 跳过无效数据
                 current_indices.push_back(rand_idx);
                 minimal_set.push_back(all_observations[rand_idx]);
             }
-        } // 循环结束后, minimal_set 中有 4 个随机选出的观测数据
+        }
 
-        // 2. 求解最小集对应的线性系统 A_min * x = b_min
-        // 构建用于求解最小系统的 8x8 矩阵 A_min 和 8x1 向量 b_min
-        Eigen::Matrix<double, fast_mono::RANSAC_MIN_MEASUREMENTS * 2, 8> A_min;
-        Eigen::Matrix<double, fast_mono::RANSAC_MIN_MEASUREMENTS * 2, 1> b_min;
+        // 2. 构建最小系统的 A_min 和 b_min
+        int n_rows = current_min_measurements * 2;
+        // 根据是否为方阵选择 Dynamic 或固定大小
+        Eigen::Matrix<double, Eigen::Dynamic, 8> A_min(n_rows, 8);
+        Eigen::Matrix<double, Eigen::Dynamic, 1> b_min(n_rows);
         
-        // 遍历最小集中的 4 个观测
-        for (int i = 0; i < fast_mono::RANSAC_MIN_MEASUREMENTS; ++i)
-        {   
-            // --- 在此添加调试代码 ---
-            const auto& obs = minimal_set[i];
-            if (std::isnan(obs.d_hat_i) || std::isinf(obs.d_hat_i))
-                ROS_ERROR("FastInit DEBUG: d_hat_i is NaN/Inf!");
-
-            if (obs.pre_integration_k->delta_q.coeffs().hasNaN())
-                ROS_ERROR("FastInit DEBUG: pre_int_k->delta_q is NaN!");
-
-            if (obs.pre_integration_k->delta_p.hasNaN())
-                ROS_ERROR("FastInit DEBUG: pre_int_k->delta_p is NaN!");
-
-            if (std::isnan(obs.pre_integration_k->sum_dt) || obs.pre_integration_k->sum_dt <= 0)
-                ROS_ERROR("FastInit DEBUG: sum_dt is invalid: %f", obs.pre_integration_k->sum_dt);
-
-            // 为每个观测构建对应的 2x8 的 A_row 和 2x1 的 b_row
+        // (构建 A_min, b_min 的循环, 包括检查 NaN)
+        bool build_ok = true;
+        for (int i = 0; i < current_min_measurements; ++i) {
             Eigen::Matrix<double, 2, 8> A_row;
             Eigen::Vector2d b_row;
             buildLinearSystemRow(minimal_set[i].pre_integration_k, minimal_set[i].z_i0,
                                  minimal_set[i].z_ik, minimal_set[i].d_hat_i, A_row, b_row);
-            
-            // 将 A_row 和 b_row 填充到 A_min 和 b_min 的对应行
+            if (A_row.hasNaN() || b_row.hasNaN()) {
+                build_ok = false; break;
+            }
             A_min.block<2, 8>(i * 2, 0) = A_row;
             b_min.block<2, 1>(i * 2, 0) = b_row;
         }
+        if (!build_ok) continue;
 
-        // ***** 新增：数值预处理 *****
-        // 创建一个对角缩放矩阵 S
-        // 我们保持 a, b 的尺度 O(1)
-        // 我们将 v 的列 (col 2,3,4) 放大 10 倍 (O(1e-1) -> O(1))
-        // 我们将 g 的列 (col 5,6,7) 放大 100 倍 (O(1e-2) -> O(1))
+        // 3. 应用数值预处理 (缩放矩阵 S)
         Eigen::Matrix<double, 8, 8> S = Eigen::Matrix<double, 8, 8>::Identity();
-        S(2, 2) = 10.0;
-        S(3, 3) = 10.0;
-        S(4, 4) = 10.0;
-        S(5, 5) = 100.0;
-        S(6, 6) = 100.0;
-        S(7, 7) = 100.0;
+        S(2, 2) = 10.0; S(3, 3) = 10.0; S(4, 4) = 10.0; // v
+        S(5, 5) = 100.0; S(6, 6) = 100.0; S(7, 7) = 100.0; // g
+        Eigen::MatrixXd Am_S = A_min * S;
 
-        // 求解缩放后的系统: (A_min * S) * x_scaled = b_min
-        // 其中 x_scaled = S_inv * x_candidate
-        Eigen::Matrix<double, 8, 1> x_scaled = (A_min * S).jacobiSvd(Eigen::ComputeFullU | Eigen::ComputeFullV).solve(b_min);
-        
-        // 从 x_scaled 恢复回 x_candidate
-        // x_candidate = S * x_scaled
+        // 4. 计算 SVD 和条件数
+        Eigen::JacobiSVD<Eigen::MatrixXd> svd;
+        if (n_rows == 8) {
+             svd.compute(Am_S, Eigen::ComputeFullU | Eigen::ComputeFullV);
+        } else {
+             svd.compute(Am_S, Eigen::ComputeThinU | Eigen::ComputeThinV);
+        }
+        double cond_num = std::numeric_limits<double>::infinity();
+        const double min_singular_value_threshold = 1e-8;
+        if (svd.singularValues().size() > 0 && svd.singularValues().minCoeff() > min_singular_value_threshold) {
+            cond_num = svd.singularValues().maxCoeff() / svd.singularValues().minCoeff();
+        }
+
+        // --- 条件数阈值检查 ---
+        const double CONDITION_NUMBER_THRESHOLD = 1e10; // << 需要调整
+        if (cond_num > CONDITION_NUMBER_THRESHOLD || std::isinf(cond_num) || std::isnan(cond_num))
+        {
+            // if (iter < 20) ROS_WARN("RANSAC Iter %d: Poor condition number (%.2e). Discarding sample.", iter, cond_num);
+            continue; // 条件数太差，放弃本次采样 
+        }
+
+        // 5. SVD 求解
+        Eigen::Matrix<double, 8, 1> x_scaled = svd.solve(b_min);
+        if (x_scaled.hasNaN()) continue; // 跳过 NaN 解
+
+        // 6. 恢复原始尺度的解 x_candidate
         Eigen::Matrix<double, 8, 1> x_candidate = S * x_scaled;
-        
-        // ***** 结束新增代码 *****
 
-        // --- MODIFICATION START: Remove ThinU/ThinV for fixed-size matrix ---
-        // 使用 SVD 求解这个 8x8 的线性方程组 A_min * x = b_min。
-        // 对于固定大小的方阵，不能使用 ComputeThinU 或 ComputeThinV 选项。
-        // Eigen::Matrix<double, 8, 1> x_candidate = A_min.jacobiSvd(Eigen::ComputeFullU | Eigen::ComputeFullV).solve(b_min);
-        // --- MODIFICATION END ---
-
-        // ***** 在此添加调试打印 *****
-        if (iter < 10) // 只打印前 10 次迭代
-        {
-            ROS_INFO("FastInit DEBUG (iter %d):", iter);
-            ROS_INFO("  a=%.3f, b=%.3f", x_candidate(0), x_candidate(1));
-            ROS_INFO("  v = [%.3f, %.3f, %.3f]", x_candidate(2), x_candidate(3), x_candidate(4));
-            ROS_INFO("  g = [%.3f, %.3f, %.3f] (norm: %.3f)", 
-                    x_candidate(5), x_candidate(6), x_candidate(7), x_candidate.segment<3>(5).norm());
-            
-            // (可选) 打印 A_min 和 b_min 的范数，看看它们是否有问题
-            ROS_INFO("  A_min norm: %.3f, b_min norm: %.3f", A_min.norm(), b_min.norm());
-        }
-        // ***** 调试结束 *****
-
-        // (可选) 检查解是否有效 (例如，重力幅度)
+        // 7. 物理合理性检查 (g_norm 过滤器)
         double g_norm_cand = x_candidate.segment<3>(5).norm();
-        if (g_norm_cand < 5.0 || g_norm_cand > 15.0 || x_candidate.hasNaN()) //
+        if (g_norm_cand < 5.0 || g_norm_cand > 15.0)
         {
-            if (iter < 10)
-                ROS_WARN("FastInit DEBUG (iter %d): Invalid candidate solution detected. Skipping this iteration.", iter);
-            continue; // 必须跳过这次迭代！
+            // if (iter < 20) ROS_WARN("RANSAC Iter %d: Good cond (%.2e), bad g_norm (%.3f). Skipping.", iter, cond_num, g_norm_cand);
+            continue; // 跳过物理上不可能的解
         }
 
-        // 3. 检验内点 (使用代数误差的平方)
-        // 用于存储当前假设 x_candidate 所对应的内点的索引
-        std::vector<int> current_inlier_indices;
-        
-        // 遍历所有的观测数据 (从 0 到 N-1)
-        for (int i = 0; i < num_observations; ++i)
-        {
-            const auto& obs = all_observations[i];
+        // --- 找到一个数值和物理都合理的候选解 ---
 
-            // 为当前观测构建 A_row 和 b_row
+        // 8. 检验内点
+        std::vector<int> current_inlier_indices;
+        for (int i = 0; i < num_observations; ++i) {
+            // ... (构建 A_row, b_row) ...
             Eigen::Matrix<double, 2, 8> A_row;
             Eigen::Vector2d b_row;
-            buildLinearSystemRow(obs.pre_integration_k, obs.z_i0, obs.z_ik, obs.d_hat_i, A_row, b_row);
-            
-            // 计算残差向量: residual = A_row * x_candidate - b_row
-            // 这就是论文中提到的 "代数误差"。理想情况下，如果 x_candidate 是真解，
-            // 且观测 obs 没有噪声，那么 residual 应该是一个 2x1 的零向量。
-            // squaredNorm() 计算残差向量的 L2 范数的平方 (|residual|^2)
-            double residual_sq_norm = (A_row * x_candidate - b_row).squaredNorm();
-            
+            buildLinearSystemRow(all_observations[i].pre_integration_k, all_observations[i].z_i0,
+                                 all_observations[i].z_ik, all_observations[i].d_hat_i, A_row, b_row);
 
-            // 将残差的平方与预设的阈值 (平方) 进行比较。
-            // RANSAC_THRESHOLD_SQ 通常需要根据经验调整，它决定了我们对内点的容忍程度。
-            if (residual_sq_norm < fast_mono::RANSAC_THRESHOLD_SQ)
-            {
-                // 如果残差足够小，则认为这个观测是当前假设 x_candidate 的一个内点。
+            double residual_sq_norm = (A_row * x_candidate - b_row).squaredNorm();
+            if (std::isnan(residual_sq_norm) || std::isinf(residual_sq_norm)) continue;
+
+            // 建议 RANSAC_THRESHOLD_SQ 设回较小值，如 0.1*0.1
+            if (residual_sq_norm < fast_mono::RANSAC_THRESHOLD_SQ) {
                 current_inlier_indices.push_back(i);
             }
         }
 
-        // 4. 如果找到更多内点，则更新最优解
-        if (current_inlier_indices.size() > best_inlier_indices.size())
-        {
+        // 9. 更新最优模型 (只关心内点数)
+        if (current_inlier_indices.size() > best_inlier_indices.size()) {
             best_inlier_indices = current_inlier_indices;
-            ROS_DEBUG("RANSAC iter %d: Found new best model with %zu inliers.", iter, best_inlier_indices.size());
+            best_x_ransac = x_candidate; // 存储当前这个最好的候选解
+            best_condition_number = cond_num;
+            ROS_INFO("RANSAC Iter %d: Found new best model with %zu inliers (Cond Num=%.2e, g_norm=%.3f)",
+                      iter, best_inlier_indices.size(), best_condition_number, g_norm_cand);
+             // (可选) 提前退出
+             // if (best_inlier_indices.size() > num_observations * 0.5) break;
         }
 
-        // (可选) 提前退出 RANSAC
-        if (best_inlier_indices.size() > num_observations * 0.7) // Example: 70% inliers
-            break;
-    }
+    } // --- RANSAC 主循环结束 ---
 
     ROS_INFO("RANSAC finished. Best model has %zu inliers.", best_inlier_indices.size());
 
-    // 检查内点数是否足够
-    if (best_inlier_indices.size() < fast_mono::RANSAC_MIN_INLIERS)
-    {
+    // 10. 检查是否找到足够内点
+    if (best_inlier_indices.size() < fast_mono::RANSAC_MIN_INLIERS) {
         ROS_WARN("RANSAC failed: Not enough inliers found (%zu / %d required).",
                  best_inlier_indices.size(), fast_mono::RANSAC_MIN_INLIERS);
         return false;
     }
 
-    // 5. 使用所有找到的内点重新拟合模型
-    std::vector<ObservationData> best_inliers_data;
+    // --- RANSAC 成功：我们找到了一个可靠的内点集 best_inlier_indices ---
 
-    // 从 all_observations 中提取出所有被判定为最佳内点的观测数据
-    for (int idx : best_inlier_indices)
-    {
-        best_inliers_data.push_back(all_observations[idx]);
+    // 11. **【关键】使用所有内点进行最终的线性拟合 (调用 solveLinearSystem)**
+    ROS_INFO("RANSAC successful. Performing final fit using %zu inliers...", best_inlier_indices.size());
+    std::vector<ObservationData> best_inliers_data;
+    best_inliers_data.reserve(best_inlier_indices.size()); // 预分配内存
+    for (int idx : best_inlier_indices) {
+        // 安全检查，以防 all_observations 在 RANSAC 过程中被意外修改 (理论上不应发生)
+        if (idx >= 0 && idx < all_observations.size()) {
+             best_inliers_data.push_back(all_observations[idx]);
+        } else {
+             ROS_ERROR("RANSAC Error: Invalid inlier index %d found!", idx);
+             return false; // 索引无效，严重错误
+        }
     }
 
-    // 调用 solveLinearSystem 函数，使用所有内点数据来计算一个更精确的解 best_x。
-    // 这个解会考虑重力约束。
-    if (!solveLinearSystem(best_inliers_data, best_x))
-    {
-        ROS_WARN("RANSAC final fit failed.");
+    // 调用最终拟合函数，并将结果存储在 best_x_out
+    if (!solveLinearSystem(best_inliers_data, best_x_out)) {
+        ROS_WARN("RANSAC succeeded in finding inliers, but the final linear system solve failed.");
         return false;
     }
 
-    // 如果 RANSAC 找到足够内点，并且最终拟合成功，则函数返回 true。
-    // 最优解存储在 best_x 中。
-    return true;
+    // 最终检查 solveLinearSystem 的结果是否合理
+    double final_g_norm = best_x_out.segment<3>(5).norm();
+    if (final_g_norm < 5.0 || final_g_norm > 15.0 || std::abs(best_x_out(0)) < 1e-4) { // 增加对 a 的检查
+         ROS_WARN("Final solution after solveLinearSystem seems unreasonable (g_norm=%.3f, a=%.4f). Initialization failed.", final_g_norm, best_x_out(0));
+         return false;
+    }
+
+    ROS_INFO("Final solution obtained successfully after final fit.");
+    return true; // RANSAC 和最终拟合都成功
 }
 
 
-// 使用所有内点求解线性系统 (带简化的重力约束)
+// 使用所有内点求解线性系统 (带简化的重力约束) - 修复版
 bool FastInitializer::solveLinearSystem(const std::vector<ObservationData>& observations,
                                         Eigen::Matrix<double, 8, 1>& x_out)
 {
-    // --- 1. 输入检查与矩阵构建 ---
-    
-    // 获取内点（可信观测）的数量。
     int num_inliers = observations.size();
-    
-    // 检查内点数量是否足够构成一个超定系统（方程数 > 未知数）。
-    // 理论上，只要 num_inliers >= 4 就可以解，但通常需要更多点来获得稳定解。
-    if (num_inliers < fast_mono::RANSAC_MIN_MEASUREMENTS) return false;
+    // 确保至少有足够的方程来求解 (理论上 4 个观测就够，但越多越好)
+    if (num_inliers < 4) {
+         ROS_WARN("solveLinearSystem Error: Too few observations (%d) for final fit.", num_inliers);
+         return false;
+    }
 
-    // 构建一个大的 (N*2 x 8) 矩阵 A 和 (N*2 x 1) 向量 b。
-    // N 是内点数量 (num_inliers)。
-    Eigen::MatrixXd A(num_inliers * 2, 8);
-    Eigen::VectorXd b(num_inliers * 2);
+    // --- 1. 构建超定系统 Ax = b ---
+    int n_rows = num_inliers * 2;
+    Eigen::MatrixXd A(n_rows, 8); // 使用动态大小
+    Eigen::VectorXd b(n_rows);
 
-    // 遍历所有内点观测。
+    bool build_ok = true;
     for (int i = 0; i < num_inliers; ++i)
     {
-        // 为每个观测构建对应的 2x8 A_row 和 2x1 b_row。
+        // 安全检查
+        if (!observations[i].pre_integration_k) {
+            ROS_ERROR("solveLinearSystem Error: Observation %d has null pre_integration!", i);
+            return false;
+        }
         Eigen::Matrix<double, 2, 8> A_row;
         Eigen::Vector2d b_row;
         buildLinearSystemRow(observations[i].pre_integration_k, observations[i].z_i0,
                              observations[i].z_ik, observations[i].d_hat_i, A_row, b_row);
-                             
-        // 将 A_row 和 b_row 堆叠到大矩阵 A 和大向量 b 中。
+
+        if (A_row.hasNaN() || b_row.hasNaN()) {
+             ROS_WARN("solveLinearSystem Warning: NaN detected while building row %d.", i);
+             // 策略：可以选择跳过这个观测，或者直接返回失败
+             // return false; // 更安全的选择
+             build_ok = false; break; // 或者跳出循环
+        }
         A.block<2, 8>(i * 2, 0) = A_row;
         b.block<2, 1>(i * 2, 0) = b_row;
-    } // 循环结束后，A 和 b 构成了超定线性系统 Ax = b
+    }
+     if (!build_ok) {
+        ROS_ERROR("solveLinearSystem Error: Failed to build the system due to NaN values.");
+        return false;
+     }
 
-    // --- 2. 步骤 1: 求解无约束最小二乘问题 ---
-    
-    // 使用 SVD 求解超定系统 Ax = b 的最小二乘解。
-    // 这个解 x_svd 会最小化残差的平方和 |Ax - b|^2。
-    Eigen::Matrix<double, 8, 1> x_svd = A.jacobiSvd(Eigen::ComputeThinU | Eigen::ComputeThinV).solve(b);
-    
-    // 从无约束解 x_svd 中提取重力向量部分 (最后 3 个元素)。
+    // --- 2. 应用数值预处理 (缩放矩阵 S) ---
+    Eigen::Matrix<double, 8, 8> S = Eigen::Matrix<double, 8, 8>::Identity();
+    S(2, 2) = 10.0; S(3, 3) = 10.0; S(4, 4) = 10.0; // v
+    S(5, 5) = 100.0; S(6, 6) = 100.0; S(7, 7) = 100.0; // g
+    Eigen::MatrixXd A_S = A * S; // 缩放后的矩阵
+
+    // --- 3. 求解无约束最小二乘问题 (SVD) ---
+    // **关键**: A_S 是 N x 8 (N >= 8)，使用 ThinU/V
+    Eigen::JacobiSVD<Eigen::MatrixXd> svd_unconstrained(A_S, Eigen::ComputeThinU | Eigen::ComputeThinV);
+
+    // 检查 SVD 是否成功以及条件数
+    double cond_num_unconstrained = std::numeric_limits<double>::infinity();
+    const double min_singular_value_threshold = 1e-8;
+    if (svd_unconstrained.singularValues().size() > 0 && svd_unconstrained.singularValues().minCoeff() > min_singular_value_threshold) {
+        cond_num_unconstrained = svd_unconstrained.singularValues().maxCoeff() / svd_unconstrained.singularValues().minCoeff();
+    }
+    ROS_INFO("solveLinearSystem (Unconstrained): Condition number = %.2e", cond_num_unconstrained);
+
+    // 可以选择性地基于条件数判断是否继续
+    // const double FINAL_FIT_COND_THRESHOLD = 1e12; // 设定一个最终拟合的条件数阈值
+    // if (cond_num_unconstrained > FINAL_FIT_COND_THRESHOLD) {
+    //    ROS_WARN("solveLinearSystem Warning: Poor condition number (%.2e) in final unconstrained fit. Result may be unreliable.", cond_num_unconstrained);
+    //    // return false; // 或者继续尝试施加约束
+    // }
+
+    Eigen::Matrix<double, 8, 1> x_scaled_svd = svd_unconstrained.solve(b);
+    if (x_scaled_svd.hasNaN()) {
+         ROS_ERROR("solveLinearSystem Error: Unconstrained SVD solve resulted in NaN!");
+         return false;
+    }
+    Eigen::Matrix<double, 8, 1> x_svd = S * x_scaled_svd; // 恢复原始尺度
+
+    // --- 4. 施加重力大小约束 ---
     Eigen::Vector3d g_svd = x_svd.segment<3>(5);
-    // 计算其模长。
     double g_norm_svd = g_svd.norm();
 
-    // --- 3. (可选) 检查无约束解的有效性 ---
-    // 如果无约束解得到的重力模长非常接近于零，说明数据可能有问题或者存在退化配置。
-    // 在这种情况下，强行施加约束可能会得到更差的结果。
-    if (g_norm_svd < 1.0) {
-        ROS_WARN("Linear system solve (SVD) resulted in near-zero gravity (%.3f).", g_norm_svd);
-        // 这里选择返回失败。另一种策略是直接返回 x_svd。
-        return false;
+    // 检查无约束解的有效性
+    if (g_norm_svd < 1.0) { // 如果无约束解的重力接近零，说明数据可能有问题
+        ROS_WARN("solveLinearSystem Warning: Unconstrained solve resulted in near-zero gravity (%.3f). Using this result without constraint.", g_norm_svd);
+        // 在这种情况下，强行施加约束可能更糟，直接返回无约束解
+        x_out = x_svd;
+        // 仍然需要检查这个解是否合理
+         if (std::abs(x_out(0)) < 1e-4 || x_out.segment<3>(5).norm() < 1.0) { // 如果 a 或 g 仍然无效
+              ROS_ERROR("solveLinearSystem Error: Unconstrained solution is also unreasonable. Failed.");
+              return false;
+         }
+        return true; // 返回无约束但（可能）合理的解
     }
 
-    // --- 4. 步骤 2: 施加重力大小约束 ---
-    
-    // g_normed 是最终我们希望得到的重力向量。
-    // 它的方向来自无约束解 g_svd (g_svd / g_norm_svd 是单位方向向量) 即 g_svd.normalized()。
-    // 它的模长来自全局参数 G.norm() (在 parameters.h 中定义，例如 9.805)。
-    Eigen::Vector3d g_normed = g_svd.normalized() * G.norm(); 
+    // 使用无约束解的方向 和 全局参数 G.norm() 确定约束后的重力
+    Eigen::Vector3d g_normed = g_svd.normalized() * G.norm();
 
-    // --- 5. 步骤 3: 固定 g_normed，重新求解 y = [a, b, v_I0]^T ---
-    
-    // 将原系统 Ax = b 分解为 A = [A_y | A_g]，其中 A_y 是前 5 列，A_g 是后 3 列。
-    // A_y 对应变量 y = [a, b, v_I0]^T，A_g 对应变量 g_I0。
-    // 原方程变为 A_y * y + A_g * g = b。
-    
-    // 固定 g = g_normed，我们需要解的方程变为: A_y * y = b - A_g * g_normed。
-    
-    // 提取 A_y (前 5 列)。
-    Eigen::MatrixXd A_y = A.leftCols<5>(); 
-    // 提取 A_g (后 3 列)。
-    Eigen::MatrixXd A_g = A.rightCols<3>(); 
-    
-    // 计算新的右端项 b_y = b - A_g * g_normed。
-    Eigen::VectorXd b_y = b - A_g * g_normed;
+    // --- 5. 固定 g_normed，重新求解 y = [a, b, v_I0]^T ---
+    Eigen::MatrixXd A_y = A.leftCols<5>(); // 前 5 列
+    Eigen::MatrixXd A_g = A.rightCols<3>(); // 后 3 列
+    Eigen::VectorXd b_y = b - A_g * g_normed; // 新的 RHS
 
-    // --- 6. 步骤 4: 使用 SVD 求解 A_y * y = b_y ---
-    
-    // 再次使用 SVD 求解这个关于 y 的超定系统的最小二乘解。
-    Eigen::VectorXd y = A_y.jacobiSvd(Eigen::ComputeThinU | Eigen::ComputeThinV).solve(b_y);
+    // --- 6. 应用数值预处理 (y 部分) ---
+    Eigen::Matrix<double, 5, 5> S_y = S.block<5, 5>(0, 0); // S 的左上 5x5
+    Eigen::MatrixXd Ay_Sy = A_y * S_y;
 
-    // --- 7. (可选) 检查约束解的有效性 ---
-    // y(0) 对应的是变量 a。
-    // 如果在施加重力约束后，计算出的 a 非常接近于 0，这意味着深度 z = 1 / (a*d_hat + b)
-    // 变得非常大或者主要由 b 决定，这通常是不稳定或不物理的。
-    if (std::abs(y(0)) < 1e-3) {
-        ROS_WARN("Linear system solve (Constrained) resulted in near-zero 'a' (%.3f). Using SVD solution instead.", y(0));
-        // 在这种情况下，我们宁愿放弃约束解，选择更可能稳定的无约束解 x_svd。
-        x_out = x_svd; 
-        return true; // 仍然认为求解是成功的，只是用了无约束结果
-    }
+    // --- 7. SVD 求解 A_y * y = b_y ---
+    // **关键**: Ay_Sy 是 N x 5 (N >= 10)，使用 ThinU/V
+    Eigen::JacobiSVD<Eigen::MatrixXd> svd_constrained(Ay_Sy, Eigen::ComputeThinU | Eigen::ComputeThinV);
 
-    // --- 8. 步骤 5: 组合最终解 ---
-    
-    // 将求解得到的 y (前 5 个元素) 和施加约束后的 g_normed (后 3 个元素) 
-    // 组合成最终的 8x1 解向量 x_out。
-    x_out.head<5>() = y;          // x_out[0]..x_out[4] = a, b, v_I0
-    x_out.tail<3>() = g_normed;   // x_out[5]..x_out[7] = g_normed
-    
-    // 如果所有步骤都顺利完成，返回 true。
+    // 检查 SVD 是否成功以及条件数
+    double cond_num_constrained = std::numeric_limits<double>::infinity();
+     if (svd_constrained.singularValues().size() > 0 && svd_constrained.singularValues().minCoeff() > min_singular_value_threshold) {
+        cond_num_constrained = svd_constrained.singularValues().maxCoeff() / svd_constrained.singularValues().minCoeff();
+     }
+    ROS_INFO("solveLinearSystem (Constrained Fit for y): Condition number = %.2e", cond_num_constrained);
+
+    Eigen::Matrix<double, 5, 1> y_scaled = svd_constrained.solve(b_y);
+     if (y_scaled.hasNaN()) {
+         ROS_ERROR("solveLinearSystem Error: Constrained SVD solve for y resulted in NaN!");
+         // 尝试回退到无约束解
+         ROS_WARN("Falling back to the unconstrained solution.");
+         x_out = x_svd;
+         // 再次检查回退解的有效性
+         if (std::abs(x_out(0)) < 1e-4 || x_out.segment<3>(5).norm() < 5.0) {
+              ROS_ERROR("solveLinearSystem Error: Fallback unconstrained solution is also unreasonable. Failed.");
+              return false;
+         }
+         return true;
+     }
+    Eigen::Matrix<double, 5, 1> y = S_y * y_scaled; // 恢复原始尺度
+
+    // --- 8. 组合最终解 ---
+    x_out.head<5>() = y;          // a, b, v_I0
+    x_out.tail<3>() = g_normed;   // 约束后的 g
+
+    ROS_INFO("solveLinearSystem finished successfully.");
     return true;
 }
