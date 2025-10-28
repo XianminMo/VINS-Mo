@@ -34,24 +34,12 @@ void Estimator::initDepthEstimator()
             ros::shutdown();
         }
 
-        ROS_INFO("正在初始化 FastInitializer...");
+        ROS_INFO("Initializing FastInitializer...");
         mp_fast_initializer = std::make_unique<FastInitializer>(&f_manager);
     }
 }
 // --- MODIFICATION END ---
 
-// --- MODIFICATION START ---
-/**
- * @brief 设置并缓存第一帧的原始图像，用于快速初始化
- * @param img 从ROS节点传入的cv::Mat格式的图像
- */
-void Estimator::setFirstImage(const cv::Mat &img)
-{
-    // 使用互斥锁确保线程安全
-    std::lock_guard<std::mutex> lock(m_depth_mutex);
-    m_first_raw_image = img.clone(); // 克隆图像以拥有其所有权
-}
-// --- MODIFICATION END ---
 
 /**
  * @brief 设置VINS系统的参数
@@ -156,7 +144,6 @@ void Estimator::clearState()
     {
         // 使用互斥锁保护深度图相关成员变量的访问，确保线程安全
         std::lock_guard<std::mutex> lock(m_depth_mutex);
-        m_first_raw_image.release();          // 释放原始图像内存
         m_first_frame_depth_computed = false; // 标记第一帧深度图未计算
         m_first_frame_depth_map.release();    // 释放深度图内存
     }
@@ -240,7 +227,7 @@ void Estimator::processIMU(double dt, const Vector3d &linear_acceleration, const
  * 这是VIO系统的核心驱动函数之一。它负责决定当前帧是否为关键帧，
  * 触发VIO初始化、后端优化和滑动窗口操作。
  */
-void Estimator::processImage(const map<int, vector<pair<int, Eigen::Matrix<double, 7, 1>>>> &image, const std_msgs::Header &header)
+void Estimator::processImage(const map<int, vector<pair<int, Eigen::Matrix<double, 7, 1>>>> &image, const std_msgs::Header &header, const cv::Mat &raw_image)
 {   
     // image数据结构: feature_id -> (camera_id, [x,y,z,u,v,velocity_x,velocity_y])
     ROS_DEBUG("new image coming ------------------------------------------");
@@ -261,11 +248,11 @@ void Estimator::processImage(const map<int, vector<pair<int, Eigen::Matrix<doubl
     // 存储当前帧的ROS消息头
     Headers[frame_count] = header;
 
-    // 创建图像帧对象，并与时间戳关联
-    ImageFrame imageframe(image, header.stamp.toSec());
-    // 将两帧之间的IMU预积分数据关联到当前图像帧
-    imageframe.pre_integration = tmp_pre_integration;
+    // 创建图像帧对象，并与时间戳关联, 将两帧之间的IMU预积分数据关联到当前图像帧
+    ImageFrame imageframe(image, header.stamp.toSec(), tmp_pre_integration, raw_image);
+
     all_image_frame.insert(make_pair(header.stamp.toSec(), imageframe));
+    
     // 为下一帧创建新的临时预积分对象
     tmp_pre_integration = new IntegrationBase{acc_0, gyr_0, Bas[frame_count], Bgs[frame_count]}; 
 
@@ -307,11 +294,13 @@ void Estimator::processImage(const map<int, vector<pair<int, Eigen::Matrix<doubl
                 // 1. 计算第一帧的深度图 (如果尚未计算)
                 if (!m_first_frame_depth_computed)
                 {
-                    // 从成员变量中获取已缓存的第一帧图像
+                    double first_frame_stamp = Headers[0].stamp.toSec();
                     cv::Mat first_img;
+
+                    auto it = all_image_frame.find(first_frame_stamp);
+                    if (it != all_image_frame.end() && !it->second.raw_image.empty())
                     {
-                        std::lock_guard<std::mutex> lock(m_depth_mutex);
-                        first_img = m_first_raw_image;
+                        first_img = it->second.raw_image;
                     }
 
                     if (!first_img.empty())

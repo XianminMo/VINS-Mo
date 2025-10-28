@@ -5,6 +5,11 @@
 #include <mutex>
 #include <condition_variable>
 #include <ros/ros.h>
+#include <sensor_msgs/Image.h>
+#include <sensor_msgs/PointCloud.h>
+#include <message_filters/subscriber.h>
+#include <message_filters/synchronizer.h>
+#include <message_filters/sync_policies/approximate_time.h>
 #include <cv_bridge/cv_bridge.h>
 #include <opencv2/opencv.hpp>
 
@@ -13,16 +18,10 @@
 #include "utility/visualization.h"
 std::condition_variable con;
 double current_time = -1;
-queue<sensor_msgs::ImuConstPtr> imu_buf;
-queue<sensor_msgs::PointCloudConstPtr> feature_buf;
-queue<sensor_msgs::PointCloudConstPtr> relo_buf;
+queue<sensor_msgs::ImuConstPtr> imu_buf; // IMU数据缓存
+queue<pair<sensor_msgs::PointCloudConstPtr, sensor_msgs::ImageConstPtr>> feature_img_buf; // 特征点和原始图像同步缓存
+queue<sensor_msgs::PointCloudConstPtr> relo_buf; // 重定位数据缓存
 int sum_of_wait = 0;
-
-// --- MODIFICATION START ---
-// 用于缓存第一帧原始图像
-cv::Mat first_image_mat;
-bool first_image_received = false;
-// --- MODIFICATION END ---
 
 std::mutex m_buf;
 std::mutex m_state;
@@ -96,41 +95,46 @@ void update()
 
 }
 
-std::vector<std::pair<std::vector<sensor_msgs::ImuConstPtr>, sensor_msgs::PointCloudConstPtr>>
+std::vector<std::tuple<std::vector<sensor_msgs::ImuConstPtr>, sensor_msgs::PointCloudConstPtr, sensor_msgs::ImageConstPtr>>
 getMeasurements()
 {
-    std::vector<std::pair<std::vector<sensor_msgs::ImuConstPtr>, sensor_msgs::PointCloudConstPtr>> measurements;
+    std::vector<std::tuple<std::vector<sensor_msgs::ImuConstPtr>, sensor_msgs::PointCloudConstPtr, sensor_msgs::ImageConstPtr>> measurements;
 
     while (true)
     {
-        if (imu_buf.empty() || feature_buf.empty())
+        if (imu_buf.empty() || feature_img_buf.empty())
             return measurements;
-        if (!(imu_buf.back()->header.stamp.toSec() > feature_buf.front()->header.stamp.toSec() + estimator_ptr->td))
+
+        // 检查IMU数据是否足够新，能够覆盖到最新的特征点+时间戳延迟
+        if (!(imu_buf.back()->header.stamp.toSec() > feature_img_buf.front().first->header.stamp.toSec() + estimator_ptr->td))
         {
-            //ROS_WARN("wait for imu, only should happen at the beginning");
             sum_of_wait++;
             return measurements;
         }
 
-        if (!(imu_buf.front()->header.stamp.toSec() < feature_buf.front()->header.stamp.toSec() + estimator_ptr->td))
+        // 检查最老的IMU数据是否比最老的特征点数据更早
+        if (!(imu_buf.front()->header.stamp.toSec() < feature_img_buf.front().first->header.stamp.toSec() + estimator_ptr->td))
         {
             ROS_WARN("throw img, only should happen at the beginning");
-            feature_buf.pop();
+            feature_img_buf.pop();
             continue;
         }
-        sensor_msgs::PointCloudConstPtr img_msg = feature_buf.front();
-        feature_buf.pop();
+        
+        // 提取同步好的特征点和图像消息
+        sensor_msgs::PointCloudConstPtr feature_msg = feature_img_buf.front().first;
+        sensor_msgs::ImageConstPtr image_msg = feature_img_buf.front().second;
+        feature_img_buf.pop();
 
         std::vector<sensor_msgs::ImuConstPtr> IMUs;
-        while (imu_buf.front()->header.stamp.toSec() < img_msg->header.stamp.toSec() + estimator_ptr->td)
+        while (imu_buf.front()->header.stamp.toSec() < feature_msg->header.stamp.toSec() + estimator_ptr->td)
         {
             IMUs.emplace_back(imu_buf.front());
             imu_buf.pop();
         }
-        IMUs.emplace_back(imu_buf.front()); // 用于插值计算，使得imu与img时间严格对齐
+        IMUs.emplace_back(imu_buf.front());
         if (IMUs.empty())
             ROS_WARN("no imu between two image");
-        measurements.emplace_back(IMUs, img_msg);
+        measurements.emplace_back(IMUs, feature_msg, image_msg);
     }
     return measurements;
 }
@@ -161,57 +165,27 @@ void imu_callback(const sensor_msgs::ImuConstPtr &imu_msg)
     }
 }
 
-
-void feature_callback(const sensor_msgs::PointCloudConstPtr &feature_msg)
+/**
+ * @brief 同步特征点和原始图像的回调函数
+ * 
+ * 使用 message_filters::Synchronizer 来确保收到的特征点云和原始图像具有相近的时间戳。
+ * 同步后的数据对被放入一个缓存队列中，等待主处理线程消耗。
+ * @param feature_msg 特征点云消息
+ * @param image_msg 原始图像消息
+ */
+void feature_img_callback(const sensor_msgs::PointCloudConstPtr &feature_msg, const sensor_msgs::ImageConstPtr &image_msg)
 {
     if (!init_feature)
     {
-        //skip the first detected feature, which doesn't contain optical flow speed
+        // 跳过第一帧，因为它没有光流速度信息
         init_feature = 1;
         return;
     }
     m_buf.lock();
-    feature_buf.push(feature_msg);
+    feature_img_buf.push(make_pair(feature_msg, image_msg));
     m_buf.unlock();
     con.notify_one();
 }
-
-// --- MODIFICATION START ---
-/**
- * @brief 订阅原始图像的回调函数
- * 
- * 仅在启用快速初始化时，缓存收到的第一帧图像。
- * @param img_msg 原始图像消息
- */
-void raw_image_callback(const sensor_msgs::ImageConstPtr &img_msg)
-{
-    // 仅在启用快速初始化且尚未收到第一帧图像时执行
-    if (USE_FAST_INIT && !first_image_received)
-    {
-        try
-        {
-            // 1. 先将 ROS 图像消息安全地转换为 OpenCV Mat (mono8)
-            cv_bridge::CvImageConstPtr cv_ptr = cv_bridge::toCvCopy(img_msg, sensor_msgs::image_encodings::MONO8);
-            
-            // 2. 创建一个三通道的 BGR 图像
-            cv::Mat bgr_image;
-            cv::cvtColor(cv_ptr->image, bgr_image, cv::COLOR_GRAY2BGR);
-
-            // 3. 缓存转换后的 BGR 图像
-            m_buf.lock(); // 使用与 process 线程相同的锁来确保线程安全
-            first_image_mat = bgr_image.clone();
-            first_image_received = true;
-            m_buf.unlock();
-            ROS_INFO("Fast-Init: Successfully cached and converted the first raw image (mono8 -> bgr8).");
-        }
-        catch (cv_bridge::Exception& e)
-        {
-            ROS_ERROR("cv_bridge exception: %s", e.what());
-            return;
-        }
-    }
-}
-// --- MODIFICATION END ---
 
 void restart_callback(const std_msgs::BoolConstPtr &restart_msg)
 {
@@ -219,8 +193,8 @@ void restart_callback(const std_msgs::BoolConstPtr &restart_msg)
     {
         ROS_WARN("restart the estimator!");
         m_buf.lock();
-        while(!feature_buf.empty())
-            feature_buf.pop();
+        while(!feature_img_buf.empty())
+            feature_img_buf.pop();
         while(!imu_buf.empty())
             imu_buf.pop();
         m_buf.unlock();
@@ -230,13 +204,6 @@ void restart_callback(const std_msgs::BoolConstPtr &restart_msg)
         m_estimator.unlock();
         current_time = -1;
         last_imu_t = 0;
-        // --- MODIFICATION START ---
-        // 重启时也要重置第一帧图像的缓存
-        m_buf.lock();
-        first_image_received = false;
-        first_image_mat.release();
-        m_buf.unlock();
-        // --- MODIFICATION END ---
     }
     return;
 }
@@ -254,7 +221,7 @@ void process()
 {
     while (true)
     {
-        std::vector<std::pair<std::vector<sensor_msgs::ImuConstPtr>, sensor_msgs::PointCloudConstPtr>> measurements;
+        std::vector<std::tuple<std::vector<sensor_msgs::ImuConstPtr>, sensor_msgs::PointCloudConstPtr, sensor_msgs::ImageConstPtr>> measurements;
         std::unique_lock<std::mutex> lk(m_buf);
         con.wait(lk, [&]
                  {
@@ -263,27 +230,15 @@ void process()
         lk.unlock();
         m_estimator.lock();
 
-        // --- MODIFICATION START ---
-        // 如果启用了快速初始化，并且收到了第一帧图像，则将其传递给 estimator
-        if (USE_FAST_INIT && first_image_received)
-        {
-            // 检查 estimator_ptr 是否是第一次处理图像 (frame_count == 0)
-            if (estimator_ptr->solver_flag == Estimator::SolverFlag::INITIAL && estimator_ptr->frame_count == 0)
-            {
-                estimator_ptr->setFirstImage(first_image_mat);
-                first_image_mat.release(); // 传递后释放内存，防止重复传递
-            }
-        }
-        // --- MODIFICATION END ---
-
         for (auto &measurement : measurements)
         {
-            auto img_msg = measurement.second;
+            auto feature_msg = std::get<1>(measurement);
+            auto image_msg = std::get<2>(measurement);
             double dx = 0, dy = 0, dz = 0, rx = 0, ry = 0, rz = 0;
-            for (auto &imu_msg : measurement.first)
+            for (auto &imu_msg : std::get<0>(measurement))
             {
                 double t = imu_msg->header.stamp.toSec();
-                double img_t = img_msg->header.stamp.toSec() + estimator_ptr->td;
+                double img_t = feature_msg->header.stamp.toSec() + estimator_ptr->td;
                 if (t <= img_t)
                 { 
                     if (current_time < 0)
@@ -348,35 +303,41 @@ void process()
                 estimator_ptr->setReloFrame(frame_stamp, frame_index, match_points, relo_t, relo_r);
             }
 
-            ROS_DEBUG("processing vision data with stamp %f \n", img_msg->header.stamp.toSec());
+            ROS_DEBUG("processing vision data with stamp %f \n", feature_msg->header.stamp.toSec());
 
             TicToc t_s;
             map<int, vector<pair<int, Eigen::Matrix<double, 7, 1>>>> image;
             // 构建image数据结构
             // feature_id -> (camera_id, [x,y,z,u,v,velocity_x,velocity_y])
             // x,y,z: 归一化坐标
-            for (unsigned int i = 0; i < img_msg->points.size(); i++)
+            for (unsigned int i = 0; i < feature_msg->points.size(); i++)
             {
-                int v = img_msg->channels[0].values[i] + 0.5;
+                int v = feature_msg->channels[0].values[i] + 0.5;
                 int feature_id = v / NUM_OF_CAM;
                 int camera_id = v % NUM_OF_CAM;
-                double x = img_msg->points[i].x;
-                double y = img_msg->points[i].y;
-                double z = img_msg->points[i].z;
-                double p_u = img_msg->channels[1].values[i];
-                double p_v = img_msg->channels[2].values[i];
-                double velocity_x = img_msg->channels[3].values[i];
-                double velocity_y = img_msg->channels[4].values[i];
+                double x = feature_msg->points[i].x;
+                double y = feature_msg->points[i].y;
+                double z = feature_msg->points[i].z;
+                double p_u = feature_msg->channels[1].values[i];
+                double p_v = feature_msg->channels[2].values[i];
+                double velocity_x = feature_msg->channels[3].values[i];
+                double velocity_y = feature_msg->channels[4].values[i];
                 ROS_ASSERT(z == 1);
                 Eigen::Matrix<double, 7, 1> xyz_uv_velocity;
                 xyz_uv_velocity << x, y, z, p_u, p_v, velocity_x, velocity_y;
                 image[feature_id].emplace_back(camera_id,  xyz_uv_velocity);
             }
-            estimator_ptr->processImage(image, img_msg->header);
+
+            // 将原始图像转换为 BGR 格式以供深度估计器使用
+            cv_bridge::CvImageConstPtr cv_ptr = cv_bridge::toCvCopy(image_msg, sensor_msgs::image_encodings::MONO8);
+            cv::Mat bgr_image;
+            cv::cvtColor(cv_ptr->image, bgr_image, cv::COLOR_GRAY2BGR);
+
+            estimator_ptr->processImage(image, feature_msg->header, bgr_image);
 
             double whole_t = t_s.toc();
             printStatistics(*estimator_ptr, whole_t);
-            std_msgs::Header header = img_msg->header;
+            std_msgs::Header header = feature_msg->header;
             header.frame_id = "world";
 
             pubOdometry(*estimator_ptr, header);
@@ -387,7 +348,7 @@ void process()
             pubKeyframe(*estimator_ptr);
             if (relo_msg != NULL)
                 pubRelocalization(*estimator_ptr);
-            //ROS_ERROR("end: %f, at %f", img_msg->header.stamp.toSec(), ros::Time::now().toSec());
+            //ROS_ERROR("end: %f, at %f", feature_msg->header.stamp.toSec(), ros::Time::now().toSec());
         }
         m_estimator.unlock();
         m_buf.lock();
@@ -432,18 +393,13 @@ int main(int argc, char **argv)
     // 使用tcpNoDelay()优化TCP传输，减少延迟
     ros::Subscriber sub_imu = n.subscribe(IMU_TOPIC, 2000, imu_callback, ros::TransportHints().tcpNoDelay());
 
-    // 订阅特征跟踪器输出的特征点数据：话题为"/feature_tracker/feature"，回调函数为feature_callback
-    ros::Subscriber sub_image = n.subscribe("/feature_tracker/feature", 2000, feature_callback);
+    // 使用 message_filters 同步特征点和原始图像
+    message_filters::Subscriber<sensor_msgs::PointCloud> sub_feature(n, "/feature_tracker/feature", 2000);
+    message_filters::Subscriber<sensor_msgs::Image> sub_image(n, IMAGE_TOPIC, 2000);
 
-    // --- MODIFICATION START ---
-    // 如果启用了快速初始化，则额外订阅原始图像话题
-    ros::Subscriber sub_raw_image;
-    if (USE_FAST_INIT)
-    {
-        sub_raw_image = n.subscribe(IMAGE_TOPIC, 100, raw_image_callback);
-        ROS_INFO("Fast-Init: Subscribing to raw image topic: %s", IMAGE_TOPIC.c_str());
-    }
-    // --- MODIFICATION END ---
+    typedef message_filters::sync_policies::ApproximateTime<sensor_msgs::PointCloud, sensor_msgs::Image> MySyncPolicy;
+    message_filters::Synchronizer<MySyncPolicy> sync(MySyncPolicy(10), sub_feature, sub_image);
+    sync.registerCallback(boost::bind(&feature_img_callback, _1, _2));
 
     // 订阅重启信号：话题为"/feature_tracker/restart"，回调函数为restart_callback
     ros::Subscriber sub_restart = n.subscribe("/feature_tracker/restart", 2000, restart_callback);

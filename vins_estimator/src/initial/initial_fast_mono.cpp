@@ -91,9 +91,7 @@ bool FastInitializer::initialize(const std::map<double, ImageFrame>& image_frame
 
             if (v >= 0 && v < first_frame_rows && u >= 0 && u < first_frame_cols)
             {
-                double d_hat_i = static_cast<double>(first_frame_norm_inv_depth.at<float>(v, u));
-                // 确保深度值有效 (例如 > 0)
-                if (d_hat_i <= 1e-6) continue;
+                double d_hat_i_inv = static_cast<double>(first_frame_norm_inv_depth.at<float>(v, u));
 
                 // 遍历该特征在后续帧 k > 0 的观测
                 for (size_t frame_idx = 1; frame_idx < feature.feature_per_frame.size(); ++frame_idx)
@@ -112,7 +110,7 @@ bool FastInitializer::initialize(const std::map<double, ImageFrame>& image_frame
                         obs_data.pre_integration_k = pre_integrations_compound[frame_k_window_index]; // $\Delta_{I_0}^{I_k}$
                         obs_data.z_i0 = z_i0;
                         obs_data.z_ik = z_ik;
-                        obs_data.d_hat_i = d_hat_i;
+                        obs_data.d_hat_i = d_hat_i_inv;
                         all_observations.push_back(obs_data);
                     }
                 }
@@ -380,116 +378,72 @@ void FastInitializer::buildLinearSystemRow(const IntegrationBase* pre_int_k, // 
                                          Eigen::Vector2d& b_row)        // 输出: 填充好的 b' 向量的 2 行
 {
     // --- 1. 提取外参 ---
-    // 重要！！！ R_c_i 代表 R_{C}^{I} (从 Camera 到 IMU 的旋转)T_c_i 代表 T_{C}^{I} (Camera 在 IMU 系下的平移)
-
-    // 从全局配置 parameters.h 中读取 IMU 到 Camera 的外参。
-    // RIC[0] (全局变量) 存储的是从 Camera 到 IMU 的旋转矩阵 R_c_i 
-    // VINS-Mono 使用的是 R_c_i (IMU Frame to Camera Frame Rotation)。
+    // R_c_i (RIC[0]) = {}_{C}^{I}R (从 Camera 到 IMU 的旋转)
+    // T_c_i (TIC[0]) = {}^{I}p_C (Camera 在 IMU 系下的平移)
     const Eigen::Matrix3d& R_c_i = RIC[0];
-    // TIC[0] (全局变量) 存储的是 Camera 在 IMU 坐标系下的平移向量 T_c_i 
-    // VINS-Mono 使用的是 T_c_i (IMU Frame to Camera Frame Translation)。
-    const Eigen::Vector3d& T_c_i = TIC[0];
-    // 计算从 IMU 到 Camera 的旋转 R_i_c = R_c_i^T 
+    const Eigen::Vector3d& T_c_i_in_I = TIC[0];
+
+    // R_i_c = R_c_i^T = {}_{I}^{C}R (从 IMU 到 Camera 的旋转)
     Eigen::Matrix3d R_i_c = R_c_i.transpose();
-    // 计算 IMU 在 Camera 坐标系下的平移 T_i_c = -R_i_c * T_c_i 
-    Eigen::Vector3d T_i_c = -R_i_c * T_c_i;
+    // T_i_c = -R_i_c * T_c_i_in_I = {}^{C}p_I (IMU 在 Camera 系下的平移)
+    Eigen::Vector3d T_i_c_in_C = -R_i_c * T_c_i_in_I;
 
-    // --- 2. 提取 IMU 预积分信息 ---
-    // 从输入的预积分对象 pre_int_k 中提取所需的值。这个对象包含了从 I0 到 Ik 的相对运动。
-    // R_I0_Ik: 从第一帧 IMU 坐标系 (I0) 到第 k 帧 IMU 坐标系 (Ik) 的旋转。
-    // 注意 delta_q 存储的是从旧帧到新帧的旋转，所以 R_I0_Ik = delta_q.toRotationMatrix()。
+    // --- 2. 提取 IMU 预积分信息 (I0 -> Ik) ---
+    // R_I0_Ik = {}_{I_0}^{I_k}R
     Eigen::Matrix3d R_I0_Ik = pre_int_k->delta_q.toRotationMatrix();
-    // p_Ik_in_I0: 第 k 帧 IMU 相对于第一帧 IMU 的位移，在 I0 坐标系下表示。
-    Eigen::Vector3d p_Ik_in_I0 = pre_int_k->delta_p;
-    // delta_t: 从第 0 帧到第 k 帧的时间差。
+    // I0_alpha_Ik = {}^{I_0}\alpha_{I_k} (VINS-Mono 的 delta_p 对应论文的 alpha)
+    Eigen::Vector3d I0_alpha_Ik = pre_int_k->delta_p;
+    // delta_t = \Delta T_k
     double delta_t = pre_int_k->sum_dt;
+    double delta_t_sq = delta_t * delta_t;
 
-    // --- 3. 计算推导所需的坐标系变换 (核心部分) ---
-    // 论文的推导是基于世界坐标系 W 就是第一帧 IMU 坐标系 I0 (W=I0) 的假设。
-    // 我们需要计算以下几个关键的变换矩阵，以便将不同坐标系下的量关联起来：
-    
-    // R_i0_ck: 从 I0 系（世界系）到 Ck 系（第 k 帧相机系）的旋转。
-    // 变换链条： I0 -> Ik -> Ck
-    // R_i0_ck = R_ik_ck * R_i0_ik
-    // 其中 R_ik_ck = R_i_c (IMU 相对于相机的旋转，是外参的逆)
-    // R_I0_Ik (从 I0 到 Ik 的旋转)
-    // 因此 R_i0_ck = R_i_c * R_I0_Ik
-    Eigen::Matrix3d R_i0_ck = R_i_c * R_I0_Ik;
-    
-    // T_i0_c0: I0 在 Camera0 系下的平移。
-    Eigen::Vector3d T_i0_c0 = T_i_c;
+    // --- 3. 计算论文中的关键中间变量 ---
 
-    // T_c0_i0: Camera0 在 I0 系下的平移。
-    Eigen::Vector3d T_c0_i0 = T_c_i; 
-    
-    // [z_ik]_x: 观测向量 z_ik 的反对称矩阵 (Skew-symmetric matrix)。
-    // 用于将叉乘运算转换为矩阵乘法 (a x b = [a]_x * b)。这是 VIO 推导中常用的技巧。
-    // 比如论文中的核心约束是 z_ik 与某个向量平行，即 z_ik x Vector = 0，转换为 [z_ik]_x * Vector = 0。
-    Eigen::Matrix3d z_ik_hat = Utility::skewSymmetric(z_ik);
-    
-    // R_i0_c0: 从 I0 系到 Cam0 系的旋转。
-    // 这是外参 R_ic 的逆
-    Eigen::Matrix3d R_i0_c0 = R_i_c;
+    // Upsilon_i,k = Gamma_i,k * {}_{I}^{C}R * {}_{I_0}^{I_k}R
+    // 
+    Eigen::Matrix3d z_ik_hat = Utility::skewSymmetric(z_ik); // Gamma_i,k
+    Eigen::Matrix3d Upsilon_3x3 = z_ik_hat * R_i_c * R_I0_Ik; // 注意：这里 R_i_c 是 {}_{I}^{C}R
 
-    // R_c0_i0: 从 Cam0 系到 I0 系的旋转。
-    Eigen::Matrix3d R_c0_i0 = R_c_i;
+    // d_i = 1 / d_hat_i (因为 d_hat_i 是逆深度)
+    // [cite: 183-184]
+    double d_i = 1.0 / d_hat_i; // d_hat_i 保证在 [1, 2] 范围，不会除零
 
-    // --- 4. 计算 Equation (23) 中的各个系数项 ---
-    // 论文公式: M1*a + M2*b + Tv*v_I0 + Tg*g_I0 + Tc = 0
-    // 我们的目标是计算出 M1, M2, Tv, Tg, Tc 这五个矩阵或向量。
+    // {}^{I_0}\theta_{C_0 \to f_i} = {}_{C_0}^{I_0}R * z_i0
+    // [cite: 169-171]
+    // {}_{C_0}^{I_0}R (从 C0 到 I0) 就是外参 R_c_i
+    Eigen::Vector3d I0_theta_C0_fi = R_c_i * z_i0;
 
-    // 4.1. 计算 M1 和 M2 (论文中的 M3) - 涉及 a 和 b 的项
-    // 这两项主要来源于公式右侧表示特征点在 C0 系下位置 p_c0 的项，经过一系列坐标变换和线性化得到。
-    // 论文通过复杂的代数运算（见附录推导），将包含 p_c0 的项线性化，直接给出了 M1 和 M2 (对应代码 M2_3d) 的表达式。
-    
-    // 公共部分: [z_ik]_x * R_i0_ck * R_c0_i0
-    // 这个公共项代表了从 C0 系的点坐标到 Ck 系下与 z_ik 叉乘结果的线性变换。
-    Eigen::Matrix3d common_term = z_ik_hat * R_i0_ck * R_c0_i0;
-    
-    // M2 (对 b 的系数，代码记为 M2_3d) 的 3D 向量: common_term * z_i0
-    // 这个对应论文公式中与 b 相关的部分。
-    Eigen::Vector3d M2_3d = common_term * z_i0; 
-    
-    // M1 (对 a 的系数) 的 3D 向量: common_term * (d_hat_i * z_i0)
-    // 这个对应论文公式中与 a 相关的部分。注意它与 M2 很像，只是多乘了一个 d_hat_i。
-    Eigen::Vector3d M1_3d = common_term * (1 / d_hat_i * z_i0);
+    // --- 4. 构建 A' 矩阵的系数 [M1, M2, Tv, Tg] ---
+    // x' = [a, b, v_I0(3), g_I0(3)]^T
 
-    // 4.2. 计算 Tv - 涉及 v_I0 (第一帧 IMU 速度) 的项
-    // 经过坐标变换和叉乘操作后，提取出 v_I0 的系数矩阵：
-    // Tv = [z_ik]_x * R_i0_ck * (delta_t * Identity)
-    Eigen::Matrix<double, 3, 3> Tv_3d = -z_ik_hat * R_i0_ck * delta_t;
+    // M1 = Upsilon * d_i * I0_theta_C0_fi
+    Eigen::Vector3d M1_3d = Upsilon_3x3 * d_i * I0_theta_C0_fi;
 
-    // 4.3. 计算 Tg - 涉及 g_I0 (第一帧 IMU 系下的重力) 的项
-    // 经过坐标变换和叉乘操作后，提取出 g_I0 的系数矩阵：
-    // Tg = [z_ik]_x * R_i0_ck * (0.5 * delta_t^2 * Identity)
-    Eigen::Matrix<double, 3, 3> Tg_3d = z_ik_hat * R_i0_ck * (0.5 * delta_t * delta_t);
+    // M2 = Upsilon * I0_theta_C0_fi
+    Eigen::Vector3d M2_3d = Upsilon_3x3 * I0_theta_C0_fi;
 
-    // 4.4. 计算 Tc - 常数项 (不涉及未知数 a, b, v, g)
-    // 这项包含了所有剩余的、只与已知量（外参 T_ci, 预积分位移 p_Ik_in_I0）相关的部分。
-    // Tc = [z_ik]_x * ( R_ck_i0 * T_i0_ci - T_ck_ci + R_ck_i0 * p_Ik_in_I0 )
-    Eigen::Vector3d Tc_3d = z_ik_hat * ( R_i0_ck * T_c0_i0 + T_i0_c0 - R_i0_ck * p_Ik_in_I0 );
+    // Tv = -Upsilon * \Delta T_k
+    // 
+    Eigen::Matrix<double, 3, 3> Tv_3d = -Upsilon_3x3 * delta_t;
 
-    // --- 5. 构建 A' 和 b' 的对应行 ---
-    // 论文的最终线性方程是 M1*a + M2*b + Tv*v + Tg*g + Tc = 0
-    // 我们将其写成 A' * x' = b' 的形式，其中 x' = [a, b, v_I0^T, g_I0^T]^T
-    // A' = [M1, M2, Tv, Tg] (只取结果的前两行，对应图像 x, y 坐标的约束)
-    // b' = -Tc (只取结果的前两行)
+    // Tg = Upsilon * (0.5 * \Delta T_k^2)
+    // 
+    Eigen::Matrix<double, 3, 3> Tg_3d = Upsilon_3x3 * (0.5 * delta_t_sq);
 
-    // A_row 是 2x8 的矩阵
-    // x' 的结构是 [ a (第0列), b (第1列), vx, vy, vz (第2-4列), gx, gy, gz (第5-7列) ]
+    // --- 5. 构建 b' 向量 (RHS) ---
+    // b' = Upsilon * I0_alpha_Ik - Upsilon * {}^{I}p_C - Gamma_i,k * {}^{C}p_I
+    // 
+    Eigen::Vector3d b_prime_3d = Upsilon_3x3 * I0_alpha_Ik - Upsilon_3x3 * T_c_i_in_I - z_ik_hat * T_i_c_in_C;
 
-    // 填充 A_row 的第 0 列 (对应未知数 a) - 取 M1_3d 的前两行
-    A_row.block<2, 1>(0, 0) = M1_3d.head<2>();      
-    // 填充 A_row 的第 1 列 (对应未知数 b) - 取 M2_3d (即 M2) 的前两行
-    A_row.block<2, 1>(0, 1) = M2_3d.head<2>();      
-    // 填充 A_row 的第 2 到 4 列 (对应未知数 v_I0) - 取 Tv_3d 的前 2 行、前 3 列
-    A_row.block<2, 3>(0, 2) = Tv_3d.block<2, 3>(0, 0); 
-    // 填充 A_row 的第 5 到 7 列 (对应未知数 g_I0) - 取 Tg_3d 的前 2 行、前 3 列
-    A_row.block<2, 3>(0, 5) = Tg_3d.block<2, 3>(0, 0); 
-    
-    // 填充 b_row (方程右侧) - 取 -Tc_3d 的前两行
-    // 因为原始方程是 ... + Tc = 0，所以 A'x' = -Tc
-    b_row = -Tc_3d.head<2>(); 
+    // --- 6. 填充 A_row (2x8) 和 b_row (2x1) ---
+    // 取 3D 向量/矩阵的前两行
+
+    A_row.block<2, 1>(0, 0) = M1_3d.head<2>();      // M1 (a)
+    A_row.block<2, 1>(0, 1) = M2_3d.head<2>();      // M2 (b)
+    A_row.block<2, 3>(0, 2) = Tv_3d.block<2, 3>(0, 0); // Tv (v_I0)
+    A_row.block<2, 3>(0, 5) = Tg_3d.block<2, 3>(0, 0); // Tg (g_I0)
+
+    b_row = b_prime_3d.head<2>(); // b'
 
     // 函数结束时，A_row 和 b_row 就包含了由这一个 (i, k) 观测所贡献的两个线性方程。
     // RANSAC 和最终求解函数会调用这个函数多次，将得到的 A_row 和 b_row 堆叠起来，
@@ -547,6 +501,20 @@ bool FastInitializer::solveRANSAC(const std::vector<ObservationData>& all_observ
         // 遍历最小集中的 4 个观测
         for (int i = 0; i < fast_mono::RANSAC_MIN_MEASUREMENTS; ++i)
         {   
+            // --- 在此添加调试代码 ---
+            const auto& obs = minimal_set[i];
+            if (std::isnan(obs.d_hat_i) || std::isinf(obs.d_hat_i))
+                ROS_ERROR("FastInit DEBUG: d_hat_i is NaN/Inf!");
+
+            if (obs.pre_integration_k->delta_q.coeffs().hasNaN())
+                ROS_ERROR("FastInit DEBUG: pre_int_k->delta_q is NaN!");
+
+            if (obs.pre_integration_k->delta_p.hasNaN())
+                ROS_ERROR("FastInit DEBUG: pre_int_k->delta_p is NaN!");
+
+            if (std::isnan(obs.pre_integration_k->sum_dt) || obs.pre_integration_k->sum_dt <= 0)
+                ROS_ERROR("FastInit DEBUG: sum_dt is invalid: %f", obs.pre_integration_k->sum_dt);
+
             // 为每个观测构建对应的 2x8 的 A_row 和 2x1 的 b_row
             Eigen::Matrix<double, 2, 8> A_row;
             Eigen::Vector2d b_row;
@@ -558,15 +526,57 @@ bool FastInitializer::solveRANSAC(const std::vector<ObservationData>& all_observ
             b_min.block<2, 1>(i * 2, 0) = b_row;
         }
 
+        // ***** 新增：数值预处理 *****
+        // 创建一个对角缩放矩阵 S
+        // 我们保持 a, b 的尺度 O(1)
+        // 我们将 v 的列 (col 2,3,4) 放大 10 倍 (O(1e-1) -> O(1))
+        // 我们将 g 的列 (col 5,6,7) 放大 100 倍 (O(1e-2) -> O(1))
+        Eigen::Matrix<double, 8, 8> S = Eigen::Matrix<double, 8, 8>::Identity();
+        S(2, 2) = 10.0;
+        S(3, 3) = 10.0;
+        S(4, 4) = 10.0;
+        S(5, 5) = 100.0;
+        S(6, 6) = 100.0;
+        S(7, 7) = 100.0;
+
+        // 求解缩放后的系统: (A_min * S) * x_scaled = b_min
+        // 其中 x_scaled = S_inv * x_candidate
+        Eigen::Matrix<double, 8, 1> x_scaled = (A_min * S).jacobiSvd(Eigen::ComputeFullU | Eigen::ComputeFullV).solve(b_min);
+        
+        // 从 x_scaled 恢复回 x_candidate
+        // x_candidate = S * x_scaled
+        Eigen::Matrix<double, 8, 1> x_candidate = S * x_scaled;
+        
+        // ***** 结束新增代码 *****
+
         // --- MODIFICATION START: Remove ThinU/ThinV for fixed-size matrix ---
         // 使用 SVD 求解这个 8x8 的线性方程组 A_min * x = b_min。
         // 对于固定大小的方阵，不能使用 ComputeThinU 或 ComputeThinV 选项。
-        Eigen::Matrix<double, 8, 1> x_candidate = A_min.jacobiSvd(Eigen::ComputeFullU | Eigen::ComputeFullV).solve(b_min);
+        // Eigen::Matrix<double, 8, 1> x_candidate = A_min.jacobiSvd(Eigen::ComputeFullU | Eigen::ComputeFullV).solve(b_min);
         // --- MODIFICATION END ---
+
+        // ***** 在此添加调试打印 *****
+        if (iter < 10) // 只打印前 10 次迭代
+        {
+            ROS_INFO("FastInit DEBUG (iter %d):", iter);
+            ROS_INFO("  a=%.3f, b=%.3f", x_candidate(0), x_candidate(1));
+            ROS_INFO("  v = [%.3f, %.3f, %.3f]", x_candidate(2), x_candidate(3), x_candidate(4));
+            ROS_INFO("  g = [%.3f, %.3f, %.3f] (norm: %.3f)", 
+                    x_candidate(5), x_candidate(6), x_candidate(7), x_candidate.segment<3>(5).norm());
+            
+            // (可选) 打印 A_min 和 b_min 的范数，看看它们是否有问题
+            ROS_INFO("  A_min norm: %.3f, b_min norm: %.3f", A_min.norm(), b_min.norm());
+        }
+        // ***** 调试结束 *****
 
         // (可选) 检查解是否有效 (例如，重力幅度)
         double g_norm_cand = x_candidate.segment<3>(5).norm();
-        if (g_norm_cand < 1.0) continue; // 导致系统接近奇异，解不可靠。跳过这次迭代
+        if (g_norm_cand < 5.0 || g_norm_cand > 15.0 || x_candidate.hasNaN()) //
+        {
+            if (iter < 10)
+                ROS_WARN("FastInit DEBUG (iter %d): Invalid candidate solution detected. Skipping this iteration.", iter);
+            continue; // 必须跳过这次迭代！
+        }
 
         // 3. 检验内点 (使用代数误差的平方)
         // 用于存储当前假设 x_candidate 所对应的内点的索引

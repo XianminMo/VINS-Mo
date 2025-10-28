@@ -14,15 +14,16 @@ class ImageFrame
 {
     public:
         ImageFrame(){};
-        ImageFrame(const map<int, vector<pair<int, Eigen::Matrix<double, 7, 1>>>>& _points, double _t):t{_t},is_key_frame{false}
-        {
-            points = _points;
-        };
+        ImageFrame(const map<int, vector<pair<int, Eigen::Matrix<double, 7, 1>>>>& _points, 
+            double _t, IntegrationBase* _pre_integration, const cv::Mat& _raw_image)
+            : points{_points}, t{_t}, pre_integration{_pre_integration}, raw_image{_raw_image.clone()}, 
+            is_key_frame{false} {}
         map<int, vector<pair<int, Eigen::Matrix<double, 7, 1>> > > points;
         double t;
         Matrix3d R;
         Vector3d T;
         IntegrationBase *pre_integration;
+        cv::Mat raw_image;
         bool is_key_frame;
 };
 

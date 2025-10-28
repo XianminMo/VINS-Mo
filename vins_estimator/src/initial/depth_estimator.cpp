@@ -149,7 +149,7 @@ bool DepthEstimator::predict(const cv::Mat& image, cv::Mat& norm_inv_depth_map)
         // 4.2. (关键!) 归一化到 [0, 1] 范围，类型为 CV_32F
         // 这就是论文中的 d_hat
         cv::Mat normalized_float_map;
-        cv::normalize(raw_inv_depth, normalized_float_map, 0.0, 1.0, cv::NORM_MINMAX, CV_32F);
+        cv::normalize(raw_inv_depth, normalized_float_map, 1.0, 2.0, cv::NORM_MINMAX, CV_32F);
 
         // 4.3. 缩放回原始图像尺寸 (使用线性插值)，以便特征点可以被直接采样
         cv::resize(normalized_float_map, norm_inv_depth_map, image.size(), 0, 0, cv::INTER_LINEAR);
