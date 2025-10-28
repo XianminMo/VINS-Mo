@@ -41,15 +41,15 @@ bool FastInitializer::initialize(const std::map<double, ImageFrame>& image_frame
                 return false;
             }
 
-            // --- MODIFICATION START: Use parameterized constructor ---
+            // 复合 I0->Ik 的预积分（i=0, j=k-1, k）
             IntegrationBase* new_compound = new IntegrationBase(Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero(),
-                                                                Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero());
-            // --- MODIFICATION END ---
-            new_compound->sum_dt = prev_compound->sum_dt + delta_integration->sum_dt;
+            Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero());
+            new_compound->sum_dt  = prev_compound->sum_dt + delta_integration->sum_dt;
             new_compound->delta_q = prev_compound->delta_q * delta_integration->delta_q;
-            new_compound->delta_p = prev_compound->delta_p + prev_compound->delta_q * delta_integration->delta_p;
             new_compound->delta_v = prev_compound->delta_v + prev_compound->delta_q * delta_integration->delta_v;
-            // 注意: 雅可比和协方差的复合在这里不是必需的
+            new_compound->delta_p = prev_compound->delta_p
+                                    + prev_compound->delta_v * delta_integration->sum_dt
+                                    + prev_compound->delta_q * delta_integration->delta_p;
 
             pre_integrations_compound.push_back(new_compound);
         }
@@ -332,7 +332,7 @@ bool FastInitializer::initialize(const std::map<double, ImageFrame>& image_frame
             // --- 状态传播公式 ---
             // R_{w}^{k} 表示w到I_{k-1}的旋转
             // R_{w}^{k} = delta_R_{k-1}^{k} * R_{w}^{k-1}
-            Eigen::Quaterniond R_curr = pre_int_delta->delta_q * R_prev;
+            Eigen::Quaterniond R_curr = R_prev * pre_int_delta->delta_q ;
 
 
             // p_k = p_{k-1} + v_{k-1} * dt - 0.5*g*dt^2 + R_{w}^{k-1} * delta_p
