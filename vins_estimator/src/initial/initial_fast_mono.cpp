@@ -43,7 +43,7 @@ bool FastInitializer::initialize(const std::map<double, ImageFrame>& image_frame
 
             // 复合 I0->Ik 的预积分（i=0, j=k-1, k）
             IntegrationBase* new_compound = new IntegrationBase(Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero(),
-            Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero());
+                                                                Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero());
             new_compound->sum_dt  = prev_compound->sum_dt + delta_integration->sum_dt;
             new_compound->delta_q = prev_compound->delta_q * delta_integration->delta_q;
             new_compound->delta_v = prev_compound->delta_v + prev_compound->delta_q * delta_integration->delta_v;
@@ -204,13 +204,13 @@ bool FastInitializer::initialize(const std::map<double, ImageFrame>& image_frame
                 double d_hat_i_inv = static_cast<double>(first_frame_norm_inv_depth.at<float>(v, u));
                 
                 // 检查预测的逆深度值是否有效 (例如大于一个很小的正数，避免除零)。
-                if (d_hat_i > 1e-6)
+                if (d_hat_i_inv > 1e-6)
                 {
                     // 应用核心公式: z = a * d_hat_inv + b 计算估计的深度。
                     double estimated_depth = a * 1.0 / d_hat_i_inv + b;
                     
                     // 检查估计的逆深度是否为正数 (因为深度 z 必须为正)。
-                    if (estimated_inv_depth > 1e-6)
+                    if (estimated_depth > 1e-6)
                     {                       
                         // 对计算出的深度值进行范围检查，剔除过近或过远的点。
                         // 0.1m 到 50m 是一个常用的经验范围。
