@@ -325,7 +325,7 @@ bool FastInitializer::initialize(const std::map<double, ImageFrame>& image_frame
 
             // --- 状态传播公式 ---
             // R_{k}^{w} 表示I_{k}到w的旋转
-            // R_{k}^{w} = R_{k-1}^{w} * delta_R_{k}^{k-1} * 
+            // R_{k}^{w} = R_{k-1}^{w} * delta_R_{k}^{k-1}
             Eigen::Quaterniond R_curr = R_prev * pre_int_delta->delta_q ;
 
 
@@ -371,16 +371,32 @@ void FastInitializer::buildLinearSystemRow(const IntegrationBase* pre_int_k, // 
                                          Eigen::Matrix<double, 2, 8>& A_row, // 输出: 填充好的 A' 矩阵的 2 行
                                          Eigen::Vector2d& b_row)        // 输出: 填充好的 b' 向量的 2 行
 {
-    // --- 1. 提取外参 ---
-    // R_i_c = R^I_C = {}_{I}^{C}R (IMU -> Camera)
-    // R_c_i = R^C_I = {}_{C}^{I}R (Camera -> IMU)
-    const Eigen::Matrix3d& R_i_c = RIC[0];
-    Eigen::Matrix3d R_c_i = R_i_c.transpose();
+    // --- 1. 提取外参 (VINS-Mono 标准: Camera-to-IMU) ---
 
-    // T_c_i (in I) = {}^{I}p_C (Camera 在 IMU 系下的平移)
-    const Eigen::Vector3d& T_c_i_in_I = TIC[0];
-    // T_i_c (in C) = {}^{C}p_I = - R^C_I * {}^{I}p_C
-    Eigen::Vector3d T_i_c_in_C = -R_c_i * T_c_i_in_I;
+    // R_c_i = R^C_I = {}_{C}^{I}R (Camera -> IMU 旋转)
+    // 这就是 VINS-Mono 中 `RIC` 的定义
+    const Eigen::Matrix3d& R_c_i = RIC[0]; 
+
+    // T_c_i_in_I = {}^{I}p_C (Camera 光心在 IMU 系下的平移)
+    // 这就是 VINS-Mono 中 `TIC` 的定义
+    const Eigen::Vector3d& T_c_i_in_I = TIC[0]; 
+
+    // --- 派生逆变换 (IMU-to-Camera) ---
+
+    // R_i_c = R^I_C = {}_{I}^{C}R (IMU -> Camera 旋转)
+    // 它是 R_c_i 的逆 (转置)
+    Eigen::Matrix3d R_i_c = R_c_i.transpose(); 
+
+    // T_i_c_in_C = {}^{C}p_I (IMU 原点在 Camera 系下的平移)
+    //
+    // 推导:
+    // P_I = R_c_i * P_C + T_c_i_in_I
+    // P_C = (R_c_i)^-1 * (P_I - T_c_i_in_I)
+    // P_C = R_i_c * P_I - R_i_c * T_c_i_in_I
+    //
+    // 比较 P_C = R_i_c * P_I + T_i_c_in_C
+    // 可得: T_i_c_in_C = -R_i_c * T_c_i_in_I
+    Eigen::Vector3d T_i_c_in_C = -R_i_c * T_c_i_in_I;
 
     // --- 2. 提取 IMU 预积分信息 (I0 -> Ik) ---
     Eigen::Matrix3d R_Ik_I0 = pre_int_k->delta_q.toRotationMatrix();
