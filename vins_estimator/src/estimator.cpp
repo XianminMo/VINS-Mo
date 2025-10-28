@@ -327,12 +327,7 @@ void Estimator::processImage(const map<int, vector<pair<int, Eigen::Matrix<doubl
                 // 2. 检查深度图是否就绪
                 if (m_first_frame_depth_computed)
                 {
-                    //
-                    // =====================================================================
-                    // === 此处为快速初始化求解器的预留位置 ===
-                    // =====================================================================
-                    //
-                    // TODO: 在这里调用基于RANSAC的快速初始化求解器，利用深度图恢复尺度、重力和速度。
+                    // 在这里调用基于RANSAC的快速初始化求解器，利用深度图恢复尺度、重力和速度。
                     TicToc t_fast_init;
                     std::map<int, Eigen::Vector3d> Ps_init;
                     std::map<int, Eigen::Vector3d> Vs_init;

@@ -9,7 +9,7 @@ FastInitializer::FastInitializer(FeatureManager* f_manager_ptr)
 
 // 主初始化函数
 bool FastInitializer::initialize(const std::map<double, ImageFrame>& image_frames,
-                               const cv::Mat& first_frame_norm_inv_depth, // CV_32F, [0,1]
+                               const cv::Mat& first_frame_norm_inv_depth, // CV_32F, [1,2]
                                Eigen::Vector3d& G_gravity_world, // Global gravity (e.g., [0, 0, 9.8])
                                std::map<int, Eigen::Vector3d>& Ps_out,
                                std::map<int, Eigen::Vector3d>& Vs_out,
@@ -21,10 +21,10 @@ bool FastInitializer::initialize(const std::map<double, ImageFrame>& image_frame
     std::vector<IntegrationBase*> pre_integrations_compound; // 存储 $\Delta_{I_0}^{I_k}$
 
     // 1.1. 复合 IMU 预积分: VINS-Mono 的 all_image_frame[k].pre_integration 是 $\Delta_{I_{k-1}}^{I_k}$
-    // --- MODIFICATION START: Use parameterized constructor ---
+
     IntegrationBase* current_pre_integration = new IntegrationBase(Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero(),
                                                                    Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero());
-    // --- MODIFICATION END ---
+
     pre_integrations_compound.push_back(current_pre_integration);
 
     int k_index = 0; // 帧在窗口内的索引
@@ -60,7 +60,7 @@ bool FastInitializer::initialize(const std::map<double, ImageFrame>& image_frame
     int first_frame_rows = first_frame_norm_inv_depth.rows;
     int first_frame_cols = first_frame_norm_inv_depth.cols;
 
-    // --- 新增: 找到当前滑动窗口的起始帧ID ---
+    // 找到当前滑动窗口的起始帧ID 
     int window_start_frame_id = -1;
     if (!m_feature_manager->feature.empty()) {
         window_start_frame_id = m_feature_manager->feature.front().start_frame;
@@ -378,72 +378,51 @@ void FastInitializer::buildLinearSystemRow(const IntegrationBase* pre_int_k, // 
                                          Eigen::Vector2d& b_row)        // 输出: 填充好的 b' 向量的 2 行
 {
     // --- 1. 提取外参 ---
-    // R_c_i (RIC[0]) = {}_{C}^{I}R (从 Camera 到 IMU 的旋转)
-    // T_c_i (TIC[0]) = {}^{I}p_C (Camera 在 IMU 系下的平移)
-    const Eigen::Matrix3d& R_c_i = RIC[0];
-    const Eigen::Vector3d& T_c_i_in_I = TIC[0];
+    // R_i_c = R^I_C = {}_{I}^{C}R (IMU -> Camera)
+    // R_c_i = R^C_I = {}_{C}^{I}R (Camera -> IMU)
+    const Eigen::Matrix3d& R_i_c = RIC[0];
+    Eigen::Matrix3d R_c_i = R_i_c.transpose();
 
-    // R_i_c = R_c_i^T = {}_{I}^{C}R (从 IMU 到 Camera 的旋转)
-    Eigen::Matrix3d R_i_c = R_c_i.transpose();
-    // T_i_c = -R_i_c * T_c_i_in_I = {}^{C}p_I (IMU 在 Camera 系下的平移)
-    Eigen::Vector3d T_i_c_in_C = -R_i_c * T_c_i_in_I;
+    // T_c_i (in I) = {}^{I}p_C (Camera 在 IMU 系下的平移)
+    const Eigen::Vector3d& T_c_i_in_I = TIC[0];
+    // T_i_c (in C) = {}^{C}p_I = - R^C_I * {}^{I}p_C
+    Eigen::Vector3d T_i_c_in_C = -R_c_i * T_c_i_in_I;
 
     // --- 2. 提取 IMU 预积分信息 (I0 -> Ik) ---
-    // R_I0_Ik = {}_{I_0}^{I_k}R
     Eigen::Matrix3d R_I0_Ik = pre_int_k->delta_q.toRotationMatrix();
-    // I0_alpha_Ik = {}^{I_0}\alpha_{I_k} (VINS-Mono 的 delta_p 对应论文的 alpha)
     Eigen::Vector3d I0_alpha_Ik = pre_int_k->delta_p;
-    // delta_t = \Delta T_k
     double delta_t = pre_int_k->sum_dt;
     double delta_t_sq = delta_t * delta_t;
 
     // --- 3. 计算论文中的关键中间变量 ---
-
-    // Upsilon_i,k = Gamma_i,k * {}_{I}^{C}R * {}_{I_0}^{I_k}R
-    // 
     Eigen::Matrix3d z_ik_hat = Utility::skewSymmetric(z_ik); // Gamma_i,k
-    Eigen::Matrix3d Upsilon_3x3 = z_ik_hat * R_i_c * R_I0_Ik; // 注意：这里 R_i_c 是 {}_{I}^{C}R
+    // Upsilon = Gamma_i,k * R_i_c * R_I0_Ik
+    Eigen::Matrix3d Upsilon_3x3 = z_ik_hat * R_i_c * R_I0_Ik;
 
-    // d_i = 1 / d_hat_i (因为 d_hat_i 是逆深度)
-    // [cite: 183-184]
-    double d_i = 1.0 / d_hat_i; // d_hat_i 保证在 [1, 2] 范围，不会除零
+    // d_i = 1 / d_hat_i (d_hat_i 为网络输出的“归一化逆深度”)
+    double d_i = 1.0 / d_hat_i;
 
-    // {}^{I_0}\theta_{C_0 \to f_i} = {}_{C_0}^{I_0}R * z_i0
-    // [cite: 169-171]
-    // {}_{C_0}^{I_0}R (从 C0 到 I0) 就是外参 R_c_i
+    // {}^{I_0}\theta_{C_0 \to f_i} = R_c_i * z_i0
     Eigen::Vector3d I0_theta_C0_fi = R_c_i * z_i0;
 
     // --- 4. 构建 A' 矩阵的系数 [M1, M2, Tv, Tg] ---
-    // x' = [a, b, v_I0(3), g_I0(3)]^T
-
-    // M1 = Upsilon * d_i * I0_theta_C0_fi
-    Eigen::Vector3d M1_3d = Upsilon_3x3 * d_i * I0_theta_C0_fi;
-
-    // M2 = Upsilon * I0_theta_C0_fi
-    Eigen::Vector3d M2_3d = Upsilon_3x3 * I0_theta_C0_fi;
-
-    // Tv = -Upsilon * \Delta T_k
-    // 
-    Eigen::Matrix<double, 3, 3> Tv_3d = -Upsilon_3x3 * delta_t;
-
-    // Tg = Upsilon * (0.5 * \Delta T_k^2)
-    // 
-    Eigen::Matrix<double, 3, 3> Tg_3d = Upsilon_3x3 * (0.5 * delta_t_sq);
+    Eigen::Vector3d M1_3d = Upsilon_3x3 * d_i * I0_theta_C0_fi;  // a
+    Eigen::Vector3d M2_3d = Upsilon_3x3 * I0_theta_C0_fi;        // b
+    Eigen::Matrix<double, 3, 3> Tv_3d = -Upsilon_3x3 * delta_t;  // v_I0
+    Eigen::Matrix<double, 3, 3> Tg_3d =  Upsilon_3x3 * (0.5 * delta_t_sq); // g_I0
 
     // --- 5. 构建 b' 向量 (RHS) ---
-    // b' = Upsilon * I0_alpha_Ik - Upsilon * {}^{I}p_C - Gamma_i,k * {}^{C}p_I
-    // 
-    Eigen::Vector3d b_prime_3d = Upsilon_3x3 * I0_alpha_Ik - Upsilon_3x3 * T_c_i_in_I - z_ik_hat * T_i_c_in_C;
+    // b' = Upsilon * alpha - Upsilon * ^I p_C - Gamma * ^C p_I
+    Eigen::Vector3d b_prime_3d = Upsilon_3x3 * I0_alpha_Ik
+                               - Upsilon_3x3 * T_c_i_in_I
+                               - z_ik_hat * T_i_c_in_C;
 
     // --- 6. 填充 A_row (2x8) 和 b_row (2x1) ---
-    // 取 3D 向量/矩阵的前两行
-
-    A_row.block<2, 1>(0, 0) = M1_3d.head<2>();      // M1 (a)
-    A_row.block<2, 1>(0, 1) = M2_3d.head<2>();      // M2 (b)
-    A_row.block<2, 3>(0, 2) = Tv_3d.block<2, 3>(0, 0); // Tv (v_I0)
-    A_row.block<2, 3>(0, 5) = Tg_3d.block<2, 3>(0, 0); // Tg (g_I0)
-
-    b_row = b_prime_3d.head<2>(); // b'
+    A_row.block<2, 1>(0, 0) = M1_3d.head<2>();           // a
+    A_row.block<2, 1>(0, 1) = M2_3d.head<2>();           // b
+    A_row.block<2, 3>(0, 2) = Tv_3d.block<2, 3>(0, 0);   // v_I0
+    A_row.block<2, 3>(0, 5) = Tg_3d.block<2, 3>(0, 0);   // g_I0
+    b_row = b_prime_3d.head<2>();
 
     // 函数结束时，A_row 和 b_row 就包含了由这一个 (i, k) 观测所贡献的两个线性方程。
     // RANSAC 和最终求解函数会调用这个函数多次，将得到的 A_row 和 b_row 堆叠起来，
