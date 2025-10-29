@@ -208,20 +208,16 @@ bool FastInitializer::initialize(const std::map<double, ImageFrame>& image_frame
                 {
                     // 应用核心公式: z = a * d_hat_inv + b 计算估计的深度。
                     double estimated_depth = a * 1.0 / d_hat_i_inv + b;
-                    
-                    // 检查估计的逆深度是否为正数 (因为深度 z 必须为正)。
-                    if (estimated_depth > 1e-6)
-                    {                       
-                        // 对计算出的深度值进行范围检查，剔除过近或过远的点。
-                        // 0.1m 到 50m 是一个常用的经验范围。
-                        if (estimated_depth > 0.1 && estimated_depth < 50.0)
-                        {
-                            // 如果深度值有效，则调用 FeatureManager 的函数来存储这个深度值。
-                            // 这个深度值将在后续的非线性优化 (solveOdometry) 中被用作初始值。
-                            m_feature_manager->setFeatureDepth(feature.feature_id, estimated_depth);
-                            // 成功初始化一个特征点的深度，计数器加一。
-                            features_initialized++;
-                        }
+                                    
+                    // 对计算出的深度值进行范围检查，剔除过近或过远的点。
+                    // 0.1m 到 50m 是一个常用的经验范围。
+                    if (estimated_depth > 0.1 && estimated_depth < 50.0)
+                    {
+                        // 如果深度值有效，则调用 FeatureManager 的函数来存储这个深度值。
+                        // 这个深度值将在后续的非线性优化 (solveOdometry) 中被用作初始值。
+                        m_feature_manager->setFeatureDepth(feature.feature_id, estimated_depth);
+                        // 成功初始化一个特征点的深度，计数器加一。
+                        features_initialized++;
                     }
                 }
             }
@@ -281,7 +277,7 @@ bool FastInitializer::initialize(const std::map<double, ImageFrame>& image_frame
 
     // --- 6. 前向传播状态到窗口内所有关键帧 ---
     // 目标: 我们已经有了第 0 帧 (I0) 在 W' 系下的姿态 R_I0_W' (即 R_wb_0), 速度 v_I0_in_W', 位置 p_I0_in_W'。
-    //       现在，我们需要利用 IMU 预积分结果，将这个状态依次传播到窗口内的第 1, 2, ..., k 帧。
+    // 现在，我们需要利用 IMU 预积分结果，将这个状态依次传播到窗口内的第 1, 2, ..., k 帧。
     
     // 清空输出的 map 容器，准备填充新的状态。
     Ps_out.clear();
