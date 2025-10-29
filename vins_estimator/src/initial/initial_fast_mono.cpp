@@ -517,7 +517,7 @@ bool FastInitializer::solveRANSAC(const std::vector<ObservationData>& all_observ
         }
 
         // --- 条件数阈值检查 ---
-        const double CONDITION_NUMBER_THRESHOLD = 1e10; // << 需要调整
+        const double CONDITION_NUMBER_THRESHOLD = 1e12; // << 需要调整
         if (cond_num > CONDITION_NUMBER_THRESHOLD || std::isinf(cond_num) || std::isnan(cond_num))
         {
             // if (iter < 20) ROS_WARN("RANSAC Iter %d: Poor condition number (%.2e). Discarding sample.", iter, cond_num);
