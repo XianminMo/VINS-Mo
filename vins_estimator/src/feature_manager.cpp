@@ -126,21 +126,38 @@ void FeatureManager::debugShow()
     }
 }
 
+
+/**
+ * @brief 获取在两帧之间被同时观测到的特征点的对应关系
+ *
+ * 该函数遍历所有特征点，查找那些在输入的两帧（frame_count_l, frame_count_r）都被观测到的特征点。
+ * 对于每个满足条件的特征点，取得其在这两帧中的归一化像素坐标，作为一组对应点输出。
+ *
+ * 通常用于双目/前后帧间的两视图几何估计，比如估算相对位姿（PnP，E/F矩阵等）。
+ * 
+ * @param frame_count_l 左图/第一帧在滑动窗口中的frame_count索引
+ * @param frame_count_r 右图/第二帧在滑动窗口中的frame_count索引
+ * @return vector<pair<Vector3d, Vector3d>> 返回所有在两帧中都被观测到的特征点的归一化坐标对
+ *         pair的first为frame_count_l帧中的归一化点坐标，second为frame_count_r帧的归一化点坐标
+ */
 vector<pair<Vector3d, Vector3d>> FeatureManager::getCorresponding(int frame_count_l, int frame_count_r)
 {
-    vector<pair<Vector3d, Vector3d>> corres;
+    vector<pair<Vector3d, Vector3d>> corres; // 存储输出的对应点对
     for (auto &it : feature)
     {
+        // 检查该特征点是否在frame_count_l和frame_count_r都被观测到
+        // 只有当特征点的观测起始帧早于等于frame_count_l，结束帧晚于等于frame_count_r才满足条件
         if (it.start_frame <= frame_count_l && it.endFrame() >= frame_count_r)
         {
-            Vector3d a = Vector3d::Zero(), b = Vector3d::Zero();
+            // 计算feature_per_frame容器中对应两帧的索引
             int idx_l = frame_count_l - it.start_frame;
             int idx_r = frame_count_r - it.start_frame;
 
-            a = it.feature_per_frame[idx_l].point;
-
-            b = it.feature_per_frame[idx_r].point;
+            // 获取该特征点在左帧和右帧（frame_count_l和frame_count_r）下的归一化坐标
+            Vector3d a = it.feature_per_frame[idx_l].point;
+            Vector3d b = it.feature_per_frame[idx_r].point;
             
+            // 保存到输出vector
             corres.push_back(make_pair(a, b));
         }
     }

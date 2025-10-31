@@ -7,6 +7,25 @@ FastInitializer::FastInitializer(FeatureManager* f_manager_ptr)
 {
 }
 
+// 计算滑窗起始帧ID：返回当前窗口内所有特征 start_frame 的最小值（若为空返回0）
+int FastInitializer::computeWindowStartFrameId() const
+{
+    int window_start_frame_id = 0;
+    if (m_feature_manager && !m_feature_manager->feature.empty())
+    {
+        // 初始化为第一个特征的 start_frame
+        window_start_frame_id = m_feature_manager->feature.front().start_frame;
+        for (const auto& f : m_feature_manager->feature)
+        {
+            if (f.start_frame < window_start_frame_id)
+                window_start_frame_id = f.start_frame;
+        }
+        if (window_start_frame_id < 0)
+            window_start_frame_id = 0;
+    }
+    return window_start_frame_id;
+}
+
 // 主初始化函数
 bool FastInitializer::initialize(const std::map<double, ImageFrame>& image_frames,
                                const cv::Mat& first_frame_norm_inv_depth, // CV_32F, [1,2]
@@ -60,17 +79,8 @@ bool FastInitializer::initialize(const std::map<double, ImageFrame>& image_frame
     int first_frame_rows = first_frame_norm_inv_depth.rows;
     int first_frame_cols = first_frame_norm_inv_depth.cols;
 
-    // 找到当前滑动窗口的起始帧ID 
-    int window_start_frame_id = -1;
-    if (!m_feature_manager->feature.empty()) {
-        window_start_frame_id = m_feature_manager->feature.front().start_frame;
-    }
-    for (const auto& feature : m_feature_manager->feature) {
-        if (feature.start_frame < window_start_frame_id) {
-            window_start_frame_id = feature.start_frame;
-        }
-    }
-    if (window_start_frame_id < 0) window_start_frame_id = 0; // 安全保护
+    // 统一计算窗口起始帧ID
+    int window_start_frame_id = computeWindowStartFrameId();
 
     for (const auto& feature : m_feature_manager->feature)
     {
@@ -174,68 +184,46 @@ bool FastInitializer::initialize(const std::map<double, ImageFrame>& image_frame
     // 利用 RANSAC 估计出的 a 和 b，为所有在第一帧 (C0) 观测到的特征点计算初始深度。
     // 这些深度值将被用于后续的非线性优化 (BA)。
     
-    int features_initialized = 0; // 计数成功初始化深度的特征数量。
+    int N_total = 0, N_ok = 0;
+    double z_min = std::numeric_limits<double>::infinity();
+    double z_max = -std::numeric_limits<double>::infinity();
+    double z_sum = 0.0;
 
-    // 遍历 FeatureManager 中存储的所有特征点。
-    // 注意：这里的 `m_feature_manager->feature` 是一个 map 或 unordered_map。
-    // C++11/17 的 range-based for loop 写法。`auto& feature_pair` 效率更高。
-    // 为了清晰，这里展开写：
-    for (auto& feature : m_feature_manager->feature) // feature_iterator 是指向 map 中元素的迭代器
+    window_start_frame_id = computeWindowStartFrameId();
+
+    for (const auto& feature : m_feature_manager->feature)
     {
-        // 检查该特征是否是从第一帧开始被跟踪的。
-        // !! 注意 !!: `feature.start_frame` 在 VINS-Mono 中是全局帧 ID。
-        // 如果您的窗口是从全局第 N 帧开始的，这里的判断需要修改为
-        // `feature.start_frame == window_start_frame_id` (您需要传入这个起始 ID)。
-        // 假设当前窗口就是从全局第 0 帧开始的，所以判断 `feature.start_frame == 0`。
-        // 同时确保该特征至少有一帧观测数据。
-        if (feature.start_frame == window_start_frame_id && feature.feature_per_frame.size() > 0)
+        if (feature.start_frame == window_start_frame_id && !feature.feature_per_frame.empty())
         {
-            // 获取该特征在第一帧 (索引 0) 的观测信息。
-            const FeaturePerFrame& obs_frame_0 = feature.feature_per_frame[0];
-            
-            // 获取该特征在第一帧的像素坐标 (u, v)，并进行四舍五入取整。
-            int u = static_cast<int>(round(obs_frame_0.uv.x()));
-            int v = static_cast<int>(round(obs_frame_0.uv.y()));
-
-            // 检查 (u, v) 坐标是否在深度图的有效范围内。
+            const FeaturePerFrame& obs0 = feature.feature_per_frame[0];
+            int u = static_cast<int>(std::round(obs0.uv.x()));
+            int v = static_cast<int>(std::round(obs0.uv.y()));
             if (v >= 0 && v < first_frame_rows && u >= 0 && u < first_frame_cols)
             {
-                // 从输入的归一化逆深度图 (CV_32F, 范围 [0,1]) 中获取对应的预测值 d_hat_i。
-                double d_hat_i_inv = static_cast<double>(first_frame_norm_inv_depth.at<float>(v, u));
-                
-                // 检查预测的逆深度值是否有效 (例如大于一个很小的正数，避免除零)。
-                if (d_hat_i_inv > 1e-6)
+                float d_hat_inv = first_frame_norm_inv_depth.at<float>(v, u); // 在 [1,2]
+                if (d_hat_inv > 1e-6f)
                 {
-                    // 应用核心公式: z = a * d_hat_inv + b 计算估计的深度。
-                    double estimated_depth = a * 1.0 / d_hat_i_inv + b;
-                                    
-                    // 对计算出的深度值进行范围检查，剔除过近或过远的点。
-                    // 0.1m 到 50m 是一个常用的经验范围。
-                    if (estimated_depth > 0.1 && estimated_depth < 50.0)
-                    {
-                        // 如果深度值有效，则调用 FeatureManager 的函数来存储这个深度值。
-                        // 这个深度值将在后续的非线性优化 (solveOdometry) 中被用作初始值。
-                        m_feature_manager->setFeatureDepth(feature.feature_id, estimated_depth);
-                        // 成功初始化一个特征点的深度，计数器加一。
-                        features_initialized++;
-                    }
+                    double z = a * (1.0 / static_cast<double>(d_hat_inv)) + b; // 现有线性深度模型
+                    N_total++;
+                    z_min = std::min(z_min, z);
+                    z_max = std::max(z_max, z);
+                    z_sum += z;
+                    if (z > 0.1 && z < 50.0) N_ok++;
                 }
             }
         }
-    } // 遍历所有特征点结束。
-    
-    // 打印成功初始化深度的特征数量。
-    ROS_INFO("FastInit: Initialized depth for %d features.", features_initialized);
-    
-    // 检查成功初始化深度的特征数量是否足够。
-    // 如果太少 (例如少于 10 个)，后续的非线性优化 (BA) 可能会因为约束不足而失败或不稳定。
-    if (features_initialized < 10) {
-        ROS_WARN("FastInit: Too few features (%d) were successfully initialized with depth. Aborting.", features_initialized);
-        return false; // 返回失败，表示初始化不成功。
     }
+    double z_mean = (N_total > 0) ? (z_sum / N_total) : 0.0;
+    ROS_INFO("FastInit depth diag: a=%.6f b=%.6f | N_total=%d N_ok(0.1~50m)=%d | z[min=%.6f max=%.6f mean=%.6f]",
+             a, b, N_total, N_ok, z_min, z_max, z_mean);
 
-
-    // --- 5. 坐标系对齐 (从 I0 系 -> W' 重力对齐系) ---
+    if (N_ok < 10) {
+        ROS_WARN("FastInit: Not enough valid depth features (%d) to initialize.", N_ok);
+        return false;
+    }
+    
+      
+      // --- 5. 坐标系对齐 (从 I0 系 -> W' 重力对齐系) ---
     // 目标: 我们 RANSAC 求解得到的速度 v_I0 和重力 g_I0 都是在 I0 坐标系（即第一帧 IMU 坐标系）下表示的。
     //       为了方便后续优化和与其他模块（如可视化）对接，我们需要将所有状态统一到一个规范的世界坐标系 W' 中。
     //       我们选择 W' 的定义为：原点与 I0 重合，Z 轴与真实重力方向对齐（通常是竖直向上或向下）。

@@ -151,4 +151,5 @@ class Estimator
     std::mutex m_depth_mutex;
 
     std::unique_ptr<FastInitializer> mp_fast_initializer;
+    int m_depth_window_start_id = -1;
 };

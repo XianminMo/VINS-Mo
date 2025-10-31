@@ -63,7 +63,7 @@ private:
     std::vector<int64_t> m_input_shape;
     std::vector<float> m_input_tensor_values; // 预分配的输入向量，避免重复分配
 
-    // --- 模型常量 (来自 Demo) ---
+    // --- 模型常量 ---
     const int m_model_input_width = 256;
     const int m_model_input_height = 256;
     const std::vector<double> m_norm_mean = {0.485, 0.456, 0.406};

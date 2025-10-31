@@ -5,7 +5,7 @@ imu_topic: "/imu0"
 image_topic: "/cam0/image_raw"
 output_path: "/home/linux/mxm/output/mh05"
 depth_model_path: "/home/linux/mxm/proj/VINS-Mo/src/VINS-Mo/vins_estimator/models/Midas-V2.onnx" # path to depth estimation model
-use_fast_init: 1      # 0: normal initialization; 1: use fast initialization with depth estimation
+use_fast_init: 0      # 0: normal initialization; 1: use fast initialization with depth estimation
 
 
 #camera calibration 

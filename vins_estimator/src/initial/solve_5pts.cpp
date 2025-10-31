@@ -190,40 +190,77 @@ namespace cv {
 }
 
 
+/**
+ * @brief 求解两帧之间的相对位姿（旋转和平移）
+ * 
+ * 给定一对两帧间的特征点归一化坐标对应关系（corres），
+ * 利用八点法+RANSAC（cv::findFundamentalMat）以及本质矩阵分解（cv::recoverPose），
+ * 估算帧间的相对旋转 (Rotation) 和相对平移 (Translation)。
+ * 该函数也进行Outlier剔除，最终要求内点数量大于阈值才认为估算有效。
+ *
+ * 关键步骤解释：
+ * 1. 首先判断对应点数量是否足够（至少15对，否则无法鲁棒估计）。
+ * 2. 将Eigen点对数据转换为OpenCV的cv::Point2f容器，分别表示左图和右图下的归一化像素坐标。
+ * 3. 调用cv::findFundamentalMat计算基础矩阵并剔除异常值（RANSAC容错，阈值0.3/460）。
+ * 4. 构建单位内参相机矩阵（本代码中点坐标已经做过归一化）。
+ * 5. 利用cv::recoverPose进一步从基础矩阵恢复出“本质矩阵”对应的相对旋转R、平移t，并获取inlier掩码。
+ * 6. OpenCV结果转为Eigen格式，注意OpenCV输出为从第一帧到第二帧的变换（R，T）；
+ *    本函数输出为第一帧在第二帧坐标系下的“逆变换”，即R^T，-R^T*T。
+ * 7. 最后检查inlier数量是否足够，大于12则判定估计成功，返回true，否则false。
+ *
+ * @param corres    输入，对应的特征点对（每对包含两帧的归一化归一像素坐标）
+ * @param Rotation  输出，相对旋转R（从后帧到前帧，3x3矩阵）
+ * @param Translation 输出，相对平移t（从后帧到前帧，3x1向量）
+ * @return bool     若估计成功返回true，否则false
+ */
 bool MotionEstimator::solveRelativeRT(const vector<pair<Vector3d, Vector3d>> &corres, Matrix3d &Rotation, Vector3d &Translation)
 {
-    if (corres.size() >= 15)
+    // 对应点数量不足，直接失败
+    if (corres.size() < 15)
+        return false;
+
+    // 1. 将输入Eigen点对转为OpenCV的cv::Point2f
+    vector<cv::Point2f> pts1, pts2;
+    for (size_t i = 0; i < corres.size(); i++)
     {
-        vector<cv::Point2f> ll, rr;
-        for (int i = 0; i < int(corres.size()); i++)
-        {
-            ll.push_back(cv::Point2f(corres[i].first(0), corres[i].first(1)));
-            rr.push_back(cv::Point2f(corres[i].second(0), corres[i].second(1)));
-        }
-        cv::Mat mask;
-        cv::Mat E = cv::findFundamentalMat(ll, rr, cv::FM_RANSAC, 0.3 / 460, 0.99, mask);
-        cv::Mat cameraMatrix = (cv::Mat_<double>(3, 3) << 1, 0, 0, 0, 1, 0, 0, 0, 1);
-        cv::Mat rot, trans;
-        int inlier_cnt = cv::recoverPose(E, ll, rr, cameraMatrix, rot, trans, mask);
-        //cout << "inlier_cnt " << inlier_cnt << endl;
-
-        Eigen::Matrix3d R;
-        Eigen::Vector3d T;
-        for (int i = 0; i < 3; i++)
-        {   
-            T(i) = trans.at<double>(i, 0);
-            for (int j = 0; j < 3; j++)
-                R(i, j) = rot.at<double>(i, j);
-        }
-
-        Rotation = R.transpose();
-        Translation = -R.transpose() * T;
-        if(inlier_cnt > 12)
-            return true;
-        else
-            return false;
+        pts1.push_back(cv::Point2f(static_cast<float>(corres[i].first(0)), static_cast<float>(corres[i].first(1))));
+        pts2.push_back(cv::Point2f(static_cast<float>(corres[i].second(0)), static_cast<float>(corres[i].second(1))));
     }
-    return false;
+
+    // 2. RANSAC 求基础矩阵, 并利用匹配掩码剔除离群点
+    cv::Mat mask;
+    // RANSAC内点阈值是像素单位，这里点已经被单位化，所以阈值极小
+    cv::Mat E = cv::findFundamentalMat(pts1, pts2, cv::FM_RANSAC, 0.3 / 460, 0.99, mask);
+
+    // 3. 假设单位内参（归一化像素）
+    cv::Mat cameraMatrix = (cv::Mat_<double>(3, 3) << 1, 0, 0,
+                                                       0, 1, 0,
+                                                       0, 0, 1);
+
+    // 4. 利用基础矩阵恢复相对R,t（本质矩阵分解）
+    cv::Mat rot, trans;
+    int inlier_cnt = cv::recoverPose(E, pts1, pts2, cameraMatrix, rot, trans, mask);
+    // inlier_cnt: 恢复出的内点数量
+
+    // 5. OpenCV矩阵->Eigen转换，并变换为“从后帧到前帧”的逆变换
+    Eigen::Matrix3d R_eigen;
+    Eigen::Vector3d t_eigen;
+    for (int i = 0; i < 3; i++)
+    {
+        t_eigen(i) = trans.at<double>(i, 0);
+        for (int j = 0; j < 3; j++)
+            R_eigen(i, j) = rot.at<double>(i, j);
+    }
+
+    // 6. OpenCV输出为"从前到后"(R, t)。输出需转为W系下前->后变换的逆: R^T, -R^T*t
+    Rotation = R_eigen.transpose();
+    Translation = -R_eigen.transpose() * t_eigen;
+
+    // 7. 检查内点数量是否达到阈值要求
+    if (inlier_cnt > 12)
+        return true;
+    else
+        return false;
 }
 
 

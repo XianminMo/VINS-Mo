@@ -87,28 +87,51 @@ bool DepthEstimator::init(const std::string& model_path)
 // 预处理函数 
 void DepthEstimator::preprocess(const cv::Mat& image, std::vector<float>& input_tensor_values)
 {
-    cv::Mat resized_image;
-    cv::resize(image, resized_image, cv::Size(m_model_input_width, m_model_input_height));
-    resized_image.convertTo(resized_image, CV_32F);
-    resized_image = resized_image / 255.0;
+    // 1) 灰度→BGR；BGR→RGB，确保模型看到的是 RGB 顺序
+    cv::Mat img_bgr;
+    if (image.channels() == 1)
+    {
+        cv::cvtColor(image, img_bgr, cv::COLOR_GRAY2BGR);
+    }
+    else if (image.channels() == 3)
+    {
+        img_bgr = image;
+    }
+    else
+    {
+        ROS_WARN("DepthEstimator::preprocess(): unsupported channels=%d, trying to proceed.", image.channels());
+        img_bgr = image;
+    }
 
-    const size_t channel_step = m_model_input_height * m_model_input_width;
+    cv::Mat img_rgb;
+    cv::cvtColor(img_bgr, img_rgb, cv::COLOR_BGR2RGB);
+
+    // 2) 缩放到模型输入尺寸，浮点化并归一化到 [0,1]
+    cv::Mat resized_image;
+    cv::resize(img_rgb, resized_image, cv::Size(m_model_input_width, m_model_input_height), 0, 0, cv::INTER_CUBIC);
+    resized_image.convertTo(resized_image, CV_32F, 1.0 / 255.0);
+
+    // 3) 按 NCHW 填充，并用 ImageNet 均值方差做标准化（RGB 顺序）
+    const int H = m_model_input_height;
+    const int W = m_model_input_width;
+    const size_t channel_step = static_cast<size_t>(H) * static_cast<size_t>(W);
+
     float* output_ptr_r = input_tensor_values.data();
     float* output_ptr_g = input_tensor_values.data() + channel_step;
-    float* output_ptr_b = input_tensor_values.data() + (2 * channel_step); 
+    float* output_ptr_b = input_tensor_values.data() + (2 * channel_step);
 
-    for (int i = 0; i < m_model_input_height; ++i)
+    for (int i = 0; i < H; ++i)
     {
-        const cv::Vec3f* input_row_ptr = resized_image.ptr<cv::Vec3f>(i);
-        for (int j = 0; j < m_model_input_width; ++j)
+        const cv::Vec3f* row = resized_image.ptr<cv::Vec3f>(i); // row[j] = [R,G,B]
+        for (int j = 0; j < W; ++j)
         {
-            float b = input_row_ptr[j][0];
-            float g = input_row_ptr[j][1];
-            float r = input_row_ptr[j][2];
-            const size_t nchw_index = i * m_model_input_width + j;
-            output_ptr_r[nchw_index] = (r - m_norm_mean[0]) / m_norm_std[0];
-            output_ptr_g[nchw_index] = (g - m_norm_mean[1]) / m_norm_std[1];
-            output_ptr_b[nchw_index] = (b - m_norm_mean[2]) / m_norm_std[2];
+            const float r = row[j][0];
+            const float g = row[j][1];
+            const float b = row[j][2];
+            const size_t idx = static_cast<size_t>(i) * static_cast<size_t>(W) + static_cast<size_t>(j);
+            output_ptr_r[idx] = static_cast<float>((r - m_norm_mean[0]) / m_norm_std[0]);
+            output_ptr_g[idx] = static_cast<float>((g - m_norm_mean[1]) / m_norm_std[1]);
+            output_ptr_b[idx] = static_cast<float>((b - m_norm_mean[2]) / m_norm_std[2]);
         }
     }
 }
@@ -127,31 +150,56 @@ bool DepthEstimator::predict(const cv::Mat& image, cv::Mat& norm_inv_depth_map)
 
     // --- 2. 创建输入张量 ---
     auto memory_info = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
-    Ort::Value input_tensor = Ort::Value::CreateTensor<float>(memory_info, 
-                                                            m_input_tensor_values.data(), 
-                                                            m_input_tensor_values.size(), 
-                                                            m_input_shape.data(), 
-                                                            m_input_shape.size());
-    
+    Ort::Value input_tensor = Ort::Value::CreateTensor<float>(
+        memory_info,
+        m_input_tensor_values.data(),
+        m_input_tensor_values.size(),
+        m_input_shape.data(),
+        m_input_shape.size());
+
     // --- 3. 执行推理 ---
     try
     {
-        auto output_tensors = m_session->Run(Ort::RunOptions{nullptr}, 
-                                             &m_input_name, &input_tensor, 1, 
+        auto output_tensors = m_session->Run(Ort::RunOptions{nullptr},
+                                             &m_input_name, &input_tensor, 1,
                                              &m_output_name, 1);
-        
+
         // --- 4. 获取输出并后处理 ---
         float* output_data_ptr = output_tensors[0].GetTensorMutableData<float>();
 
-        // 4.1. 将 float* 包装为 cv::Mat (零拷贝)
+        // 4.1 封装为 Mat（H x W, CV_32F）
         cv::Mat raw_inv_depth(m_model_input_height, m_model_input_width, CV_32F, output_data_ptr);
 
-        // 4.2. (关键!) 归一化到 [0, 1] 范围，类型为 CV_32F
-        // 这就是论文中的 d_hat
-        cv::Mat normalized_float_map;
-        cv::normalize(raw_inv_depth, normalized_float_map, 1.0, 2.0, cv::NORM_MINMAX, CV_32F);
+        // 4.2 统计 raw 的 min/max/mean
+        double raw_min = 0.0, raw_max = 0.0;
+        cv::minMaxLoc(raw_inv_depth, &raw_min, &raw_max);
+        cv::Scalar raw_mean = cv::mean(raw_inv_depth);
+        ROS_INFO("MiDaS raw_inv_depth: min=%.6f max=%.6f mean=%.6f", raw_min, raw_max, raw_mean[0]);
 
-        // 4.3. 缩放回原始图像尺寸 (使用线性插值)，以便特征点可以被直接采样
+        // 4.3 归一化到 [1, 2]（按你的设置保留）
+        cv::Mat normalized_float_map;
+        cv::normalize(raw_inv_depth, normalized_float_map, 0.0, 1.0, cv::NORM_MINMAX, CV_32F);
+
+        // 4.4 统计 norm 的 min/max/mean
+        double n_min = 0.0, n_max = 0.0;
+        cv::minMaxLoc(normalized_float_map, &n_min, &n_max);
+        cv::Scalar n_mean = cv::mean(normalized_float_map);
+        ROS_INFO("MiDaS norm_inv_depth: min=%.6f max=%.6f mean=%.6f", n_min, n_max, n_mean[0]);
+
+        // 4.5 保存首帧的可视化图（只保存一次，便于人工确认是否“扁平”）
+        static bool dumped = false;
+        if (!dumped)
+        {
+            cv::Mat raw_vis_8u, norm_vis_8u;
+            cv::normalize(raw_inv_depth, raw_vis_8u, 0, 255, cv::NORM_MINMAX, CV_8U);
+            cv::normalize(normalized_float_map, norm_vis_8u, 0, 255, cv::NORM_MINMAX, CV_8U);
+            cv::imwrite("/tmp/first_frame_raw_inv_depth.png", raw_vis_8u);
+            cv::imwrite("/tmp/first_frame_norm_inv_depth.png", norm_vis_8u);
+            ROS_INFO("Saved MiDaS debug images to /tmp/first_frame_raw_inv_depth.png and /tmp/first_frame_norm_inv_depth.png");
+            dumped = true;
+        }
+
+        // 4.6 缩放回原图尺寸
         cv::resize(normalized_float_map, norm_inv_depth_map, image.size(), 0, 0, cv::INTER_LINEAR);
     }
     catch (const Ort::Exception& e)

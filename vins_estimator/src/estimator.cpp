@@ -12,7 +12,6 @@ Estimator::Estimator(): f_manager{Rs}
     m_first_frame_depth_computed = false; 
 }
 
-// --- MODIFICATION START ---
 /**
  * @brief 初始化深度估计器（如果启用）
  * 这个函数应该在 readParameters() 之后被调用
@@ -38,7 +37,6 @@ void Estimator::initDepthEstimator()
         mp_fast_initializer = std::make_unique<FastInitializer>(&f_manager);
     }
 }
-// --- MODIFICATION END ---
 
 
 /**
@@ -139,7 +137,6 @@ void Estimator::clearState()
     // 清空特征管理器中的所有特征点状态
     f_manager.clearState();
 
-    // --- MODIFICATION START ---
     // 添加对我们新成员变量的重置
     {
         // 使用互斥锁保护深度图相关成员变量的访问，确保线程安全
@@ -147,7 +144,6 @@ void Estimator::clearState()
         m_first_frame_depth_computed = false; // 标记第一帧深度图未计算
         m_first_frame_depth_map.release();    // 释放深度图内存
     }
-    // --- MODIFICATION END ---
 
     failure_occur = 0; // 失败标志位清零
     relocalization_info = 0; // 重定位信息标志位清零
@@ -282,19 +278,25 @@ void Estimator::processImage(const map<int, vector<pair<int, Eigen::Matrix<doubl
     {
         if (frame_count == WINDOW_SIZE) // 如果滑动窗口已满（收集了足够的数据）
         {
-            // --- MODIFICATION START: 使用开关选择初始化策略 ---
-
             bool is_init_success = false; // 标记初始化是否成功
 
             if (USE_FAST_INIT) // 如果启用了快速初始化
             {
                 // --- 分支 1: 执行新的快速初始化流程 ---
                 ROS_INFO_THROTTLE(1.0, "Attempting Fast Monocular Initialization...");
+                // 计算当前滑窗起始帧（最小 start_frame，若无则 0）
+                int window_start_frame_id = 0;
+                if (!f_manager.feature.empty()) {
+                    window_start_frame_id = f_manager.feature.front().start_frame;
+                    for (const auto& fe : f_manager.feature)
+                        window_start_frame_id = std::min(window_start_frame_id, fe.start_frame);
+                    if (window_start_frame_id < 0) window_start_frame_id = 0;
+                }
 
                 // 1. 计算第一帧的深度图 (如果尚未计算)
-                if (!m_first_frame_depth_computed)
+                if (!m_first_frame_depth_computed || m_depth_window_start_id != window_start_frame_id)
                 {
-                    double first_frame_stamp = Headers[0].stamp.toSec();
+                    double first_frame_stamp = Headers[window_start_frame_id].stamp.toSec();
                     cv::Mat first_img;
 
                     auto it = all_image_frame.find(first_frame_stamp);
@@ -334,12 +336,28 @@ void Estimator::processImage(const map<int, vector<pair<int, Eigen::Matrix<doubl
                     std::map<int, Eigen::Quaterniond> Rs_init;
 
                     bool fast_init_ok = false;
-                    { // 锁定深度图，以防万一 (虽然在同一线程)
-                        std::lock_guard<std::mutex> lock(m_depth_mutex);
-                        fast_init_ok = mp_fast_initializer->initialize(all_image_frame, 
-                                                                       m_first_frame_depth_map, 
-                                                                       g, // 传入全局重力向量 (会被修改)
-                                                                       Ps_init, Vs_init, Rs_init);
+                    // 初始化门槛：特征数
+                    if (f_manager.getFeatureCount() < 80) {
+                        ROS_WARN_THROTTLE(1.0, "Fast-Init gate: too few features (%d).", f_manager.getFeatureCount());
+                    } else {
+                        // 旋转激励（累计角度）
+                        double rot_sum = 0.0;
+                        for (int k = 1; k <= WINDOW_SIZE; ++k) {
+                            if (pre_integrations[k]) {
+                                Eigen::AngleAxisd aa(pre_integrations[k]->delta_q);
+                                rot_sum += std::abs(aa.angle());
+                            }
+                        }
+                        if (rot_sum < 0.35) { // ~20度，按需调整
+                            ROS_WARN_THROTTLE(1.0, "Fast-Init gate: insufficient rotation (%.3f rad).", rot_sum);
+                        } else {
+                            // 满足门槛再调初始化
+                            std::lock_guard<std::mutex> lock(m_depth_mutex);
+                            fast_init_ok = mp_fast_initializer->initialize(all_image_frame,
+                                                                        m_first_frame_depth_map,
+                                                                        g,
+                                                                        Ps_init, Vs_init, Rs_init);
+                        }
                     }
 
                     if (fast_init_ok)
@@ -378,6 +396,9 @@ void Estimator::processImage(const map<int, vector<pair<int, Eigen::Matrix<doubl
                     else
                     {
                         ROS_WARN("Fast Monocular Init Failed.");
+                        std::lock_guard<std::mutex> lock(m_depth_mutex);
+                        m_first_frame_depth_computed = false;
+                        m_depth_window_start_id = -1;
                         // 如果失败，m_first_frame_depth_computed 仍然是 true，
                         // 但 is_init_success 是 false，会触发 slideWindow()，
                         // slideWindow() 中的重置逻辑会处理 m_first_frame_depth_computed
@@ -426,7 +447,6 @@ void Estimator::processImage(const map<int, vector<pair<int, Eigen::Matrix<doubl
                 // 初始化失败，滑动窗口，丢弃最老的帧，继续尝试
                 slideWindow();
             }
-            // --- MODIFICATION END ---
         }
         else
             frame_count++; // 如果窗口未满，继续累积帧
@@ -744,13 +764,16 @@ bool Estimator::visualInitialAlign()
  * @param[out] l 找到的参考帧的索引
  * @return true 如果找到合适的帧
  * 
- * 该函数在滑动窗口中从后往前遍历，找到一个与最新帧(WINDOW_SIZE)
+ * 该函数在滑动窗口中从前往后遍历，找到一个与最新帧(WINDOW_SIZE)
  * 有足够视差和共视点的帧 l，并计算它们之间的相对位姿。
  * 这个相对位姿将作为全局SFM的起点。
+ * 滑窗内一共有WINDOW_SIZE + 1帧，从0到WINDOW_SIZE
+ * 从0到WINDOW_SIZE-1帧，依次与最新帧(WINDOW_SIZE)进行匹配
+ * 
  */
 bool Estimator::relativePose(Matrix3d &relative_R, Vector3d &relative_T, int &l)
 {
-    // 从倒数第二帧开始向前遍历
+    // 从滑窗内第一帧开始向前遍历
     for (int i = 0; i < WINDOW_SIZE; i++)
     {
         // 获取帧 i 和最新帧之间的匹配点
@@ -1394,7 +1417,6 @@ void Estimator::slideWindow()
         back_P0 = Ps[0];
         if (frame_count == WINDOW_SIZE)
         {
-            // --- MODIFICATION START ---
             // 如果在初始化阶段滑动窗口，说明初始化失败，需要重置深度图
             if (solver_flag == INITIAL)
             {
@@ -1406,8 +1428,7 @@ void Estimator::slideWindow()
                     m_first_frame_depth_map.release();
                 }
             }
-            // --- MODIFICATION END ---
-            
+
             // 将滑动窗口中的所有状态向前移动一格
             for (int i = 0; i < WINDOW_SIZE; i++)
             {
@@ -1440,20 +1461,20 @@ void Estimator::slideWindow()
 
             if (true || solver_flag == INITIAL)
             {
-            map<double, ImageFrame>::iterator it_0;
-            it_0 = all_image_frame.find(t_0);
-            delete it_0->second.pre_integration;
-            it_0->second.pre_integration = nullptr;
- 
-                for (map<double, ImageFrame>::iterator it = all_image_frame.begin(); it != it_0; ++it)
-                {
-                    if (it->second.pre_integration)
-                        delete it->second.pre_integration;
-                    it->second.pre_integration = NULL;
-                }
+                map<double, ImageFrame>::iterator it_0;
+                it_0 = all_image_frame.find(t_0);
+                delete it_0->second.pre_integration;
+                it_0->second.pre_integration = nullptr;
+    
+                    for (map<double, ImageFrame>::iterator it = all_image_frame.begin(); it != it_0; ++it)
+                    {
+                        if (it->second.pre_integration)
+                            delete it->second.pre_integration;
+                        it->second.pre_integration = NULL;
+                    }
 
-            all_image_frame.erase(all_image_frame.begin(), it_0);
-            all_image_frame.erase(t_0);
+                all_image_frame.erase(all_image_frame.begin(), it_0);
+                all_image_frame.erase(t_0);
 
             }
             slideWindowOld();

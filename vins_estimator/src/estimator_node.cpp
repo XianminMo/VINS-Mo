@@ -235,6 +235,8 @@ void process()
             auto feature_msg = std::get<1>(measurement);
             auto image_msg = std::get<2>(measurement);
             double dx = 0, dy = 0, dz = 0, rx = 0, ry = 0, rz = 0;
+            
+            // handle imu data
             for (auto &imu_msg : std::get<0>(measurement))
             {
                 double t = imu_msg->header.stamp.toSec();
@@ -276,6 +278,7 @@ void process()
                     //printf("dimu: dt:%f a: %f %f %f w: %f %f %f\n",dt_1, dx, dy, dz, rx, ry, rz);
                 }
             }
+            
             // set relocalization frame
             sensor_msgs::PointCloudConstPtr relo_msg = NULL;
             while (!relo_buf.empty())
@@ -305,6 +308,7 @@ void process()
 
             ROS_DEBUG("processing vision data with stamp %f \n", feature_msg->header.stamp.toSec());
 
+            // handle feature data
             TicToc t_s;
             map<int, vector<pair<int, Eigen::Matrix<double, 7, 1>>>> image;
             // 构建image数据结构

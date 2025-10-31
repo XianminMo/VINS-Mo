@@ -59,6 +59,9 @@ public:
 
 
 private:
+    // 计算滑窗起始帧ID：返回当前窗口内所有特征 start_frame 的最小值（若为空返回0）
+    int computeWindowStartFrameId() const;
+
     /**
      * @struct ObservationData
      * @brief 用于存储一次 (特征点 i, 图像帧 k) 观测所需的所有数据，方便 RANSAC 处理。
