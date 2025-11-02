@@ -10,7 +10,7 @@ FastInitializer::FastInitializer(FeatureManager* f_manager_ptr)
 // 计算滑窗起始帧ID：返回当前窗口内所有特征 start_frame 的最小值（若为空返回0）
 int FastInitializer::computeWindowStartFrameId() const
 {
-    int window_start_frame_id = 0;
+    int window_start_frame_id = -1;
     if (m_feature_manager && !m_feature_manager->feature.empty())
     {
         // 初始化为第一个特征的 start_frame
@@ -23,7 +23,7 @@ int FastInitializer::computeWindowStartFrameId() const
         if (window_start_frame_id < 0)
             window_start_frame_id = 0;
     }
-    return window_start_frame_id;
+    return (window_start_frame_id >= 0) ? window_start_frame_id : 0;
 }
 
 // 主初始化函数
@@ -34,331 +34,124 @@ bool FastInitializer::initialize(const std::map<double, ImageFrame>& image_frame
                                std::map<int, Eigen::Vector3d>& Vs_out,
                                std::map<int, Eigen::Quaterniond>& Rs_out)
 {
-    // --- 1. 数据收集 ---
+    // ========================================================================
+    // 步骤 1: 数据准备与验证
+    // ========================================================================
     ROS_INFO("FastInit: Collecting observations...");
-    std::vector<ObservationData> all_observations;
-    std::vector<IntegrationBase*> pre_integrations_compound; 
-
-    // 1.1. 复合 IMU 预积分
-
-    IntegrationBase* current_pre_integration = new IntegrationBase(Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero(),
-                                                                   Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero());
-
-    pre_integrations_compound.push_back(current_pre_integration);
-
-    int k_index = 0; // 帧在窗口内的索引
-    for (const auto& pair : image_frames)
-    {
-        if (k_index > 0) // 跳过第一帧
-        {
-            IntegrationBase* prev_compound = pre_integrations_compound.back();
-            IntegrationBase* delta_integration = pair.second.pre_integration;
-            if (!delta_integration) {
-                ROS_ERROR("FastInit: Missing pre_integration for frame %d!", k_index);
-                // 清理已分配的内存
-                for(IntegrationBase* p : pre_integrations_compound) delete p;
-                return false;
-            }
-
-            // 复合 I0->Ik 的预积分（i=0, j=k-1, k）
-            IntegrationBase* new_compound = new IntegrationBase(Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero(),
-                                                                Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero());
-            new_compound->sum_dt  = prev_compound->sum_dt + delta_integration->sum_dt;
-            new_compound->delta_q = prev_compound->delta_q * delta_integration->delta_q;
-            new_compound->delta_v = prev_compound->delta_v + prev_compound->delta_q * delta_integration->delta_v;
-            new_compound->delta_p = prev_compound->delta_p
-                                    + prev_compound->delta_v * delta_integration->sum_dt
-                                    + prev_compound->delta_q * delta_integration->delta_p;
-
-            pre_integrations_compound.push_back(new_compound);
-        }
-        k_index++;
-    }
-
-    // 1.2. 收集特征观测和深度
-    int first_frame_rows = first_frame_norm_inv_depth.rows;
-    int first_frame_cols = first_frame_norm_inv_depth.cols;
-
-    // 统一计算窗口起始帧ID
-    int window_start_frame_id = computeWindowStartFrameId();
-
-    for (const auto& feature : m_feature_manager->feature)
-    {
-        // 确保特征在第一帧被观测到
-        if (feature.start_frame == window_start_frame_id && feature.feature_per_frame.size() > 0)
-        {
-            int feature_id = feature.feature_id;
-            const FeaturePerFrame& obs_frame_0 = feature.feature_per_frame[0];
-
-            // 获取归一化坐标 z_i0
-            Eigen::Vector3d z_i0 = obs_frame_0.point; // VINS-Mono 已存储为 [x, y, 1]
-
-            // 获取归一化逆深度 d_hat_i
-            // 这里的 uv 是原始图像坐标，且 first_frame_norm_inv_depth
-            // 已经被 resize 到了原始图像尺寸 (在 DepthEstimator::predict 中完成)
-            int u = static_cast<int>(round(obs_frame_0.uv.x()));
-            int v = static_cast<int>(round(obs_frame_0.uv.y()));
-
-            if (v >= 0 && v < first_frame_rows && u >= 0 && u < first_frame_cols)
-            {
-                double d_hat_i_inv = static_cast<double>(first_frame_norm_inv_depth.at<float>(v, u));
-
-                // 遍历该特征在后续帧 k > 0 的观测
-                for (size_t frame_idx = 1; frame_idx < feature.feature_per_frame.size(); ++frame_idx)
-                {
-                    const FeaturePerFrame& obs_frame_k = feature.feature_per_frame[frame_idx];
-                    // 将全局 frame_id 转换为窗口内的局部索引
-                    int frame_k_window_index = obs_frame_k.frame_id - window_start_frame_id;
-
-                    if (frame_k_window_index > 0 && frame_k_window_index <= WINDOW_SIZE)
-                    {
-                        Eigen::Vector3d z_ik = obs_frame_k.point;
-
-                        ObservationData obs_data;
-                        obs_data.feature_id = feature_id;
-                        obs_data.frame_k_index = frame_k_window_index;
-                        obs_data.pre_integration_k = pre_integrations_compound[frame_k_window_index]; // $\Delta_{I_0}^{I_k}$
-                        obs_data.z_i0 = z_i0;
-                        obs_data.z_ik = z_ik;
-                        obs_data.d_hat_i = d_hat_i_inv;
-                        all_observations.push_back(obs_data);
-                    }
-                }
-            }
-        }
-    }
-    ROS_INFO("FastInit: Collected %zu observations.", all_observations.size());
-
-    // 检查是否有足够的观测来进行 RANSAC 最小集求解
-    if (all_observations.size() < fast_mono::RANSAC_MIN_MEASUREMENTS)
-    {
-        ROS_WARN("FastInit: Not enough valid observations (%zu) to initialize.", all_observations.size());
-        // 清理复合预积分对象
-        for(IntegrationBase* p : pre_integrations_compound) delete p;
+    
+    // 1.1 计算复合 IMU 预积分（I0 -> I1, I0 -> I2, ..., I0 -> Ik） Ik变换到I0的旋转矩阵
+    std::vector<IntegrationBase*> pre_integrations_compound;
+    if (!computeCompoundPreIntegrations(image_frames, pre_integrations_compound)) {
+        ROS_WARN("FastInit: Failed to compute compound pre-integrations.");
         return false;
     }
-
-    // --- 2. RANSAC 求解 ---
-    ROS_INFO("FastInit: Starting RANSAC...");
+    
+    // 确保在函数退出时清理预积分内存（RAII风格的清理器）
+    struct IntegrationBaseCleaner {
+        std::vector<IntegrationBase*>& vec;
+        ~IntegrationBaseCleaner() {
+            for (IntegrationBase* p : vec) delete p;
+        }
+    } cleaner{pre_integrations_compound};
+    
+    // 1.2 收集所有有效的特征观测数据
+    int window_start_frame_id = computeWindowStartFrameId();
+    std::vector<ObservationData> all_observations;
+    int num_obs = collectValidObservations(
+        first_frame_norm_inv_depth,
+        window_start_frame_id,
+        pre_integrations_compound,
+        all_observations);
+    
+    ROS_INFO("FastInit: Collected %zu observations from %d features.", 
+             all_observations.size(), num_obs);
+    
+    // 检查是否有足够的观测来进行 RANSAC
+    if (all_observations.size() < fast_mono::RANSAC_MIN_MEASUREMENTS) {
+        ROS_WARN("FastInit: Not enough valid observations (%zu < %d) to initialize.", 
+                 all_observations.size(), fast_mono::RANSAC_MIN_MEASUREMENTS);
+        return false;
+    }
+    
+    // ========================================================================
+    // 步骤 2: RANSAC 鲁棒求解
+    // ========================================================================
+    ROS_INFO("FastInit: Starting RANSAC with %zu observations...", all_observations.size());
     Eigen::Matrix<double, 8, 1> x_best; // 最优解 [a, b, v_I0(3), g_I0(3)]^T
-    bool ransac_success = solveRANSAC(all_observations, x_best);
-
-    // 清理复合预积分对象 (不再需要)
-    for(IntegrationBase* p : pre_integrations_compound) delete p;
-
-    if (!ransac_success)
-    {
+    if (!solveRANSAC(all_observations, x_best)) {
         ROS_WARN("FastInit: RANSAC failed to find a valid solution.");
         return false;
     }
-
-    // --- 3. 结果解析与状态生成 ---
-    // 从 RANSAC 返回的最优解向量 x_best (8x1) 中提取各个分量。
-    // x_best = [a, b, v_I0_x, v_I0_y, v_I0_z, g_I0_x, g_I0_y, g_I0_z]^T
     
-    // 深度线性模型的尺度因子 a
-    double a = x_best(0); 
-    // 深度线性模型的偏移量 b
-    double b = x_best(1); 
-    // 第一帧 IMU 在 I0 坐标系下的速度向量
-    Eigen::Vector3d v_I0_in_I0 = x_best.segment<3>(2); 
-    // 重力向量在 I0 坐标系下的表示
-    Eigen::Vector3d g_in_I0    = x_best.segment<3>(5);    
-
-    // --- 3.1 结果有效性检查 ---
-    // 对 RANSAC 解进行基本的物理合理性检查。
-    // 检查尺度因子 a 是否过小 (接近 0)。如果 a 太小，会导致深度 z = a/d_hat + b对 d_hat 的变化不敏感，或者深度值趋于无穷，这通常是不稳定或错误的解。
-    // 1e-3 是一个经验阈值。
-    // 检查估计出的重力向量模长 g_in_I0.norm() 是否在合理范围内 (例如 5 到 15 m/s^2)。
-    // 远小于或远大于标准重力加速度 (约 9.8) 都表明解可能错误。
-    if (a < 1e-3 || a > 100.0 || g_in_I0.norm() < 5.0 || g_in_I0.norm() > 15.0)
-    {
-        ROS_WARN("FastInit: RANSAC solution seems unreasonable (a=%.6f must be in [1e-3, 100], |g|=%.2f). Aborting.", 
-                a, g_in_I0.norm());
+    // ========================================================================
+    // 步骤 3: 解析 RANSAC 解并验证
+    // ========================================================================
+    double a = x_best(0);                         // 深度尺度因子
+    double b = x_best(1);                         // 深度偏移
+    Eigen::Vector3d v_I0_in_I0 = x_best.segment<3>(2); // 第一帧速度（I0系）
+    Eigen::Vector3d g_in_I0 = x_best.segment<3>(5);     // 重力向量（I0系）
+    
+    // 验证解的物理合理性
+    if (!isValidSolution(x_best)) {
+        ROS_WARN("FastInit: RANSAC solution failed physical validity check.");
         return false;
     }
     
-    // b 是深度偏移，通常应该在合理范围内（不能太大，否则会导致深度异常）
-    // 如果 b 的绝对值太大，说明模型估计有问题
-    const double MAX_B_ABS = 1.0;  // b 的绝对值不应该超过1米
-    if (std::abs(b) > MAX_B_ABS) {
-        ROS_WARN("FastInit: Offset b=%.6f is too large (|b| > %.1f). This may indicate poor depth model quality.", 
-                b, MAX_B_ABS);
-        // 可以选择拒绝或警告
-        // return false;  // 严格模式：直接拒绝
-    }
-
-    // --- 4. 计算特征点深度 (在 C0 系) ---
-    // 利用 RANSAC 估计出的 a 和 b，为所有在第一帧 (C0) 观测到的特征点计算初始深度。
-    // 这些深度值将被用于后续的非线性优化 (BA)。
-    
-    int N_total = 0, N_ok = 0;
-    double z_min = std::numeric_limits<double>::infinity();
-    double z_max = -std::numeric_limits<double>::infinity();
-    double z_sum = 0.0;
-
-    window_start_frame_id = computeWindowStartFrameId();
-
-    for (const auto& feature : m_feature_manager->feature)
-    {
-        if (feature.start_frame == window_start_frame_id && !feature.feature_per_frame.empty())
-        {
-            const FeaturePerFrame& obs0 = feature.feature_per_frame[0];
-            int u = static_cast<int>(std::round(obs0.uv.x()));
-            int v = static_cast<int>(std::round(obs0.uv.y()));
-            if (v >= 0 && v < first_frame_rows && u >= 0 && u < first_frame_cols)
-            {
-                float d_hat_inv = first_frame_norm_inv_depth.at<float>(v, u); // 在 [1,2]
-                if (d_hat_inv > 1e-6f)
-                {
-                    double z = a * (1.0 / static_cast<double>(d_hat_inv)) + b; // 现有线性深度模型
-                    N_total++;
-                    z_min = std::min(z_min, z);
-                    z_max = std::max(z_max, z);
-                    z_sum += z;
-                    if (z > 0.1 && z < 50.0) N_ok++;
-                }
-            }
-        }
-    }
-    double z_mean = (N_total > 0) ? (z_sum / N_total) : 0.0;
-    ROS_INFO("FastInit depth diag: a=%.6f b=%.6f | N_total=%d N_ok(0.1~50m)=%d | z[min=%.6f max=%.6f mean=%.6f]",
-             a, b, N_total, N_ok, z_min, z_max, z_mean);
-
-    if (N_ok < 10) {
-        ROS_WARN("FastInit: Not enough valid depth features (%d) to initialize.", N_ok);
+    // ========================================================================
+    // 步骤 4: 计算特征点深度统计并验证
+    // ========================================================================
+    DepthStatistics depth_stats;
+    if (!computeDepthStatistics(first_frame_norm_inv_depth, a, b, 
+                               window_start_frame_id, depth_stats)) {
+        ROS_WARN("FastInit: Failed to compute depth statistics.");
         return false;
     }
     
-      
-      // --- 5. 坐标系对齐 (从 I0 系 -> W' 重力对齐系) ---
-    // 目标: 我们 RANSAC 求解得到的速度 v_I0 和重力 g_I0 都是在 I0 坐标系（即第一帧 IMU 坐标系）下表示的。
-    //       为了方便后续优化和与其他模块（如可视化）对接，我们需要将所有状态统一到一个规范的世界坐标系 W' 中。
-    //       我们选择 W' 的定义为：原点与 I0 重合，Z 轴与真实重力方向对齐（通常是竖直向上或向下）。
+    ROS_INFO("FastInit depth stats: a=%.6f b=%.6f | total=%d valid=%d | "
+             "z[%.3f~%.3f] mean=%.3f", 
+             a, b, depth_stats.total_count, depth_stats.valid_count,
+             depth_stats.min_depth, depth_stats.max_depth, depth_stats.mean_depth);
     
-    // G_gravity_world (输入参数): 这是 VINS-Mono 系统定义的全局目标重力向量。
-    // 它的大小由配置文件中的 g_norm 决定，方向通常是 [0, 0, +G.norm()] (VINS-Mono 约定)。
-    // 我们用它来确定目标 W' 系的 Z 轴方向。
+    // 验证有效深度特征数量
+    const int MIN_VALID_DEPTH_FEATURES = 10;
+    if (depth_stats.valid_count < MIN_VALID_DEPTH_FEATURES) {
+        ROS_WARN("FastInit: Not enough valid depth features (%d < %d).", 
+                 depth_stats.valid_count, MIN_VALID_DEPTH_FEATURES);
+        return false;
+    }
     
-    // g_in_I0: RANSAC 估计出的重力向量在 I0 系下的表示。
+    // ========================================================================
+    // 步骤 5: 坐标系对齐（I0 系 -> W' 重力对齐系）
+    // ========================================================================
+    Eigen::Quaterniond R_I0_to_W_prime;
+    Eigen::Vector3d v_I0_in_W_prime;
+    alignCoordinateSystem(g_in_I0, v_I0_in_I0, G_gravity_world, 
+                         R_I0_to_W_prime, v_I0_in_W_prime);
     
-    // 计算估计出的重力向量 g_in_I0 的单位方向向量。
-    Eigen::Vector3d g_I0_normalized = g_in_I0.normalized();
-    // --- MODIFICATION START: Use global G for target direction ---
-    // 计算目标重力向量 ::G (来自 parameters.h) 的单位方向向量，以确定 W' 系的 Z 轴。
-    // 不能使用传入的 G_gravity_world，因为它在此时是未初始化的。
-    Eigen::Vector3d g_target_normalized = ::G.normalized(); 
-
-    // 计算从 W' 系到 I0 系的旋转 R_W'_I0。
-    // Eigen::Quaterniond::FromTwoVectors(a, b) 计算的是将向量 a 旋转到向量 b 所需的最小旋转。
-    // 因此，FromTwoVectors(g_target_normalized, g_I0_normalized) 计算的是将 W' 系下的重力方向 ([0,0,1]) 
-    // 旋转到我们在 I0 系下估计出的重力方向 g_I0_normalized 所需的旋转。
-    // 这个旋转就是 R_W'_I0 (从 W' 旋转到 I0)。
-    Eigen::Quaterniond R_W_prime_to_I0 = Eigen::Quaterniond::FromTwoVectors(g_target_normalized, g_I0_normalized);
-
-    // 更新全局重力向量 G_gravity_world。
-    // 我们保留 VINS 系统预设的重力 方向 (g_target_normalized)，
-    // 但是使用我们 RANSAC 估计出的重力 大小 (g_in_I0.norm())。
-    // 这允许系统自适应地估计当地的重力加速度大小。
-    G_gravity_world = g_target_normalized * g_in_I0.norm();
-
-    // 计算从 I0 系到 W' 系的旋转 R_I0_W'，即 R_W'_I0 的逆。
-    // 这个旋转用于将 I0 系下的向量（如速度）转换到 W' 系下。
-    Eigen::Quaterniond R_I0_to_W_prime = R_W_prime_to_I0.inverse();
-
-    // 第一帧在I0坐标系下的姿态是单位旋转（第一帧就是I0）
-    // 需要消除第一帧在W'坐标系下的yaw角
-    Matrix3d R0_matrix = R_I0_to_W_prime.toRotationMatrix();
-    double yaw_first = Utility::R2ypr(R0_matrix).x();  // 第一帧在W'系下的yaw角
-    Matrix3d R_yaw_correction = Utility::ypr2R(Eigen::Vector3d{-yaw_first, 0, 0});
-    R0_matrix = R_yaw_correction * R0_matrix;
-    R_I0_to_W_prime = Quaterniond(R0_matrix);
-
-    // 将第一帧的速度 v_I0_in_I0 从 I0 系变换到 W' 系。
-    Eigen::Vector3d v_I0_in_W_prime = R_I0_to_W_prime * v_I0_in_I0;
-    // 定义第一帧 IMU 在 W' 系下的位置为原点。
-    Eigen::Vector3d p_I0_in_W_prime = Eigen::Vector3d::Zero(); 
-
-    // --- 6. 前向传播状态到窗口内所有关键帧 ---
-    // 目标: 我们已经有了第 0 帧 (I0) 在 W' 系下的姿态 R_I0_W' (即 R_wb_0), 速度 v_I0_in_W', 位置 p_I0_in_W'。
-    // 现在，我们需要利用 IMU 预积分结果，将这个状态依次传播到窗口内的第 1, 2, ..., k 帧。
+    // 第一帧在 W' 系下的位置设为原点
+    Eigen::Vector3d p_I0_in_W_prime = Eigen::Vector3d::Zero();
     
-    // 清空输出的 map 容器，准备填充新的状态。
-    Ps_out.clear();
-    Vs_out.clear();
-    Rs_out.clear();
-
-    k_index = 0; // 窗口内帧的索引。
+    // ========================================================================
+    // 步骤 6: 前向传播状态到所有帧
+    // ========================================================================
+    if (!propagateStatesToAllFrames(image_frames, R_I0_to_W_prime, 
+                                    p_I0_in_W_prime, v_I0_in_W_prime,
+                                    G_gravity_world, Ps_out, Vs_out, Rs_out)) {
+        ROS_WARN("FastInit: Failed to propagate states to all frames.");
+        return false;
+    }
     
-    // R_prev, p_prev, v_prev 存储的是上一帧 (k-1) 在 W 系下的状态。
-    // 初始化为第 0 帧的状态。
-    // 注意 VINS-Mono 的 Rs 数组存储的是从 Body 到 World 的旋转 R_{b}^{w}。
-    // R_I0_to_W_prime 是从 I0 (Body) 到 W (World) 的旋转 R_{I0}^{w}。
-    Eigen::Quaterniond R_prev = R_I0_to_W_prime; // R_wb_0
-    Eigen::Vector3d p_prev = p_I0_in_W_prime;   // p_w_0
-    Eigen::Vector3d v_prev = v_I0_in_W_prime;   // v_w_0
-
-    // 遍历输入的所有图像帧信息 (image_frames 是按时间戳排序的 map)。
-    for (const auto& pair : image_frames)
-    {
-        // --- 处理第 0 帧 ---
-        if (k_index == 0)
-        {
-            // 直接存储第 0 帧的初始状态。
-            Rs_out[k_index] = R_prev; // R_wb_0
-            Ps_out[k_index] = p_prev; // p_w_0
-            Vs_out[k_index] = v_prev; // v_w_0
-        }
-        // --- 处理第 k 帧 (k > 0) ---
-        else
-        {
-            // 获取从 k-1 帧到 k 帧的 IMU 预积分结果 (delta_q, delta_p, delta_v)。
-            // 注意：pair.second.pre_integration 存储的是 $\Delta_{I_{k-1}}^{I_k}$。
-            IntegrationBase* pre_int_delta = pair.second.pre_integration;
-            // 检查预积分对象是否存在 (理论上应该总是存在)。
-            if (!pre_int_delta) {
-                ROS_ERROR("FastInit: Missing pre_integration for state propagation at frame %d!", k_index);
-                return false; 
-            }
-            // 获取 k-1 到 k 的时间差。
-            double dt = pre_int_delta->sum_dt;
-
-            // --- 状态传播公式 ---
-            // R_{k}^{w} 表示I_{k}到w的旋转
-            // R_{k}^{w} = R_{k-1}^{w} * delta_R_{k}^{k-1}
-            Eigen::Quaterniond R_curr = R_prev * pre_int_delta->delta_q ;
-
-
-            // p_k = p_{k-1} + v_{k-1} * dt - 0.5*g*dt^2 + R_{k-1}^{w} * delta_p
-            // 所有向量都在 W' (World) 系下。
-            // delta_p 是在 Body(k-1) 系下表示的位移。需要用 R_{k-1}^{w} (即 R_prev) 转换到世界系。
-            Eigen::Vector3d p_curr = p_prev + v_prev * dt - 0.5 * G_gravity_world * dt * dt + R_prev * pre_int_delta->delta_p;
-
-            // v_k = v_{k-1} - g * dt + R_{k-1}^{w} * delta_v
-            // delta_v 是在 Body(k-1) 系下表示的速度变化。需要用 R_{k-1}^{w} (即 R_prev) 转换到世界系。
-            Eigen::Vector3d v_curr = v_prev - G_gravity_world * dt + R_prev * pre_int_delta->delta_v;
-
-            // 存储计算出的第 k 帧的状态。
-            Rs_out[k_index] = R_curr;
-            Ps_out[k_index] = p_curr;
-            Vs_out[k_index] = v_curr;
-
-            // 更新 R_prev, p_prev, v_prev 以供下一轮迭代使用。
-            R_prev = R_curr;
-            p_prev = p_curr;
-            v_prev = v_curr;
-        }
-        k_index++; // 帧索引加一。
-    } // 遍历所有帧结束。
-
-    // --- 7. 输出最终信息并返回成功 ---
-    // 打印成功信息和关键的估计结果。
+    // ========================================================================
+    // 步骤 7: 输出成功信息
+    // ========================================================================
     ROS_INFO("FastInit: Initialization successful!");
-    ROS_INFO("  a=%.3f, b=%.3f", a, b);
-    ROS_INFO("  v_I0_W' = [%.3f, %.3f, %.3f]", v_I0_in_W_prime.x(), v_I0_in_W_prime.y(), v_I0_in_W_prime.z());
-    ROS_INFO("  g_W'    = [%.3f, %.3f, %.3f] (norm: %.3f)", G_gravity_world.x(), G_gravity_world.y(), G_gravity_world.z(), G_gravity_world.norm());
-
-    // 返回 true 表示初始化成功。
+    ROS_INFO("  Depth model: a=%.3f, b=%.3f", a, b);
+    ROS_INFO("  Initial velocity (W'): [%.3f, %.3f, %.3f] m/s", 
+             v_I0_in_W_prime.x(), v_I0_in_W_prime.y(), v_I0_in_W_prime.z());
+    ROS_INFO("  Gravity (W'): [%.3f, %.3f, %.3f] m/s² (norm: %.3f)", 
+             G_gravity_world.x(), G_gravity_world.y(), G_gravity_world.z(), 
+             G_gravity_world.norm());
+    
     return true;
 }
 
@@ -466,18 +259,20 @@ bool FastInitializer::solveRANSAC(const std::vector<ObservationData>& all_observ
     for (int iter = 0; iter < fast_mono::RANSAC_MAX_ITERATIONS; ++iter)
     {
         // 1. 随机采样最小集
-        std::vector<int> current_indices;
+        std::set<int> used_indices;  // 使用set提高查找效率
         std::vector<ObservationData> minimal_set;
         while (minimal_set.size() < current_min_measurements)
         {
             int rand_idx = distribution(m_random_generator);
-            bool found = false;
-            for(int idx : current_indices) if(idx == rand_idx) found = true;
-            if(!found) {
-                if (!all_observations[rand_idx].pre_integration_k) continue; // 跳过无效数据
-                current_indices.push_back(rand_idx);
-                minimal_set.push_back(all_observations[rand_idx]);
+            // 检查是否已使用且数据有效
+            if (used_indices.find(rand_idx) != used_indices.end()) {
+                continue;  // 已使用，跳过
             }
+            if (!all_observations[rand_idx].pre_integration_k) {
+                continue;  // 数据无效，跳过
+            }
+            used_indices.insert(rand_idx);
+            minimal_set.push_back(all_observations[rand_idx]);
         }
 
         // 2. 构建最小系统的 A_min 和 b_min
@@ -523,7 +318,7 @@ bool FastInitializer::solveRANSAC(const std::vector<ObservationData>& all_observ
         }
 
         // --- 条件数阈值检查 ---
-        const double CONDITION_NUMBER_THRESHOLD = 1e12; // << 需要调整
+        const double CONDITION_NUMBER_THRESHOLD = 1e8; // << 需要调整
         if (cond_num > CONDITION_NUMBER_THRESHOLD || std::isinf(cond_num) || std::isnan(cond_num))
         {
             // if (iter < 20) ROS_WARN("RANSAC Iter %d: Poor condition number (%.2e). Discarding sample.", iter, cond_num);
@@ -729,8 +524,9 @@ bool FastInitializer::solveLinearSystem(const std::vector<ObservationData>& obse
 
     // 使用无约束解的方向 和 全局参数 G.norm() 确定约束后的重力
     Eigen::Vector3d g_normed = g_svd.normalized() * G.norm();
-    cout << "g_svd: " << g_svd.transpose() << endl;
-    cout << "g_svd.norm(): " << g_svd.norm() << endl;
+    // 替换第732-733行
+    ROS_DEBUG("g_svd: [%.6f, %.6f, %.6f], norm: %.6f", 
+        g_svd.x(), g_svd.y(), g_svd.z(), g_svd.norm());
 
     // --- 5. 固定 g_normed，重新求解 y = [a, b, v_I0]^T ---
     Eigen::MatrixXd A_y = A.leftCols<5>(); // 前 5 列
@@ -772,5 +568,353 @@ bool FastInitializer::solveLinearSystem(const std::vector<ObservationData>& obse
     x_out.tail<3>() = g_normed;   // 约束后的 g
 
     ROS_INFO("solveLinearSystem finished successfully.");
+    return true;
+}
+
+
+bool FastInitializer::isValidDepth(double d_hat_inv)
+{
+    // 深度值必须：有限、大于0、在合理范围内（归一化逆深度通常为[1,2]）
+    return std::isfinite(d_hat_inv) && d_hat_inv > 0.0 && d_hat_inv <= 10.0;
+}
+
+bool FastInitializer::isValidPixelCoord(int u, int v, int rows, int cols)
+{
+    return (u >= 0 && u < cols && v >= 0 && v < rows);
+}
+
+bool FastInitializer::isValidNormalizedCoord(const Eigen::Vector3d& z)
+{
+    // 归一化坐标的第三个分量应该接近1，且所有分量有限
+    return z.allFinite() && z.z() > 1e-6;
+}
+
+bool FastInitializer::getValidDepthFromMap(const cv::Mat& depth_map, int u, int v, double& d_out)
+{
+    if (!isValidPixelCoord(u, v, depth_map.rows, depth_map.cols)) {
+        return false;
+    }
+    
+    float d_hat_inv = depth_map.at<float>(v, u);
+    d_out = static_cast<double>(d_hat_inv);
+    
+    return isValidDepth(d_out);
+}
+
+bool FastInitializer::computeCompoundPreIntegrations(
+    const std::map<double, ImageFrame>& image_frames,
+    std::vector<IntegrationBase*>& pre_integrations_out)
+{
+    pre_integrations_out.clear();
+    pre_integrations_out.reserve(image_frames.size());
+    
+    // 第一帧的预积分为单位预积分（从 I0 到 I0）
+    IntegrationBase* I0_to_I0 = new IntegrationBase(
+        Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero(),
+        Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero());
+    pre_integrations_out.push_back(I0_to_I0);
+    
+    // 遍历后续帧，计算复合预积分
+    int k_index = 0;
+    for (const auto& pair : image_frames) {
+        if (k_index > 0) {  // 跳过第一帧
+            IntegrationBase* prev_compound = pre_integrations_out.back();
+            IntegrationBase* delta_integration = pair.second.pre_integration;
+            
+            if (!delta_integration) {
+                ROS_ERROR("FastInit: Missing pre_integration for frame %d!", k_index);
+                return false;
+            }
+            
+            // 复合预积分公式：I0->Ik = (I0->I_{k-1}) * (I_{k-1}->Ik)
+            IntegrationBase* new_compound = new IntegrationBase(
+                Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero(),
+                Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero());
+            
+            // 时间累积
+            new_compound->sum_dt = prev_compound->sum_dt + delta_integration->sum_dt;
+            
+            // 旋转复合：R_Ik^I0 = R_{I_{k-1}}^I0 * R_Ik^{I_{k-1}}
+            new_compound->delta_q = prev_compound->delta_q * delta_integration->delta_q;
+            
+            // 速度复合：v_Ik^I0 = v_{I_{k-1}}^I0 + R_{I_{k-1}}^I0 * delta_v
+            new_compound->delta_v = prev_compound->delta_v + 
+                                   prev_compound->delta_q * delta_integration->delta_v;
+            
+            // 位置复合：p_Ik^I0 = p_{I_{k-1}}^I0 + v_{I_{k-1}}^I0 * dt + R_{I_{k-1}}^I0 * delta_p
+            new_compound->delta_p = prev_compound->delta_p
+                                  + prev_compound->delta_v * delta_integration->sum_dt
+                                  + prev_compound->delta_q * delta_integration->delta_p;
+            
+            pre_integrations_out.push_back(new_compound);
+        }
+        k_index++;
+    }
+    
+    return true;
+}
+
+int FastInitializer::collectValidObservations(
+    const cv::Mat& depth_map,
+    int window_start_frame_id,
+    const std::vector<IntegrationBase*>& pre_integrations_compound,
+    std::vector<ObservationData>& observations_out)
+{
+    observations_out.clear();
+    int feature_count = 0;
+    int rows = depth_map.rows;
+    int cols = depth_map.cols;
+    
+    for (const auto& feature : m_feature_manager->feature) {
+        // 只处理在第一帧（窗口起始帧）被观测到的特征
+        if (feature.start_frame != window_start_frame_id || 
+            feature.feature_per_frame.empty()) {
+            continue;
+        }
+        
+        feature_count++;
+        
+        // 获取第一帧的观测
+        const FeaturePerFrame& obs_frame_0 = feature.feature_per_frame[0];
+        Eigen::Vector3d z_i0 = obs_frame_0.point;
+        
+        // 验证归一化坐标
+        if (!isValidNormalizedCoord(z_i0)) {
+            continue;
+        }
+        
+        // 获取深度值
+        int u = static_cast<int>(std::round(obs_frame_0.uv.x()));
+        int v = static_cast<int>(std::round(obs_frame_0.uv.y()));
+        double d_hat_i_inv;
+        if (!getValidDepthFromMap(depth_map, u, v, d_hat_i_inv)) {
+            continue;
+        }
+        
+        // 遍历该特征在后续帧的观测
+        for (size_t frame_idx = 1; frame_idx < feature.feature_per_frame.size(); ++frame_idx) {
+            const FeaturePerFrame& obs_frame_k = feature.feature_per_frame[frame_idx];
+            int frame_k_window_index = obs_frame_k.frame_id - window_start_frame_id;
+            
+            // 确保帧索引在有效范围内
+            if (frame_k_window_index <= 0 || 
+                frame_k_window_index > WINDOW_SIZE ||
+                frame_k_window_index >= static_cast<int>(pre_integrations_compound.size())) {
+                continue;
+            }
+            
+            Eigen::Vector3d z_ik = obs_frame_k.point;
+            if (!isValidNormalizedCoord(z_ik)) {
+                continue;
+            }
+            
+            // 构建观测数据
+            ObservationData obs_data;
+            obs_data.feature_id = feature.feature_id;
+            obs_data.frame_k_index = frame_k_window_index;
+            obs_data.pre_integration_k = pre_integrations_compound[frame_k_window_index];
+            obs_data.z_i0 = z_i0;
+            obs_data.z_ik = z_ik;
+            obs_data.d_hat_i = d_hat_i_inv;
+            
+            observations_out.push_back(obs_data);
+        }
+    }
+    
+    return feature_count;
+}
+
+bool FastInitializer::isValidSolution(const Eigen::Matrix<double, 8, 1>& x)
+{
+    double a = x(0);
+    double b = x(1);
+    Eigen::Vector3d g_in_I0 = x.segment<3>(5);
+    double g_norm = g_in_I0.norm();
+    
+    // 检查尺度因子 a 的合理性
+    if (a < 1e-3 || a > 100.0) {
+        ROS_WARN("FastInit: Invalid scale factor a=%.6f (should be in [1e-3, 100]).", a);
+        return false;
+    }
+    
+    // 检查重力大小的合理性（地球表面重力加速度范围）
+    if (g_norm < 5.0 || g_norm > 15.0) {
+        ROS_WARN("FastInit: Invalid gravity norm |g|=%.2f (should be in [5, 15] m/s²).", g_norm);
+        return false;
+    }
+    
+    // 检查深度偏移 b 的合理性（可选：严格模式下可拒绝）
+    const double MAX_B_ABS = 1.0;
+    if (std::abs(b) > MAX_B_ABS) {
+        ROS_WARN("FastInit: Large depth offset b=%.6f (|b| > %.1f). "
+                 "This may indicate poor depth model quality.", b, MAX_B_ABS);
+        // 注意：这里只警告，不直接拒绝，因为某些场景下可能合理
+    }
+    
+    return true;
+}
+
+bool FastInitializer::computeDepthStatistics(
+    const cv::Mat& depth_map,
+    double a, double b,
+    int window_start_frame_id,
+    DepthStatistics& stats_out)
+{
+    stats_out = DepthStatistics();
+    int rows = depth_map.rows;
+    int cols = depth_map.cols;
+    
+    for (const auto& feature : m_feature_manager->feature) {
+        if (feature.start_frame != window_start_frame_id || 
+            feature.feature_per_frame.empty()) {
+            continue;
+        }
+        
+        const FeaturePerFrame& obs0 = feature.feature_per_frame[0];
+        int u = static_cast<int>(std::round(obs0.uv.x()));
+        int v = static_cast<int>(std::round(obs0.uv.y()));
+        
+        double d_hat_inv;
+        if (!getValidDepthFromMap(depth_map, u, v, d_hat_inv)) {
+            continue;
+        }
+        
+        // 计算深度：z = a * (1 / d_hat_inv) + b
+        double z = a * (1.0 / d_hat_inv) + b;
+        
+        stats_out.total_count++;
+        stats_out.min_depth = std::min(stats_out.min_depth, z);
+        stats_out.max_depth = std::max(stats_out.max_depth, z);
+        
+        // 统计有效深度（在合理范围内：0.1 ~ 50 米）
+        if (z > 0.1 && z < 50.0) {
+            stats_out.valid_count++;
+        }
+    }
+    
+    // 计算平均深度（只计算有效深度的平均）
+    double z_sum = 0.0;
+    int valid_sum_count = 0;
+    for (const auto& feature : m_feature_manager->feature) {
+        if (feature.start_frame != window_start_frame_id || 
+            feature.feature_per_frame.empty()) {
+            continue;
+        }
+        
+        const FeaturePerFrame& obs0 = feature.feature_per_frame[0];
+        int u = static_cast<int>(std::round(obs0.uv.x()));
+        int v = static_cast<int>(std::round(obs0.uv.y()));
+        
+        double d_hat_inv;
+        if (!getValidDepthFromMap(depth_map, u, v, d_hat_inv)) {
+            continue;
+        }
+        
+        double z = a * (1.0 / d_hat_inv) + b;
+        if (z > 0.1 && z < 50.0) {
+            z_sum += z;
+            valid_sum_count++;
+        }
+    }
+    
+    stats_out.mean_depth = (valid_sum_count > 0) ? (z_sum / valid_sum_count) : 0.0;
+    
+    return true;
+}
+
+void FastInitializer::alignCoordinateSystem(
+    const Eigen::Vector3d& g_in_I0,
+    const Eigen::Vector3d& v_I0_in_I0,
+    Eigen::Vector3d& G_gravity_world,
+    Eigen::Quaterniond& R_I0_to_W_prime,
+    Eigen::Vector3d& v_I0_in_W_prime)
+{
+    // 计算目标重力方向（使用全局参数 G，通常是 [0, 0, 9.81]）
+    Eigen::Vector3d g_target_normalized = ::G.normalized();
+    Eigen::Vector3d g_I0_normalized = g_in_I0.normalized();
+    
+    // 计算从 W' 到 I0 的旋转（将目标重力方向旋转到估计的重力方向）
+    // R_W'_I0 = FromTwoVectors(g_target, g_I0)
+    Eigen::Quaterniond R_W_prime_to_I0 = 
+        Eigen::Quaterniond::FromTwoVectors(g_target_normalized, g_I0_normalized);
+    
+    // 更新全局重力向量：保留目标方向，使用估计的大小
+    G_gravity_world = g_target_normalized * g_in_I0.norm();
+    
+    // 计算从 I0 到 W' 的旋转（用于变换速度等）
+    R_I0_to_W_prime = R_W_prime_to_I0.inverse();
+    
+    // 消除第一帧在 W' 系下的 yaw 角（使其与重力对齐，但不固定 yaw）
+    Matrix3d R0_matrix = R_I0_to_W_prime.toRotationMatrix();
+    double yaw_first = Utility::R2ypr(R0_matrix).x();
+    Matrix3d R_yaw_correction = Utility::ypr2R(Eigen::Vector3d{-yaw_first, 0, 0});
+    R0_matrix = R_yaw_correction * R0_matrix;
+    R_I0_to_W_prime = Quaterniond(R0_matrix);
+    
+    // 将速度从 I0 系转换到 W' 系
+    v_I0_in_W_prime = R_I0_to_W_prime * v_I0_in_I0;
+}
+
+bool FastInitializer::propagateStatesToAllFrames(
+    const std::map<double, ImageFrame>& image_frames,
+    const Eigen::Quaterniond& R_I0_to_W_prime,
+    const Eigen::Vector3d& p_I0_in_W_prime,
+    const Eigen::Vector3d& v_I0_in_W_prime,
+    const Eigen::Vector3d& G_gravity_world,
+    std::map<int, Eigen::Vector3d>& Ps_out,
+    std::map<int, Eigen::Vector3d>& Vs_out,
+    std::map<int, Eigen::Quaterniond>& Rs_out)
+{
+    Ps_out.clear();
+    Vs_out.clear();
+    Rs_out.clear();
+    
+    // 初始化第一帧的状态
+    Eigen::Quaterniond R_prev = R_I0_to_W_prime;
+    Eigen::Vector3d p_prev = p_I0_in_W_prime;
+    Eigen::Vector3d v_prev = v_I0_in_W_prime;
+    
+    int k_index = 0;
+    for (const auto& pair : image_frames) {
+        if (k_index == 0) {
+            // 第一帧：直接存储初始状态
+            Rs_out[k_index] = R_prev;
+            Ps_out[k_index] = p_prev;
+            Vs_out[k_index] = v_prev;
+        } else {
+            // 后续帧：使用 IMU 预积分进行状态传播
+            IntegrationBase* pre_int_delta = pair.second.pre_integration;
+            if (!pre_int_delta) {
+                ROS_ERROR("FastInit: Missing pre_integration for frame %d!", k_index);
+                return false;
+            }
+            
+            double dt = pre_int_delta->sum_dt;
+            
+            // 旋转传播：R_k^w = R_{k-1}^w * delta_R_{k-1}^k
+            Eigen::Quaterniond R_curr = R_prev * pre_int_delta->delta_q;
+            
+            // 位置传播：p_k^w = p_{k-1}^w + v_{k-1}^w * dt - 0.5*g*dt² + R_{k-1}^w * delta_p
+            Eigen::Vector3d p_curr = p_prev + v_prev * dt 
+                                    - 0.5 * G_gravity_world * dt * dt
+                                    + R_prev * pre_int_delta->delta_p;
+            
+            // 速度传播：v_k^w = v_{k-1}^w - g*dt + R_{k-1}^w * delta_v
+            Eigen::Vector3d v_curr = v_prev - G_gravity_world * dt
+                                    + R_prev * pre_int_delta->delta_v;
+            
+            // 存储当前帧状态
+            Rs_out[k_index] = R_curr;
+            Ps_out[k_index] = p_curr;
+            Vs_out[k_index] = v_curr;
+            
+            // 更新为下一帧的"前一帧"状态
+            R_prev = R_curr;
+            p_prev = p_curr;
+            v_prev = v_curr;
+        }
+        k_index++;
+    }
+    
     return true;
 }

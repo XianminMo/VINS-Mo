@@ -579,20 +579,20 @@ void Estimator::processImage(const map<int, vector<pair<int, Eigen::Matrix<doubl
                                                   const std::map<int, Eigen::Vector3d>& Vs_init,
                                                   const std::map<int, Eigen::Quaterniond>& Rs_init)
  {
-     // 将初始化结果复制到 Estimator 的状态变量
-     for (int k = 0; k <= WINDOW_SIZE; ++k) {
-         if (Ps_init.count(k) && Vs_init.count(k) && Rs_init.count(k)) {
-             Ps[k] = Ps_init[k];
-             Vs[k] = Vs_init[k];
-             Rs[k] = Rs_init[k].toRotationMatrix(); // Quaterniond -> Matrix3d
-             
-             // 将所有初始化的帧标记为关键帧
-             double timestamp = Headers[k].stamp.toSec();
-             if (all_image_frame.count(timestamp)) {
-                 all_image_frame[timestamp].is_key_frame = true;
-             }
-         }
-     }
+    // 将初始化结果复制到 Estimator 的状态变量
+    for (int k = 0; k <= WINDOW_SIZE; ++k) {
+        if (Ps_init.count(k) && Vs_init.count(k) && Rs_init.count(k)) {
+            Ps[k] = Ps_init.at(k);
+            Vs[k] = Vs_init.at(k);
+            Rs[k] = Rs_init.at(k).toRotationMatrix(); // Quaterniond -> Matrix3d
+            
+            // 将所有初始化的帧标记为关键帧
+            double timestamp = Headers[k].stamp.toSec();
+            if (all_image_frame.count(timestamp)) {
+                all_image_frame[timestamp].is_key_frame = true;
+            }
+        }
+    }
  }
 
 /**

@@ -115,9 +115,134 @@ private:
      */
     bool solveLinearSystem(const std::vector<ObservationData>& observations,
                            Eigen::Matrix<double, 8, 1>& x_out);
-
-
-    // --- 成员变量 ---
+    
+    /**
+    * @brief 验证归一化逆深度值的有效性
+    * @param d_hat_inv 归一化逆深度值
+    * @return true 如果深度值有效，false 否则
+    */
+    static bool isValidDepth(double d_hat_inv);
+    
+    /**
+    * @brief 验证像素坐标是否在图像范围内
+    * @param u 像素坐标 x
+    * @param v 像素坐标 y
+    * @param rows 图像行数
+    * @param cols 图像列数
+    * @return true 如果坐标有效，false 否则
+    */
+    static bool isValidPixelCoord(int u, int v, int rows, int cols);
+    
+    /**
+    * @brief 验证归一化特征坐标的有效性
+    * @param z 归一化坐标向量 [x, y, 1]
+    * @return true 如果坐标有效，false 否则
+    */
+    static bool isValidNormalizedCoord(const Eigen::Vector3d& z);
+    
+    /**
+    * @brief 从深度图获取深度值并验证
+    * @param depth_map 归一化逆深度图
+    * @param u 像素坐标 x
+    * @param v 像素坐标 y
+    * @param d_out [out] 输出的深度值
+    * @return true 如果成功获取有效深度值，false 否则
+    */
+    static bool getValidDepthFromMap(const cv::Mat& depth_map, int u, int v, double& d_out);
+    
+    /**
+    * @brief 计算复合 IMU 预积分（从第一帧 I0 到当前帧 Ik）
+    * @param image_frames 所有图像帧的映射
+    * @param pre_integrations_out [out] 输出的复合预积分向量，索引对应窗口内帧索引
+    * @return true 如果成功，false 如果失败（如缺少预积分数据）
+    */
+    bool computeCompoundPreIntegrations(
+        const std::map<double, ImageFrame>& image_frames,
+        std::vector<IntegrationBase*>& pre_integrations_out);
+    
+    /**
+    * @brief 收集所有有效的特征观测数据
+    * @param depth_map 第一帧的归一化逆深度图
+    * @param window_start_frame_id 窗口起始帧ID
+    * @param pre_integrations_compound 复合预积分向量
+    * @param observations_out [out] 输出的观测数据向量
+    * @return 收集到的有效观测数量
+    */
+    int collectValidObservations(
+        const cv::Mat& depth_map,
+        int window_start_frame_id,
+        const std::vector<IntegrationBase*>& pre_integrations_compound,
+        std::vector<ObservationData>& observations_out);
+    
+    /**
+    * @brief 验证 RANSAC 解的基本物理合理性
+    * @param x 解向量 [a, b, v_I0, g_I0]^T
+    * @return true 如果解合理，false 否则
+    */
+    static bool isValidSolution(const Eigen::Matrix<double, 8, 1>& x);
+    
+    /**
+    * @brief 计算所有特征点的深度统计信息
+    * @param depth_map 归一化逆深度图
+    * @param a 深度尺度因子
+    * @param b 深度偏移
+    * @param window_start_frame_id 窗口起始帧ID
+    * @param stats_out [out] 输出统计信息结构体
+    * @return true 如果统计成功
+    */
+    struct DepthStatistics {
+        int total_count = 0;      // 总特征点数
+        int valid_count = 0;       // 有效深度特征点数（0.1~50m范围内）
+        double min_depth = std::numeric_limits<double>::infinity();
+        double max_depth = -std::numeric_limits<double>::infinity();
+        double mean_depth = 0.0;
+    };
+    bool computeDepthStatistics(
+        const cv::Mat& depth_map,
+        double a, double b,
+        int window_start_frame_id,
+        DepthStatistics& stats_out);
+    
+    /**
+    * @brief 执行坐标系对齐：从 I0 系转换到 W' 重力对齐系
+    * @param g_in_I0 重力向量在 I0 系下的表示
+    * @param v_I0_in_I0 速度向量在 I0 系下的表示
+    * @param G_gravity_world [out] 重力向量在 W' 系下的表示
+    * @param R_I0_to_W_prime [out] 从 I0 到 W' 的旋转
+    * @param v_I0_in_W_prime [out] 速度向量在 W' 系下的表示
+    */
+    void alignCoordinateSystem(
+        const Eigen::Vector3d& g_in_I0,
+        const Eigen::Vector3d& v_I0_in_I0,
+        Eigen::Vector3d& G_gravity_world,
+        Eigen::Quaterniond& R_I0_to_W_prime,
+        Eigen::Vector3d& v_I0_in_W_prime);
+    
+    /**
+    * @brief 使用 IMU 预积分前向传播状态到所有帧
+    * @param image_frames 所有图像帧的映射
+    * @param R_I0_to_W_prime 第一帧的旋转（I0 到 W'）
+    * @param p_I0_in_W_prime 第一帧的位置（在 W' 系下）
+    * @param v_I0_in_W_prime 第一帧的速度（在 W' 系下）
+    * @param G_gravity_world 重力向量（在 W' 系下）
+    * @param Ps_out [out] 输出的位置向量
+    * @param Vs_out [out] 输出的速度向量
+    * @param Rs_out [out] 输出的旋转向量
+    * @return true 如果成功，false 如果失败
+    */
+    bool propagateStatesToAllFrames(
+        const std::map<double, ImageFrame>& image_frames,
+        const Eigen::Quaterniond& R_I0_to_W_prime,
+        const Eigen::Vector3d& p_I0_in_W_prime,
+        const Eigen::Vector3d& v_I0_in_W_prime,
+        const Eigen::Vector3d& G_gravity_world,
+        std::map<int, Eigen::Vector3d>& Ps_out,
+        std::map<int, Eigen::Vector3d>& Vs_out,
+        std::map<int, Eigen::Quaterniond>& Rs_out);
+    
+    
+    
+    // 成员变量 
     FeatureManager* m_feature_manager; ///< 指向 Estimator 中 FeatureManager 的指针，用于访问特征信息
     std::mt19937 m_random_generator;   ///< 用于 RANSAC 的随机数生成器
 };

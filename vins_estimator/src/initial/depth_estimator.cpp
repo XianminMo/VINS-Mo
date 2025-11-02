@@ -194,32 +194,30 @@ void DepthEstimator::preprocess(const cv::Mat& image, std::vector<float>& input_
     {
         cv::cvtColor(image, img_bgr, cv::COLOR_GRAY2BGR);
     }
-    else if (image.channels() == 3 && save_debug_images)
+    else if (image.channels() == 3)
     {
         img_bgr = image;
         
-        static bool checked_pseudo_color = false;
-        if (!checked_pseudo_color) {
-            cv::Mat channels[3];
-            cv::split(img_bgr, channels);
-            cv::Mat diff1, diff2;
-            cv::absdiff(channels[0], channels[1], diff1);
-            cv::absdiff(channels[0], channels[2], diff2);
-            double max_diff1, max_diff2;
-            cv::minMaxLoc(diff1, nullptr, &max_diff1);
-            cv::minMaxLoc(diff2, nullptr, &max_diff2);
-            
-            if (max_diff1 < 5.0 && max_diff2 < 5.0) {
-                ROS_WARN("DepthEstimator: Input appears to be pseudo-color (grayscale converted to BGR). "
-                         "All channels are nearly identical. MiDaS depth estimation may fail!");
+        // 仅在启用调试时检查伪彩色
+        if (save_debug_images) {
+            static bool checked_pseudo_color = false;
+            if (!checked_pseudo_color) {
+                cv::Mat channels[3];
+                cv::split(img_bgr, channels);
+                cv::Mat diff1, diff2;
+                cv::absdiff(channels[0], channels[1], diff1);
+                cv::absdiff(channels[0], channels[2], diff2);
+                double max_diff1, max_diff2;
+                cv::minMaxLoc(diff1, nullptr, &max_diff1);
+                cv::minMaxLoc(diff2, nullptr, &max_diff2);
+                
+                if (max_diff1 < 5.0 && max_diff2 < 5.0) {
+                    ROS_WARN("DepthEstimator: Input appears to be pseudo-color (grayscale converted to BGR). "
+                             "All channels are nearly identical. MiDaS depth estimation may fail!");
+                }
+                checked_pseudo_color = true;
             }
-            checked_pseudo_color = true;
         }
-    }
-    else
-    {
-        ROS_WARN("DepthEstimator::preprocess(): unsupported channels=%d, trying to proceed.", image.channels());
-        img_bgr = image;
     }
 
     cv::Mat img_rgb;

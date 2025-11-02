@@ -412,21 +412,6 @@ int main(int argc, char **argv)
     estimator.initDepthEstimator();
     estimator.setParameter();
 
-    // 可选：在后台检查模型加载状态
-    std::thread status_check([&estimator]() {
-        int wait_count = 0;
-        while (!estimator.isDepthEstimatorReady() && wait_count < 100) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-            wait_count++;
-        }
-        if (estimator.isDepthEstimatorReady()) {
-            ROS_INFO("Depth model is ready!");
-        } else {
-            ROS_WARN("Depth model is still loading in background...");
-        }
-    });
-    status_check.detach();
-
     // 如果定义了EIGEN_DONT_PARALLELIZE宏（禁用Eigen并行计算），输出调试日志
 #ifdef EIGEN_DONT_PARALLELIZE
     ROS_DEBUG("EIGEN_DONT_PARALLELIZE");

@@ -5,7 +5,7 @@ imu_topic: "/imu0"
 image_topic: "/cam0/image_raw"
 output_path: "/home/linux/mxm/output/test0924"
 depth_model_path: "/home/linux/mxm/proj/VINS-Mo/src/VINS-Mo/vins_estimator/models/Midas-V2.onnx" # path to depth estimation model
-use_fast_init: 1      # 0: normal initialization; 1: use fast initialization with depth estimation
+use_fast_init: 1     # 0: normal initialization; 1: use fast initialization with depth estimation
 
 #camera calibration 
 model_type: PINHOLE
@@ -41,7 +41,7 @@ extrinsicTranslation: !!opencv-matrix
    rows: 3
    cols: 1
    dt: d
-   data: [0.0, 0.0, -0.15]
+   data: [0.0, 0.015, 0.0]
 
 #feature traker paprameters
 max_cnt: 150            # max feature number in feature tracking
