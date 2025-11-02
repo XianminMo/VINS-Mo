@@ -1,37 +1,70 @@
 #include "initial_alignment.h"
 
+/**
+ * @brief 利用视觉恢复的两帧间旋转初步校准IMU的陀螺仪零偏
+ * 
+ * 该函数遍历窗口内所有相邻帧，通过比较视觉恢复的两帧实际旋转(R)与IMU预积分得到的旋转(delta_q)，
+ * 进而估算陀螺仪的偏置bg，通过最小二乘法求解一个最优修正量delta_bg。
+ * 
+ * 校准完成后，更新所有滑窗帧的陀螺仪bias，并将其重新repropagate到IMU预积分对象中。
+ * 
+ * @param all_image_frame 时间戳到ImageFrame的映射，包含滑窗内所有帧的视/IMU信息
+ * @param Bgs 存储每一帧的gyroscope bias（在滑窗初始化阶段可直接修改为矫正结果）
+ */
 void solveGyroscopeBias(map<double, ImageFrame> &all_image_frame, Vector3d* Bgs)
 {
-    Matrix3d A;
-    Vector3d b;
-    Vector3d delta_bg;
+    Matrix3d A;      // 用于积累线性系统Ax=b中的A
+    Vector3d b;      // 用于积累线性系统Ax=b中的b
+    Vector3d delta_bg; // 求解得到的陀螺仪bias修正量
     A.setZero();
     b.setZero();
+
     map<double, ImageFrame>::iterator frame_i;
     map<double, ImageFrame>::iterator frame_j;
+
+    // 遍历所有相邻帧（i, j），i为前一帧，j为后一帧
     for (frame_i = all_image_frame.begin(); next(frame_i) != all_image_frame.end(); frame_i++)
     {
         frame_j = next(frame_i);
+
+        // 用于临时存储一组系数
         MatrixXd tmp_A(3, 3);
         tmp_A.setZero();
         VectorXd tmp_b(3);
         tmp_b.setZero();
+
+        // 视觉恢复的两帧之间的相对旋转
+        // q_ij: i->j的旋转（由R_i, R_j计算得到，R*为右乘旋转）
         Eigen::Quaterniond q_ij(frame_i->second.R.transpose() * frame_j->second.R);
+
+        // 预积分中的jacobian块，对应于陀螺仪偏置对旋转的影响
         tmp_A = frame_j->second.pre_integration->jacobian.template block<3, 3>(O_R, O_BG);
+
+        // 将IMU旋转增量与视觉旋转对比，构建线性观测模型
+        // delta_q.inverse() * q_ij 表示IMU预积分旋转与视觉旋转的差异（四元数误差的向量部分）
+        // 这里乘以2是因为单位四元数误差近似的线性化关系
         tmp_b = 2 * (frame_j->second.pre_integration->delta_q.inverse() * q_ij).vec();
+
+        // 将该对帧对整体系统做累加,正规方程：
+        // A = Σ(J^T * J)
+        // b = Σ(J^T * residual)
         A += tmp_A.transpose() * tmp_A;
         b += tmp_A.transpose() * tmp_b;
-
     }
+    // 求解线性方程，得到最佳的陀螺仪偏置修正量
     delta_bg = A.ldlt().solve(b);
+
     ROS_WARN_STREAM("gyroscope bias initial calibration " << delta_bg.transpose());
 
+    // 将求得的偏置修正加到所有窗口帧的Bgs上（此时各帧bias应该是同步更新）
     for (int i = 0; i <= WINDOW_SIZE; i++)
         Bgs[i] += delta_bg;
 
+    // 对所有帧的IMU预积分对象，重新propagate一次以应用新bias
     for (frame_i = all_image_frame.begin(); next(frame_i) != all_image_frame.end( ); frame_i++)
     {
         frame_j = next(frame_i);
+        // 注意：这里加速度bias置零，仅重新设置陀螺仪bias
         frame_j->second.pre_integration->repropagate(Vector3d::Zero(), Bgs[0]);
     }
 }

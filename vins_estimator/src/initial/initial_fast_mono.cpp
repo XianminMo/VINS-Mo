@@ -37,9 +37,9 @@ bool FastInitializer::initialize(const std::map<double, ImageFrame>& image_frame
     // --- 1. 数据收集 ---
     ROS_INFO("FastInit: Collecting observations...");
     std::vector<ObservationData> all_observations;
-    std::vector<IntegrationBase*> pre_integrations_compound; // 存储 $\Delta_{I_0}^{I_k}$
+    std::vector<IntegrationBase*> pre_integrations_compound; 
 
-    // 1.1. 复合 IMU 预积分: VINS-Mono 的 all_image_frame[k].pre_integration 是 $\Delta_{I_{k-1}}^{I_k}$
+    // 1.1. 复合 IMU 预积分
 
     IntegrationBase* current_pre_integration = new IntegrationBase(Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero(),
                                                                    Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero());
@@ -257,6 +257,14 @@ bool FastInitializer::initialize(const std::map<double, ImageFrame>& image_frame
     // 计算从 I0 系到 W' 系的旋转 R_I0_W'，即 R_W'_I0 的逆。
     // 这个旋转用于将 I0 系下的向量（如速度）转换到 W' 系下。
     Eigen::Quaterniond R_I0_to_W_prime = R_W_prime_to_I0.inverse();
+
+    // 第一帧在I0坐标系下的姿态是单位旋转（第一帧就是I0）
+    // 需要消除第一帧在W'坐标系下的yaw角
+    Matrix3d R0_matrix = R_I0_to_W_prime.toRotationMatrix();
+    double yaw_first = Utility::R2ypr(R0_matrix).x();  // 第一帧在W'系下的yaw角
+    Matrix3d R_yaw_correction = Utility::ypr2R(Eigen::Vector3d{-yaw_first, 0, 0});
+    R0_matrix = R_yaw_correction * R0_matrix;
+    R_I0_to_W_prime = Quaterniond(R0_matrix);
 
     // 将第一帧的速度 v_I0_in_I0 从 I0 系变换到 W' 系。
     Eigen::Vector3d v_I0_in_W_prime = R_I0_to_W_prime * v_I0_in_I0;

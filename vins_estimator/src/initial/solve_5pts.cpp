@@ -227,20 +227,20 @@ bool MotionEstimator::solveRelativeRT(const vector<pair<Vector3d, Vector3d>> &co
         pts2.push_back(cv::Point2f(static_cast<float>(corres[i].second(0)), static_cast<float>(corres[i].second(1))));
     }
 
-    // 2. RANSAC 求基础矩阵, 并利用匹配掩码剔除离群点
+    // 2. RANSAC 求基础矩阵, 并利用匹配掩码剔除离群点 (本质矩阵就是基础矩阵 + 内参矩阵K)
     cv::Mat mask;
+    
     // RANSAC内点阈值是像素单位，这里点已经被单位化，所以阈值极小
     cv::Mat E = cv::findFundamentalMat(pts1, pts2, cv::FM_RANSAC, 0.3 / 460, 0.99, mask);
 
-    // 3. 假设单位内参（归一化像素）
+    // 3. pts归一化坐标，所以内参就是单位矩阵I
     cv::Mat cameraMatrix = (cv::Mat_<double>(3, 3) << 1, 0, 0,
                                                        0, 1, 0,
                                                        0, 0, 1);
 
     // 4. 利用基础矩阵恢复相对R,t（本质矩阵分解）
     cv::Mat rot, trans;
-    int inlier_cnt = cv::recoverPose(E, pts1, pts2, cameraMatrix, rot, trans, mask);
-    // inlier_cnt: 恢复出的内点数量
+    int inlier_cnt = cv::recoverPose(E, pts1, pts2, cameraMatrix, rot, trans, mask); // inlier_cnt: 恢复出的内点数量（内部有个标准，应该是解算出的点在前视图）
 
     // 5. OpenCV矩阵->Eigen转换，并变换为“从后帧到前帧”的逆变换
     Eigen::Matrix3d R_eigen;
@@ -254,7 +254,7 @@ bool MotionEstimator::solveRelativeRT(const vector<pair<Vector3d, Vector3d>> &co
 
     // 6. OpenCV输出为"从前到后"(R, t)。输出需转为W系下前->后变换的逆: R^T, -R^T*t
     Rotation = R_eigen.transpose();
-    Translation = -R_eigen.transpose() * t_eigen;
+    Translation = -R_eigen.transpose() * t_eigen; // 项目中是后帧到前帧的变换，所以需要取逆
 
     // 7. 检查内点数量是否达到阈值要求
     if (inlier_cnt > 12)

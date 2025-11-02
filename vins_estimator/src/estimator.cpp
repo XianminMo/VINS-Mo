@@ -529,6 +529,7 @@ bool Estimator::initialStructure()
     }
     
     // 2. 全局SFM
+    // 一共有frame_count + 1帧，窗口内是满的，再加上新来的一帧
     Quaterniond Q[frame_count + 1]; // 存储每帧的姿态（四元数）
     Vector3d T[frame_count + 1];    // 存储每帧的位置
     map<int, Vector3d> sfm_tracked_points; // 存储恢复出的3D地图点
@@ -553,14 +554,16 @@ bool Estimator::initialStructure()
     Matrix3d relative_R;
     Vector3d relative_T;
     int l; // 用于恢复相对位姿的参考帧索引
-    // 找到一个与最新帧有足够视差和共视点的历史帧 l
+    
+    // 1.1. 找到一个与最新帧有足够视差和共视点的历史帧 l
+    // 1.2. 利用本质矩阵来求解两帧之间的相对位姿和相对平移
     if (!relativePose(relative_R, relative_T, l))
     {
         ROS_INFO("Not enough features or parallax; Move device around");
         return false;
     }
     
-    // 使用 GlobalSFM 类来恢复所有帧的位姿和地图点
+    // 2. 使用 GlobalSFM 类来恢复所有帧的位姿和地图点
     GlobalSFM sfm;
     if(!sfm.construct(frame_count + 1, Q, T, l,
               relative_R, relative_T,
@@ -572,7 +575,6 @@ bool Estimator::initialStructure()
     }
 
     // 3. 对所有非关键帧进行PnP求解
-    // 全局SFM只恢复了被选为关键帧的位姿，其他帧需要通过PnP来确定位姿
     map<double, ImageFrame>::iterator frame_it;
     map<int, Vector3d>::iterator it;
     frame_it = all_image_frame.begin();
@@ -583,7 +585,7 @@ bool Estimator::initialStructure()
         if((frame_it->first) == Headers[i].stamp.toSec())
         {
             frame_it->second.is_key_frame = true;
-            frame_it->second.R = Q[i].toRotationMatrix() * RIC[0].transpose();
+            frame_it->second.R = Q[i].toRotationMatrix() * RIC[0].transpose(); // 从相机到w的旋转 变成 imu到w的旋转 （w 设定的是第l帧的相机系）
             frame_it->second.T = T[i];
             i++;
             continue;
@@ -707,12 +709,13 @@ bool Estimator::visualInitialAlign()
 
     // 4. 恢复真实的尺度
     double s = (x.tail<1>())(0); // 从对齐结果中获取尺度因子
+    
     // 用新的陀螺仪偏置重新进行IMU预积分
     for (int i = 0; i <= WINDOW_SIZE; i++)
     {
         pre_integrations[i]->repropagate(Vector3d::Zero(), Bgs[i]);
     }
-    // 将尺度 s 应用到所有位置和速度上
+    // 将尺度 s 应用到所有位置和速度上，将原点设置为第一帧IMU
     for (int i = frame_count; i >= 0; i--)
         Ps[i] = s * Ps[i] - Rs[i] * TIC[0] - (s * Ps[0] - Rs[0] * TIC[0]);
     
@@ -745,6 +748,7 @@ bool Estimator::visualInitialAlign()
     
     Matrix3d rot_diff = R0;
     // 将这个旋转应用到滑动窗口内所有的位姿和速度上
+    // 最终的姿态参考坐标系为：以第一帧 IMU 为原点、Z 轴对齐重力、且第一帧 yaw 为 0 的规范世界坐标系
     for (int i = 0; i <= frame_count; i++)
     {
         Ps[i] = rot_diff * Ps[i];
@@ -773,7 +777,7 @@ bool Estimator::visualInitialAlign()
  */
 bool Estimator::relativePose(Matrix3d &relative_R, Vector3d &relative_T, int &l)
 {
-    // 从滑窗内第一帧开始向前遍历
+    // 从滑窗内第一帧开始向后遍历
     for (int i = 0; i < WINDOW_SIZE; i++)
     {
         // 获取帧 i 和最新帧之间的匹配点
@@ -793,8 +797,7 @@ bool Estimator::relativePose(Matrix3d &relative_R, Vector3d &relative_T, int &l)
             }
             average_parallax = 1.0 * sum_parallax / int(corres.size());
             
-            // 如果平均视差（乘以焦距后，近似为像素距离）足够大
-            // 并且能成功求解相对位姿（通过8点法等）
+            // 如果平均视差（乘以焦距后，近似为像素距离）足够大 && 能成功求解相对位姿（通过8点法等），则认为找到了合适的帧
             if(average_parallax * 460 > 30 && m_estimator.solveRelativeRT(corres, relative_R, relative_T))
             {
                 l = i; // 记录该帧的索引

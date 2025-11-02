@@ -2,20 +2,50 @@
 
 GlobalSFM::GlobalSFM(){}
 
-void GlobalSFM::triangulatePoint(Eigen::Matrix<double, 3, 4> &Pose0, Eigen::Matrix<double, 3, 4> &Pose1,
-						Vector2d &point0, Vector2d &point1, Vector3d &point_3d)
+/**
+ * @brief 通过DLT算法三角化两个图像点对应的空间三维点
+ * @param[in]  Pose0  第一个相机的投影矩阵（3x4，形式为 K[R|t]，通常传入归一化内参下即K=I）
+ * @param[in]  Pose1  第二个相机的投影矩阵（3x4）
+ * @param[in]  point0 第一个相机图像平面上的像素坐标（归一化平面坐标，即去畸变、去内参后）
+ * @param[in]  point1 第二个相机图像平面上的像素坐标（同样为归一化平面坐标）
+ * @param[out] point_3d 三角化得到的空间三维点（以第一个相机坐标系为参考）
+ * 
+ * DLT算法流程：
+ * 对于空间点X = (X, Y, Z, 1)^T 和投影矩阵P，成像投影满足 x = PX (齐次座标)，
+ * 可写成
+ *     x * (P.row(2) * X) - (P.row(0) * X) = 0
+ *     y * (P.row(2) * X) - (P.row(1) * X) = 0
+ * 对两个相机建立四个线性方程，组成4x4线性方程组，最小二乘解即为SVD最后一列
+ */
+void GlobalSFM::triangulatePoint(Eigen::Matrix<double, 3, 4> &Pose0,
+                                 Eigen::Matrix<double, 3, 4> &Pose1,
+                                 Vector2d &point0,
+                                 Vector2d &point1,
+                                 Vector3d &point_3d)
 {
-	Matrix4d design_matrix = Matrix4d::Zero();
-	design_matrix.row(0) = point0[0] * Pose0.row(2) - Pose0.row(0);
-	design_matrix.row(1) = point0[1] * Pose0.row(2) - Pose0.row(1);
-	design_matrix.row(2) = point1[0] * Pose1.row(2) - Pose1.row(0);
-	design_matrix.row(3) = point1[1] * Pose1.row(2) - Pose1.row(1);
-	Vector4d triangulated_point;
-	triangulated_point =
-		      design_matrix.jacobiSvd(Eigen::ComputeFullV).matrixV().rightCols<1>();
-	point_3d(0) = triangulated_point(0) / triangulated_point(3);
-	point_3d(1) = triangulated_point(1) / triangulated_point(3);
-	point_3d(2) = triangulated_point(2) / triangulated_point(3);
+    // 构建SVD求解用的4x4设计矩阵
+    Matrix4d design_matrix = Matrix4d::Zero();
+
+    // 第一个观测产生两行约束
+    //   point0[0] * P0第三行 - P0第一行
+    //   point0[1] * P0第三行 - P0第二行
+    design_matrix.row(0) = point0[0] * Pose0.row(2) - Pose0.row(0);
+    design_matrix.row(1) = point0[1] * Pose0.row(2) - Pose0.row(1);
+
+    // 第二个观测产生两行约束
+    //   point1[0] * P1第三行 - P1第一行
+    //   point1[1] * P1第三行 - P1第二行
+    design_matrix.row(2) = point1[0] * Pose1.row(2) - Pose1.row(0);
+    design_matrix.row(3) = point1[1] * Pose1.row(2) - Pose1.row(1);
+
+    // 对设计矩阵做SVD，空间点的解为V矩阵的最后一列（对应最小奇异值解）
+    Vector4d triangulated_point;
+    triangulated_point = design_matrix.jacobiSvd(Eigen::ComputeFullV).matrixV().rightCols<1>();
+
+    // 齐次坐标转非齐次坐标
+    point_3d(0) = triangulated_point(0) / triangulated_point(3);
+    point_3d(1) = triangulated_point(1) / triangulated_point(3);
+    point_3d(2) = triangulated_point(2) / triangulated_point(3);
 }
 
 
@@ -26,7 +56,7 @@ bool GlobalSFM::solveFrameByPnP(Matrix3d &R_initial, Vector3d &P_initial, int i,
 	vector<cv::Point3f> pts_3_vector;
 	for (int j = 0; j < feature_num; j++)
 	{
-		if (sfm_f[j].state != true)
+		if (sfm_f[j].state != true) // 用已经三角化过后的特征点来求解位姿
 			continue;
 		Vector2d point2d;
 		for (int k = 0; k < (int)sfm_f[j].observation.size(); k++)
@@ -71,9 +101,29 @@ bool GlobalSFM::solveFrameByPnP(Matrix3d &R_initial, Vector3d &P_initial, int i,
 
 }
 
-void GlobalSFM::triangulateTwoFrames(int frame0, Eigen::Matrix<double, 3, 4> &Pose0, 
-									 int frame1, Eigen::Matrix<double, 3, 4> &Pose1,
-									 vector<SFMFeature> &sfm_f)
+
+/**
+ * @brief 在两个指定帧之间对所有特征进行三角化，恢复三维点坐标
+ * 
+ * 此函数用于SFM结构初始化流程。给定两帧的位姿（frame0和frame1），遍历所有SFM特征点，
+ * 若某特征点同时在这两帧都被观测到，且尚未三角化（state为false），则通过投影矩阵对该特征三角化。
+ * 三角化成功后将其三维位置写入sfm_f，并将state置为true表示已恢复三维位置。
+ * 
+ * @param frame0   [in]        第一个参考帧的索引（窗口内编号，从0开始）
+ * @param Pose0    [in]        第一个参考帧的投影矩阵（3x4，通常为[R|t]格式，世界到相机）
+ * @param frame1   [in]        第二个参考帧的索引
+ * @param Pose1    [in]        第二个参考帧的投影矩阵
+ * @param sfm_f    [in/out]    所有SFM特征的结构体数组，输出三角化后的特征三维点位置
+ *
+ * 注意事项：
+ * - 只对在frame0和frame1均有观测、且尚未三角化的特征进行处理
+ * - 三角化使用triangulatePoint()辅助函数
+ * - 处理完成后，特征的state被置为true，表明其三维坐标已恢复
+ */
+void GlobalSFM::triangulateTwoFrames(
+    int frame0, Eigen::Matrix<double, 3, 4> &Pose0, 
+	int frame1, Eigen::Matrix<double, 3, 4> &Pose1,
+	std::vector<SFMFeature> &sfm_f)
 {
 	assert(frame0 != frame1);
 	for (int j = 0; j < feature_num; j++)
