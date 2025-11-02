@@ -167,17 +167,25 @@ bool FastInitializer::initialize(const std::map<double, ImageFrame>& image_frame
 
     // --- 3.1 结果有效性检查 ---
     // 对 RANSAC 解进行基本的物理合理性检查。
-    
-    // 检查尺度因子 a 是否过小 (接近 0)。如果 a 太小，会导致深度 z = 1 / (a*d_hat + b)
-    // 对 d_hat 的变化不敏感，或者深度值趋于无穷，这通常是不稳定或错误的解。
+    // 检查尺度因子 a 是否过小 (接近 0)。如果 a 太小，会导致深度 z = a/d_hat + b对 d_hat 的变化不敏感，或者深度值趋于无穷，这通常是不稳定或错误的解。
     // 1e-3 是一个经验阈值。
     // 检查估计出的重力向量模长 g_in_I0.norm() 是否在合理范围内 (例如 5 到 15 m/s^2)。
     // 远小于或远大于标准重力加速度 (约 9.8) 都表明解可能错误。
-    if (std::abs(a) < 1e-3 || g_in_I0.norm() < 5.0 || g_in_I0.norm() > 15.0)
+    if (a < 1e-3 || a > 100.0 || g_in_I0.norm() < 5.0 || g_in_I0.norm() > 15.0)
     {
-        // 如果检查不通过，打印警告信息并返回 false，表示初始化失败。
-        ROS_WARN("FastInit: RANSAC solution seems unreasonable (a=%.2f, |g|=%.2f). Aborting.", a, g_in_I0.norm());
+        ROS_WARN("FastInit: RANSAC solution seems unreasonable (a=%.6f must be in [1e-3, 100], |g|=%.2f). Aborting.", 
+                a, g_in_I0.norm());
         return false;
+    }
+    
+    // b 是深度偏移，通常应该在合理范围内（不能太大，否则会导致深度异常）
+    // 如果 b 的绝对值太大，说明模型估计有问题
+    const double MAX_B_ABS = 1.0;  // b 的绝对值不应该超过1米
+    if (std::abs(b) > MAX_B_ABS) {
+        ROS_WARN("FastInit: Offset b=%.6f is too large (|b| > %.1f). This may indicate poor depth model quality.", 
+                b, MAX_B_ABS);
+        // 可以选择拒绝或警告
+        // return false;  // 严格模式：直接拒绝
     }
 
     // --- 4. 计算特征点深度 (在 C0 系) ---
@@ -495,8 +503,10 @@ bool FastInitializer::solveRANSAC(const std::vector<ObservationData>& all_observ
 
         // 3. 应用数值预处理 (缩放矩阵 S)
         Eigen::Matrix<double, 8, 8> S = Eigen::Matrix<double, 8, 8>::Identity();
-        S(2, 2) = 10.0; S(3, 3) = 10.0; S(4, 4) = 10.0; // v
-        S(5, 5) = 100.0; S(6, 6) = 100.0; S(7, 7) = 100.0; // g
+        S(0, 0) = 0.1;   // a: 深度尺度因子，通常在0.01-1范围内，缩放到合理尺度
+        S(1, 1) = 1.0;   // b: 深度偏移，通常较小，保持原尺度
+        S(2, 2) = 10.0; S(3, 3) = 10.0; S(4, 4) = 10.0; // v (m/s)
+        S(5, 5) = 100.0; S(6, 6) = 100.0; S(7, 7) = 100.0; // g (m/s²)
         Eigen::MatrixXd Am_S = A_min * S;
 
         // 4. 计算 SVD 和条件数
@@ -533,6 +543,11 @@ bool FastInitializer::solveRANSAC(const std::vector<ObservationData>& all_observ
         {
             // if (iter < 20) ROS_WARN("RANSAC Iter %d: Good cond (%.2e), bad g_norm (%.3f). Skipping.", iter, cond_num, g_norm_cand);
             continue; // 跳过物理上不可能的解
+        }
+
+        double a_cand = x_candidate(0);
+        if (a_cand < 1e-3 || a_cand > 100.0) {
+            continue; // a 必须在合理范围内
         }
 
         // --- 找到一个数值和物理都合理的候选解 ---
@@ -579,7 +594,7 @@ bool FastInitializer::solveRANSAC(const std::vector<ObservationData>& all_observ
 
     // --- RANSAC 成功：我们找到了一个可靠的内点集 best_inlier_indices ---
 
-    // 11. **【关键】使用所有内点进行最终的线性拟合 (调用 solveLinearSystem)**
+    // 11. 使用所有内点进行最终的线性拟合 (调用 solveLinearSystem)
     ROS_INFO("RANSAC successful. Performing final fit using %zu inliers...", best_inlier_indices.size());
     std::vector<ObservationData> best_inliers_data;
     best_inliers_data.reserve(best_inlier_indices.size()); // 预分配内存
@@ -601,9 +616,16 @@ bool FastInitializer::solveRANSAC(const std::vector<ObservationData>& all_observ
 
     // 最终检查 solveLinearSystem 的结果是否合理
     double final_g_norm = best_x_out.segment<3>(5).norm();
-    if (final_g_norm < 5.0 || final_g_norm > 15.0 || std::abs(best_x_out(0)) < 1e-4) { // 增加对 a 的检查
-         ROS_WARN("Final solution after solveLinearSystem seems unreasonable (g_norm=%.3f, a=%.4f). Initialization failed.", final_g_norm, best_x_out(0));
-         return false;
+    double final_a = best_x_out(0);
+    double final_b = best_x_out(1);\
+    
+    if (final_g_norm < 5.0 || final_g_norm > 15.0 || 
+        final_a < 1e-3 || final_a > 100.0 ||
+        std::abs(final_b) > 1.0) 
+    {
+        ROS_WARN("Final solution after solveLinearSystem seems unreasonable (g_norm=%.3f, a=%.6f, b=%.6f). Initialization failed.", 
+                 final_g_norm, final_a, final_b);
+        return false;
     }
 
     ROS_INFO("Final solution obtained successfully after final fit.");
@@ -611,7 +633,7 @@ bool FastInitializer::solveRANSAC(const std::vector<ObservationData>& all_observ
 }
 
 
-// 使用所有内点求解线性系统 (带简化的重力约束) - 修复版
+// 使用所有内点求解线性系统 (带简化的重力约束)
 bool FastInitializer::solveLinearSystem(const std::vector<ObservationData>& observations,
                                         Eigen::Matrix<double, 8, 1>& x_out)
 {
@@ -656,8 +678,10 @@ bool FastInitializer::solveLinearSystem(const std::vector<ObservationData>& obse
 
     // --- 2. 应用数值预处理 (缩放矩阵 S) ---
     Eigen::Matrix<double, 8, 8> S = Eigen::Matrix<double, 8, 8>::Identity();
-    S(2, 2) = 10.0; S(3, 3) = 10.0; S(4, 4) = 10.0; // v
-    S(5, 5) = 100.0; S(6, 6) = 100.0; S(7, 7) = 100.0; // g
+    S(0, 0) = 0.1;   // a: 深度尺度因子，通常在0.01-1范围内，缩放到合理尺度
+    S(1, 1) = 1.0;   // b: 深度偏移，通常较小，保持原尺度
+    S(2, 2) = 10.0; S(3, 3) = 10.0; S(4, 4) = 10.0; // v (m/s)
+    S(5, 5) = 100.0; S(6, 6) = 100.0; S(7, 7) = 100.0; // g (m/s²)
     Eigen::MatrixXd A_S = A * S; // 缩放后的矩阵
 
     // --- 3. 求解无约束最小二乘问题 (SVD) ---
@@ -705,6 +729,8 @@ bool FastInitializer::solveLinearSystem(const std::vector<ObservationData>& obse
 
     // 使用无约束解的方向 和 全局参数 G.norm() 确定约束后的重力
     Eigen::Vector3d g_normed = g_svd.normalized() * G.norm();
+    cout << "g_svd: " << g_svd.transpose() << endl;
+    cout << "g_svd.norm(): " << g_svd.norm() << endl;
 
     // --- 5. 固定 g_normed，重新求解 y = [a, b, v_I0]^T ---
     Eigen::MatrixXd A_y = A.leftCols<5>(); // 前 5 列

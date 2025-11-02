@@ -1,4 +1,5 @@
 #include "depth_estimator.h"
+#include "../utility/tic_toc.h" 
 
 // 构造函数：初始化所有 C++ 风格的对象
 DepthEstimator::DepthEstimator()
@@ -15,6 +16,9 @@ DepthEstimator::DepthEstimator()
 // 析构函数 (默认即可，std::unique_ptr 会自动管理 m_session)
 DepthEstimator::~DepthEstimator()
 {
+    if (m_init_thread && m_init_thread->joinable()) {
+        m_init_thread->join();
+    }
 }
 
 bool DepthEstimator::init(const std::string& model_path)
@@ -84,18 +88,133 @@ bool DepthEstimator::init(const std::string& model_path)
     return true;
 }
 
-// 预处理函数 
-void DepthEstimator::preprocess(const cv::Mat& image, std::vector<float>& input_tensor_values)
+// 异步初始化方法
+bool DepthEstimator::initAsync(const std::string& model_path)
 {
+    if (m_is_ready.load()) {
+        ROS_WARN("DepthEstimator::initAsync(): Model already initialized.");
+        return true;
+    }
+
+    if (m_init_thread && m_init_thread->joinable()) {
+        ROS_WARN("DepthEstimator::initAsync(): Initialization already in progress.");
+        return false;
+    }
+
+    m_init_failed = false;
+    m_init_thread = std::make_unique<std::thread>(&DepthEstimator::initWorker, this, model_path);
+    
+    ROS_INFO("DepthEstimator::initAsync(): Started asynchronous initialization.");
+    return true;
+}
+
+// 添加工作线程函数
+void DepthEstimator::initWorker(const std::string& model_path)
+{
+    ROS_INFO("DepthEstimator::initWorker(): Loading model in background thread...");
+    TicToc t_init;
+    
+    bool success = init(model_path);
+    
+    if (success) {
+        // 预热模型
+        warmup();
+        m_is_ready.store(true);
+        ROS_INFO("DepthEstimator::initWorker(): Model loaded and warmed up successfully (%.2f ms).", t_init.toc());
+    } else {
+        m_init_failed.store(true);
+        ROS_ERROR("DepthEstimator::initWorker(): Model loading failed.");
+    }
+}
+
+// 添加等待方法
+bool DepthEstimator::waitForReady(int timeout_ms) const
+{
+    if (m_is_ready.load()) {
+        return true;
+    }
+
+    if (timeout_ms < 0) {
+        // 无限等待
+        while (!m_is_ready.load() && !m_init_failed.load()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        return m_is_ready.load();
+    } else {
+        // 有限等待
+        auto start = std::chrono::steady_clock::now();
+        while (!m_is_ready.load() && !m_init_failed.load()) {
+            auto elapsed = std::chrono::steady_clock::now() - start;
+            auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count();
+            if (elapsed_ms >= timeout_ms) {
+                return false;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        return m_is_ready.load();
+    }
+}
+
+// 添加预热方法
+void DepthEstimator::warmup()
+{
+    if (!m_session) {
+        ROS_WARN("DepthEstimator::warmup(): Session not ready, skipping warmup.");
+        return;
+    }
+
+    ROS_INFO("DepthEstimator::warmup(): Warming up model...");
+    TicToc t_warmup;
+    
+    // 创建一个小的虚拟图像进行推理
+    cv::Mat dummy_img(m_model_input_height, m_model_input_width, CV_8UC3, cv::Scalar(128, 128, 128));
+    cv::Mat dummy_output;
+    
+    bool success = predictInternal(dummy_img, dummy_output, false);
+    if (success) {
+        ROS_INFO("DepthEstimator::warmup(): Model warmed up successfully (%.2f ms).", t_warmup.toc());
+    } else {
+        ROS_WARN("DepthEstimator::warmup(): Warmup failed, but continuing...");
+    }
+}
+
+// 预处理函数 
+void DepthEstimator::preprocess(const cv::Mat& image, std::vector<float>& input_tensor_values, bool save_debug_images)
+{
+    static bool first_preprocess = true;
+    if (first_preprocess && save_debug_images) {
+        ROS_INFO("DepthEstimator::preprocess(): Input image - channels: %d, type: %d, size: %dx%d", 
+                 image.channels(), image.type(), image.cols, image.rows);
+        first_preprocess = false;
+    }
+
     // 1) 灰度→BGR；BGR→RGB，确保模型看到的是 RGB 顺序
     cv::Mat img_bgr;
     if (image.channels() == 1)
     {
         cv::cvtColor(image, img_bgr, cv::COLOR_GRAY2BGR);
     }
-    else if (image.channels() == 3)
+    else if (image.channels() == 3 && save_debug_images)
     {
         img_bgr = image;
+        
+        static bool checked_pseudo_color = false;
+        if (!checked_pseudo_color) {
+            cv::Mat channels[3];
+            cv::split(img_bgr, channels);
+            cv::Mat diff1, diff2;
+            cv::absdiff(channels[0], channels[1], diff1);
+            cv::absdiff(channels[0], channels[2], diff2);
+            double max_diff1, max_diff2;
+            cv::minMaxLoc(diff1, nullptr, &max_diff1);
+            cv::minMaxLoc(diff2, nullptr, &max_diff2);
+            
+            if (max_diff1 < 5.0 && max_diff2 < 5.0) {
+                ROS_WARN("DepthEstimator: Input appears to be pseudo-color (grayscale converted to BGR). "
+                         "All channels are nearly identical. MiDaS depth estimation may fail!");
+            }
+            checked_pseudo_color = true;
+        }
     }
     else
     {
@@ -139,6 +258,25 @@ void DepthEstimator::preprocess(const cv::Mat& image, std::vector<float>& input_
 // 预测函数
 bool DepthEstimator::predict(const cv::Mat& image, cv::Mat& norm_inv_depth_map)
 {
+    if (!m_is_ready.load()) {
+        ROS_ERROR("DepthEstimator::predict() failed: model is not ready yet.");
+        return false;
+    }
+    
+    // 调用内部实现
+    return predictInternal(image, norm_inv_depth_map);
+}
+
+// 预测内部实现
+bool DepthEstimator::predictInternal(const cv::Mat& image, cv::Mat& norm_inv_depth_map, bool save_debug_images)
+{
+    static bool saved_input = false;
+    if (!saved_input && save_debug_images) {
+        cv::imwrite("/tmp/first_frame_input_image.png", image);
+        ROS_INFO("Saved input image to /tmp/first_frame_input_image.png (channels: %d)", image.channels());
+        saved_input = true;
+    }
+
     if (!m_session)
     {
         ROS_ERROR("DepthEstimator::predict() failed: session is not initialized.");
@@ -146,7 +284,7 @@ bool DepthEstimator::predict(const cv::Mat& image, cv::Mat& norm_inv_depth_map)
     }
 
     // --- 1. 预处理 ---
-    preprocess(image, m_input_tensor_values);
+    preprocess(image, m_input_tensor_values, save_debug_images);
 
     // --- 2. 创建输入张量 ---
     auto memory_info = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
@@ -178,7 +316,7 @@ bool DepthEstimator::predict(const cv::Mat& image, cv::Mat& norm_inv_depth_map)
 
         // 4.3 归一化到 [1, 2]（按你的设置保留）
         cv::Mat normalized_float_map;
-        cv::normalize(raw_inv_depth, normalized_float_map, 0.0, 1.0, cv::NORM_MINMAX, CV_32F);
+        cv::normalize(raw_inv_depth, normalized_float_map, 1.0, 2.0, cv::NORM_MINMAX, CV_32F);
 
         // 4.4 统计 norm 的 min/max/mean
         double n_min = 0.0, n_max = 0.0;
@@ -188,13 +326,23 @@ bool DepthEstimator::predict(const cv::Mat& image, cv::Mat& norm_inv_depth_map)
 
         // 4.5 保存首帧的可视化图（只保存一次，便于人工确认是否“扁平”）
         static bool dumped = false;
-        if (!dumped)
+        if (!dumped && save_debug_images)
         {
+            // 使用伪彩色显示深度图，而不是黑白
             cv::Mat raw_vis_8u, norm_vis_8u;
             cv::normalize(raw_inv_depth, raw_vis_8u, 0, 255, cv::NORM_MINMAX, CV_8U);
             cv::normalize(normalized_float_map, norm_vis_8u, 0, 255, cv::NORM_MINMAX, CV_8U);
-            cv::imwrite("/tmp/first_frame_raw_inv_depth.png", raw_vis_8u);
-            cv::imwrite("/tmp/first_frame_norm_inv_depth.png", norm_vis_8u);
+            
+            // 转为伪彩色（Jet colormap）
+            cv::Mat raw_vis_color, norm_vis_color;
+            cv::applyColorMap(raw_vis_8u, raw_vis_color, cv::COLORMAP_JET);
+            cv::applyColorMap(norm_vis_8u, norm_vis_color, cv::COLORMAP_JET);
+            
+            // 保存彩色和黑白两种版本
+            cv::imwrite("/tmp/first_frame_raw_inv_depth.png", raw_vis_color);
+            cv::imwrite("/tmp/first_frame_norm_inv_depth.png", norm_vis_color);
+            cv::imwrite("/tmp/first_frame_raw_inv_depth_gray.png", raw_vis_8u);
+            cv::imwrite("/tmp/first_frame_norm_inv_depth_gray.png", norm_vis_8u);
             ROS_INFO("Saved MiDaS debug images to /tmp/first_frame_raw_inv_depth.png and /tmp/first_frame_norm_inv_depth.png");
             dumped = true;
         }

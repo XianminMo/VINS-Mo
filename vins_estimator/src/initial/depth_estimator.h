@@ -2,50 +2,62 @@
 
 #include <string>
 #include <vector>
-#include <memory> // 用于 std::unique_ptr
+#include <memory>
+#include <atomic>
+#include <mutex>
+#include <thread>
 
 #include <opencv2/opencv.hpp>
 #include "onnxruntime_cxx_api.h"
-
-
 #include <ros/ros.h>
 
 class DepthEstimator
 {
 public:
-    /**
-     * @brief 构造函数
-     */
     DepthEstimator();
-
-    /**
-     * @brief 析构函数
-     */
     ~DepthEstimator();
 
     /**
-     * @brief 初始化 ONNX Runtime 环境、会话并加载模型。
-     * @param model_path ONNX 模型的路径。
-     * @return true 如果初始化成功。
+     * @brief 同步初始化（保持向后兼容）
      */
     bool init(const std::string& model_path);
 
     /**
-     * @brief 对输入的 BGR 图像执行深度估计。
-     * @param image [in] 输入的 cv::Mat 图像 (BGR, CV_8UC3)。
-     * @param norm_inv_depth_map [out] 输出的 cv::Mat (CV_32F)。
-     * 该 Mat 包含归一化到 [0.0, 1.0] 范围的相对逆深度，
-     * 尺寸与输入图像相同，可以直接用于特征点采样。
-     * @return true 如果预测成功。
+     * @brief 异步初始化（不阻塞）
+     * @param model_path 模型路径
+     * @return true 如果异步初始化已启动
      */
+    bool initAsync(const std::string& model_path);
+
+    /**
+     * @brief 检查模型是否已就绪
+     */
+    bool isReady() const { return m_is_ready.load(); }
+
+    /**
+     * @brief 等待模型加载完成（带超时）
+     * @param timeout_ms 超时时间（毫秒），-1表示无限等待
+     * @return true 如果模型已就绪
+     */
+    bool waitForReady(int timeout_ms = -1) const;
+
+    /**
+     * @brief 预热模型（执行一次虚拟推理）
+     */
+    void warmup();
+
     bool predict(const cv::Mat& image, cv::Mat& norm_inv_depth_map);
 
-
 private:
+    void preprocess(const cv::Mat& image, std::vector<float>& input_tensor_values, bool save_debug_images = true);
+
     /**
-     * @brief 预处理函数 (来自 Demo)
+     * @brief 内部预测方法（用于 warmup，不检查就绪状态）
      */
-    void preprocess(const cv::Mat& image, std::vector<float>& input_tensor_values);
+    bool predictInternal(const cv::Mat& image, cv::Mat& norm_inv_depth_map, bool save_debug_images = true);
+    
+    // 异步初始化的工作函数
+    void initWorker(const std::string& model_path);
 
     // --- ONNX Runtime 核心成员 ---
     Ort::Env m_env;
@@ -53,17 +65,21 @@ private:
     std::unique_ptr<Ort::Session> m_session;
     Ort::AllocatorWithDefaultOptions m_allocator;
 
+    // --- 异步初始化相关 ---
+    std::atomic<bool> m_is_ready{false};
+    std::atomic<bool> m_init_failed{false};
+    std::mutex m_init_mutex;
+    std::unique_ptr<std::thread> m_init_thread;
+
     // --- 模型输入/输出信息 ---
-    // 使用 ONNX Runtime 原生智能指针，它会自动管理内存
     Ort::AllocatedStringPtr m_input_name_ptr;
     Ort::AllocatedStringPtr m_output_name_ptr;
     const char* m_input_name;
     const char* m_output_name;
 
     std::vector<int64_t> m_input_shape;
-    std::vector<float> m_input_tensor_values; // 预分配的输入向量，避免重复分配
+    std::vector<float> m_input_tensor_values;
 
-    // --- 模型常量 ---
     const int m_model_input_width = 256;
     const int m_model_input_height = 256;
     const std::vector<double> m_norm_mean = {0.485, 0.456, 0.406};

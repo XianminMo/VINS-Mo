@@ -19,10 +19,10 @@
  */
 namespace fast_mono
 {
-    const int RANSAC_MIN_MEASUREMENTS = 4; // 求解 8 个未知数 (a, b, v[3], g[3])，每个观测提供 2 个方程，需要 4 对观测
-    const int RANSAC_MAX_ITERATIONS = 250; // RANSAC 最大迭代次数
-    const double RANSAC_THRESHOLD_SQ = 1.0 * 1.0; // 内点判断的误差阈值 (平方)，根据论文代数误差调整
-    const int RANSAC_MIN_INLIERS = 10;   // RANSAC 成功所需的最少内点数
+    const int RANSAC_MIN_MEASUREMENTS = 4; 
+    const int RANSAC_MAX_ITERATIONS = 500;  // 增加迭代次数，从250改为500
+    const double RANSAC_THRESHOLD_SQ = 0.01 * 0.01; // 从1.0*1.0改为0.01*0.01 (更严格)
+    const int RANSAC_MIN_INLIERS = 20;   // 从10改为20 (需要更多内点，提高鲁棒性)
 } // namespace fast_mono
 
 

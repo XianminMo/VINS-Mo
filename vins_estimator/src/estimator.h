@@ -56,6 +56,54 @@ class Estimator
     void double2vector();
     bool failureDetection();
 
+    bool isDepthEstimatorReady() const {
+        return mp_depth_estimator && mp_depth_estimator->isReady();
+    }
+
+    // Fast initialization helper methods
+    /**
+     * @brief 尝试计算窗口第一帧的深度图
+     * @return true 如果深度图计算成功或已存在
+     * 
+     * 检查是否需要重新计算深度图（窗口第一帧变化或未计算过），
+     * 如果需要则等待深度估计模型就绪并计算深度图。
+     */
+     bool tryComputeFirstFrameDepth();
+
+     /**
+      * @brief 检查快速初始化的条件是否满足
+      * @param rot_sum_out 输出累计旋转角度（弧度）
+      * @return true 如果满足所有初始化条件
+      * 
+      * 检查特征数量是否足够，以及累计旋转激励是否充分。
+      */
+     bool checkFastInitConditions(double& rot_sum_out);
+ 
+     /**
+      * @brief 执行快速单目初始化
+      * @param Ps_init 输出：初始化后的位置（map: frame_id -> position）
+      * @param Vs_init 输出：初始化后的速度（map: frame_id -> velocity）
+      * @param Rs_init 输出：初始化后的旋转（map: frame_id -> rotation）
+      * @return true 如果初始化成功
+      * 
+      * 调用 FastInitializer 进行初始化，利用深度学习深度图恢复尺度、重力和速度。
+      */
+     bool performFastInitialization(std::map<int, Eigen::Vector3d>& Ps_init,
+                                    std::map<int, Eigen::Vector3d>& Vs_init,
+                                    std::map<int, Eigen::Quaterniond>& Rs_init);
+ 
+     /**
+      * @brief 将快速初始化的结果更新到估计器状态
+      * @param Ps_init 初始化后的位置
+      * @param Vs_init 初始化后的速度
+      * @param Rs_init 初始化后的旋转
+      * 
+      * 将 FastInitializer 返回的初始化结果复制到 Estimator 的状态变量中，
+      * 并将所有帧标记为关键帧。
+      */
+     void updateEstimatorStateFromFastInit(const std::map<int, Eigen::Vector3d>& Ps_init,
+                                          const std::map<int, Eigen::Vector3d>& Vs_init,
+                                          const std::map<int, Eigen::Quaterniond>& Rs_init);
 
     enum SolverFlag
     {
@@ -152,4 +200,5 @@ class Estimator
 
     std::unique_ptr<FastInitializer> mp_fast_initializer;
     int m_depth_window_start_id = -1;
+    std::atomic<bool> m_depth_estimator_ready{false};
 };

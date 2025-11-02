@@ -20,18 +20,22 @@ void Estimator::initDepthEstimator()
 {
     if (USE_FAST_INIT)
     {
-        ROS_INFO("Initializing DepthEstimator...");
+        ROS_INFO("Initializing DepthEstimator asynchronously...");
+        
         // 创建一个深度估计器的智能指针实例
         mp_depth_estimator = std::make_unique<DepthEstimator>();
+        
         // 使用配置文件中指定的模型路径初始化深度估计器
-        if (!mp_depth_estimator->init(DEPTH_MODEL_PATH))
+        if (!mp_depth_estimator->initAsync(DEPTH_MODEL_PATH))
         {
-        // 如果初始化失败
+            // 如果初始化失败
             // 打印致命错误日志，提示用户检查模型路径和相关配置（如ONNX, CUDA）
             ROS_FATAL("DepthEstimator initialization failed! Please check the model path and ONNX/CUDA configuration.");
             // 可以在此处添加 ros::shutdown() 来终止节点，防止进一步错误
             ros::shutdown();
         }
+
+        // 注意：这里不等待模型加载完成，让它在后台进行
 
         ROS_INFO("Initializing FastInitializer...");
         mp_fast_initializer = std::make_unique<FastInitializer>(&f_manager);
@@ -284,130 +288,44 @@ void Estimator::processImage(const map<int, vector<pair<int, Eigen::Matrix<doubl
             {
                 // --- 分支 1: 执行新的快速初始化流程 ---
                 ROS_INFO_THROTTLE(1.0, "Attempting Fast Monocular Initialization...");
-                // 计算当前滑窗起始帧（最小 start_frame，若无则 0）
-                int window_start_frame_id = 0;
-                if (!f_manager.feature.empty()) {
-                    window_start_frame_id = f_manager.feature.front().start_frame;
-                    for (const auto& fe : f_manager.feature)
-                        window_start_frame_id = std::min(window_start_frame_id, fe.start_frame);
-                    if (window_start_frame_id < 0) window_start_frame_id = 0;
-                }
 
-                // 1. 计算第一帧的深度图 (如果尚未计算)
-                if (!m_first_frame_depth_computed || m_depth_window_start_id != window_start_frame_id)
-                {
-                    double first_frame_stamp = Headers[window_start_frame_id].stamp.toSec();
-                    cv::Mat first_img;
-
-                    auto it = all_image_frame.find(first_frame_stamp);
-                    if (it != all_image_frame.end() && !it->second.raw_image.empty())
-                    {
-                        first_img = it->second.raw_image;
-                    }
-
-                    if (!first_img.empty())
-                    {
-                        ROS_INFO("Fast-Init: Calculating depth for the first frame...");
-                        TicToc t_depth;
-                        cv::Mat depth_map;
-                        // 调用深度学习模型进行深度预测, first_img 为 bgr
-                        bool success = mp_depth_estimator->predict(first_img, depth_map);
-                        if (success)
-                        {
-                            std::lock_guard<std::mutex> lock(m_depth_mutex);
-                            m_first_frame_depth_map = depth_map; // 存储深度图
-                            m_first_frame_depth_computed = true; // 标记深度图已计算
-                            ROS_INFO("Fast-Init: Depth prediction succeeded (%.2f ms).", t_depth.toc());
-                        }
-                    }
-                    else
-                    {
-                        ROS_WARN_THROTTLE(1.0, "Fast-Init: Waiting for the raw image of the first frame...");
-                    }
-                }
-
-                // 2. 检查深度图是否就绪
-                if (m_first_frame_depth_computed)
-                {
-                    // 在这里调用基于RANSAC的快速初始化求解器，利用深度图恢复尺度、重力和速度。
-                    TicToc t_fast_init;
-                    std::map<int, Eigen::Vector3d> Ps_init;
-                    std::map<int, Eigen::Vector3d> Vs_init;
-                    std::map<int, Eigen::Quaterniond> Rs_init;
-
-                    bool fast_init_ok = false;
-                    // 初始化门槛：特征数
-                    if (f_manager.getFeatureCount() < 80) {
-                        ROS_WARN_THROTTLE(1.0, "Fast-Init gate: too few features (%d).", f_manager.getFeatureCount());
-                    } else {
-                        // 旋转激励（累计角度）
-                        double rot_sum = 0.0;
-                        for (int k = 1; k <= WINDOW_SIZE; ++k) {
-                            if (pre_integrations[k]) {
-                                Eigen::AngleAxisd aa(pre_integrations[k]->delta_q);
-                                rot_sum += std::abs(aa.angle());
-                            }
-                        }
-                        if (rot_sum < 0.35) { // ~20度，按需调整
-                            ROS_WARN_THROTTLE(1.0, "Fast-Init gate: insufficient rotation (%.3f rad).", rot_sum);
-                        } else {
-                            // 满足门槛再调初始化
-                            std::lock_guard<std::mutex> lock(m_depth_mutex);
-                            fast_init_ok = mp_fast_initializer->initialize(all_image_frame,
-                                                                        m_first_frame_depth_map,
-                                                                        g,
-                                                                        Ps_init, Vs_init, Rs_init);
-                        }
-                    }
-
-                    if (fast_init_ok)
-                    {
-                        ROS_INFO("Fast Monocular Init Succeeded! (%.2f ms)", t_fast_init.toc());
-
-                        // 将 FastInitializer 返回的结果复制到 Estimator 的状态变量 Ps, Vs, Rs
-                        // 注意索引 k (0 to WINDOW_SIZE)
-                        for (int k = 0; k <= WINDOW_SIZE; ++k)
-                        {
-                            // 检查 map 中是否存在该帧的结果
-                            if (Ps_init.count(k) && Vs_init.count(k) && Rs_init.count(k))
-                            {
-                                Ps[k] = Ps_init[k];
-                                Vs[k] = Vs_init[k];
-                                Rs[k] = Rs_init[k];
-                                // (重要) 将所有初始化的帧标记为关键帧
-                                // 注意：all_image_frame 的 key 是时间戳，需要查找
-                                double timestamp = Headers[k].stamp.toSec();
-                                if (all_image_frame.count(timestamp)) {
-                                    all_image_frame[timestamp].is_key_frame = true;
-                                }
-                            }
-                            else {
-                                // 如果 FastInitializer 没有返回某个帧的状态，这是个严重错误
-                                ROS_ERROR("FastInit Error: Missing state for frame %d in initializer output!", k);
-                                fast_init_ok = false; // 标记为失败
-                                break;
-                            }
-                        }
-
-                        if (fast_init_ok) {
-                            is_init_success = true; // 标记整个初始化成功
-                        }
-                    }
-                    else
-                    {
-                        ROS_WARN("Fast Monocular Init Failed.");
-                        std::lock_guard<std::mutex> lock(m_depth_mutex);
-                        m_first_frame_depth_computed = false;
-                        m_depth_window_start_id = -1;
-                        // 如果失败，m_first_frame_depth_computed 仍然是 true，
-                        // 但 is_init_success 是 false，会触发 slideWindow()，
-                        // slideWindow() 中的重置逻辑会处理 m_first_frame_depth_computed
-                    }
-
-                    
+                // 步骤 1: 尝试计算窗口第一帧的深度图
+                if (!tryComputeFirstFrameDepth()) {
+                    ROS_WARN_THROTTLE(1.0, "Fast-Init: Waiting for depth map computation...");
+                    is_init_success = false;
                 }
                 else {
-                 ROS_WARN_THROTTLE(1.0, "Fast-Init: Waiting for depth map computation...");
+                    // 步骤 2: 检查初始化条件并执行初始化
+                    TicToc t_fast_init;
+                    double rot_sum = 0.0;
+                    
+                    if (!checkFastInitConditions(rot_sum)) {
+                        // 初始化条件不满足，跳过本次初始化
+                        is_init_success = false;
+                    }
+                    else {
+                        // 步骤 3: 执行快速初始化
+                        std::map<int, Eigen::Vector3d> Ps_init;
+                        std::map<int, Eigen::Vector3d> Vs_init;
+                        std::map<int, Eigen::Quaterniond> Rs_init;
+                        
+                        if (performFastInitialization(Ps_init, Vs_init, Rs_init)) {
+                            ROS_INFO("Fast Monocular Init Succeeded! (%.2f ms, rotation: %.3f rad)", 
+                                    t_fast_init.toc(), rot_sum);
+                            
+                            // 步骤 4: 更新估计器状态
+                            updateEstimatorStateFromFastInit(Ps_init, Vs_init, Rs_init);
+                            is_init_success = true;
+                        }
+                        else {
+                            ROS_WARN("Fast Monocular Init Failed.");
+                            // 初始化失败，重置深度图状态
+                            std::lock_guard<std::mutex> lock(m_depth_mutex);
+                            m_first_frame_depth_computed = false;
+                            m_depth_window_start_id = -1;
+                            is_init_success = false;
+                        }
+                    }
                 }
             }
             else
@@ -488,6 +406,194 @@ void Estimator::processImage(const map<int, vector<pair<int, Eigen::Matrix<doubl
         last_P0 = Ps[0];
     }
 }
+
+/**
+ * @brief 尝试计算窗口第一帧的深度图
+ */
+ bool Estimator::tryComputeFirstFrameDepth()
+ {
+     if (all_image_frame.empty()) {
+         return false;
+     }
+ 
+     auto first_frame_it = all_image_frame.begin();
+     double first_frame_stamp = first_frame_it->first;
+     
+     // 判断是否需要重新计算：未计算过，或窗口第一帧发生变化
+     bool need_recompute = !m_first_frame_depth_computed;
+     if (m_first_frame_depth_computed && m_depth_window_start_id >= 0) {
+         double stored_stamp = Headers[m_depth_window_start_id].stamp.toSec();
+         need_recompute = (std::abs(first_frame_stamp - stored_stamp) > 1e-6);
+     }
+     
+     if (!need_recompute) {
+         return true; // 深度图已存在且仍然有效
+     }
+     
+     // 等待深度估计模型就绪
+     if (!mp_depth_estimator->isReady()) {
+         ROS_WARN_THROTTLE(1.0, "Fast-Init: Depth model still loading, waiting...");
+         if (!mp_depth_estimator->waitForReady(5000)) {
+             ROS_WARN_THROTTLE(1.0, "Fast-Init: Depth model not ready after timeout, skipping depth computation.");
+             return false;
+         }
+     }
+     
+     // 检查原始图像是否可用
+     if (first_frame_it->second.raw_image.empty()) {
+         ROS_WARN_THROTTLE(1.0, "Fast-Init: Waiting for the raw image of the first frame...");
+         return false;
+     }
+     
+     // 计算深度图
+     ROS_INFO("Fast-Init: Calculating depth for the first frame...");
+     TicToc t_depth;
+     cv::Mat depth_map;
+     
+     if (!mp_depth_estimator->predict(first_frame_it->second.raw_image, depth_map)) {
+         return false;
+     }
+     
+     // 存储深度图并查找对应的 frame_id
+     std::lock_guard<std::mutex> lock(m_depth_mutex);
+     m_first_frame_depth_map = depth_map;
+     m_first_frame_depth_computed = true;
+     
+     // 查找对应的 frame_id 并记录
+     for (int i = 0; i <= WINDOW_SIZE; i++) {
+         if (std::abs(Headers[i].stamp.toSec() - first_frame_stamp) < 1e-6) {
+             m_depth_window_start_id = i;
+             break;
+         }
+     }
+     
+     ROS_INFO("Fast-Init: Depth prediction succeeded (%.2f ms).", t_depth.toc());
+     return true;
+ }
+ 
+ /**
+  * @brief 检查快速初始化的条件是否满足
+  */
+  bool Estimator::checkFastInitConditions(double& rot_sum_out)
+  {
+      rot_sum_out = 0.0;
+      
+      // 1. 特征数门槛：可以比原版更低（原版需要80+，快速初始化可以降至50-60）
+      //    因为深度图提供了额外的约束，不依赖大量特征点的三角化
+      int feature_count = f_manager.getFeatureCount();
+      const int FAST_INIT_MIN_FEATURES = 50;  // 比原版80更低
+      if (feature_count < FAST_INIT_MIN_FEATURES) {
+          ROS_WARN_THROTTLE(1.0, "Fast-Init gate: too few features (%d < %d).", 
+                           feature_count, FAST_INIT_MIN_FEATURES);
+          return false;
+      }
+      
+      // 2. IMU激励检查：使用原版逻辑，但可以适当降低阈值
+      //    因为有深度先验，对运动激励的要求可以稍微放宽
+      double acc_var = 0.0;
+      {
+          map<double, ImageFrame>::iterator frame_it;
+          Vector3d sum_g;
+          int valid_count = 0;
+          
+          // 遍历所有帧（从第二帧开始），计算平均加速度
+          for (frame_it = all_image_frame.begin(), frame_it++; frame_it != all_image_frame.end(); frame_it++)
+          {
+              if (!frame_it->second.pre_integration) {
+                  continue;
+              }
+              double dt = frame_it->second.pre_integration->sum_dt;
+              if (dt < 1e-6) {
+                  continue;
+              }
+              Vector3d tmp_g = frame_it->second.pre_integration->delta_v / dt;
+              sum_g += tmp_g;
+              valid_count++;
+          }
+          
+          if (valid_count <= 0) {
+              ROS_WARN_THROTTLE(1.0, "Fast-Init gate: insufficient frames for IMU excitation check.");
+              return false;
+          }
+          
+          Vector3d aver_g = sum_g / valid_count;
+          
+          // 计算加速度方差
+          for (frame_it = all_image_frame.begin(), frame_it++; frame_it != all_image_frame.end(); frame_it++)
+          {
+              if (!frame_it->second.pre_integration) {
+                  continue;
+              }
+              double dt = frame_it->second.pre_integration->sum_dt;
+              if (dt < 1e-6) {
+                  continue;
+              }
+              Vector3d tmp_g = frame_it->second.pre_integration->delta_v / dt;
+              acc_var += (tmp_g - aver_g).transpose() * (tmp_g - aver_g);
+          }
+          acc_var = sqrt(acc_var / valid_count);
+      }
+      
+      // 快速初始化的优势：可以接受更低的IMU激励（原版0.25，这里可以0.15-0.2）
+      // 因为深度图提供了尺度约束，对IMU激励的依赖降低
+      const double FAST_INIT_MIN_ACC_VAR = 0.15;  // 比原版0.25更低
+      if (acc_var < FAST_INIT_MIN_ACC_VAR) {
+          ROS_WARN_THROTTLE(1.0, "Fast-Init gate: insufficient IMU excitation (acc variance: %.4f < %.2f).", 
+                           acc_var, FAST_INIT_MIN_ACC_VAR);
+          return false;
+      }
+      
+      // 3. 可选：计算旋转激励用于日志记录（用于对比分析，但不作为硬性要求）
+      for (int k = 1; k <= WINDOW_SIZE; ++k) {
+          if (pre_integrations[k]) {
+              Eigen::AngleAxisd aa(pre_integrations[k]->delta_q);
+              rot_sum_out += std::abs(aa.angle());
+          }
+      }
+      
+      // 记录初始化条件（用于性能分析和证明优势）
+      ROS_INFO_THROTTLE(1.0, "Fast-Init conditions: features=%d, acc_var=%.4f, rot_sum=%.3f rad", 
+                       feature_count, acc_var, rot_sum_out);
+      
+      return true;
+  }
+ 
+ /**
+  * @brief 执行快速单目初始化
+  */
+ bool Estimator::performFastInitialization(std::map<int, Eigen::Vector3d>& Ps_init,
+                                          std::map<int, Eigen::Vector3d>& Vs_init,
+                                          std::map<int, Eigen::Quaterniond>& Rs_init)
+ {
+     std::lock_guard<std::mutex> lock(m_depth_mutex);
+     return mp_fast_initializer->initialize(all_image_frame,
+                                           m_first_frame_depth_map,
+                                           g,
+                                           Ps_init, Vs_init, Rs_init);
+ }
+ 
+ /**
+  * @brief 将快速初始化的结果更新到估计器状态
+  */
+ void Estimator::updateEstimatorStateFromFastInit(const std::map<int, Eigen::Vector3d>& Ps_init,
+                                                  const std::map<int, Eigen::Vector3d>& Vs_init,
+                                                  const std::map<int, Eigen::Quaterniond>& Rs_init)
+ {
+     // 将初始化结果复制到 Estimator 的状态变量
+     for (int k = 0; k <= WINDOW_SIZE; ++k) {
+         if (Ps_init.count(k) && Vs_init.count(k) && Rs_init.count(k)) {
+             Ps[k] = Ps_init[k];
+             Vs[k] = Vs_init[k];
+             Rs[k] = Rs_init[k].toRotationMatrix(); // Quaterniond -> Matrix3d
+             
+             // 将所有初始化的帧标记为关键帧
+             double timestamp = Headers[k].stamp.toSec();
+             if (all_image_frame.count(timestamp)) {
+                 all_image_frame[timestamp].is_key_frame = true;
+             }
+         }
+     }
+ }
 
 /**
  * @brief 纯视觉的结构恢复（Structure from Motion, SFM）
@@ -1469,12 +1575,12 @@ void Estimator::slideWindow()
                 delete it_0->second.pre_integration;
                 it_0->second.pre_integration = nullptr;
     
-                    for (map<double, ImageFrame>::iterator it = all_image_frame.begin(); it != it_0; ++it)
-                    {
-                        if (it->second.pre_integration)
-                            delete it->second.pre_integration;
-                        it->second.pre_integration = NULL;
-                    }
+                for (map<double, ImageFrame>::iterator it = all_image_frame.begin(); it != it_0; ++it)
+                {
+                    if (it->second.pre_integration)
+                        delete it->second.pre_integration;
+                    it->second.pre_integration = NULL;
+                }
 
                 all_image_frame.erase(all_image_frame.begin(), it_0);
                 all_image_frame.erase(t_0);

@@ -332,10 +332,40 @@ void process()
                 image[feature_id].emplace_back(camera_id,  xyz_uv_velocity);
             }
 
-            // 将原始图像转换为 BGR 格式以供深度估计器使用
-            cv_bridge::CvImageConstPtr cv_ptr = cv_bridge::toCvCopy(image_msg, sensor_msgs::image_encodings::MONO8);
+            cv_bridge::CvImageConstPtr cv_ptr;
             cv::Mat bgr_image;
-            cv::cvtColor(cv_ptr->image, bgr_image, cv::COLOR_GRAY2BGR);
+
+            try {
+                // 首先尝试读取为BGR8（彩色图）
+                if (image_msg->encoding == sensor_msgs::image_encodings::BGR8) {
+                    cv_ptr = cv_bridge::toCvCopy(image_msg, sensor_msgs::image_encodings::BGR8);
+                    bgr_image = cv_ptr->image;
+                }
+                else if (image_msg->encoding == sensor_msgs::image_encodings::RGB8) {
+                    // 如果是RGB8，转成BGR
+                    cv_ptr = cv_bridge::toCvCopy(image_msg, sensor_msgs::image_encodings::RGB8);
+                    cv::cvtColor(cv_ptr->image, bgr_image, cv::COLOR_RGB2BGR);
+                }
+                else if (image_msg->encoding == sensor_msgs::image_encodings::MONO8) {
+                    // 灰度图：警告并转换（MiDaS在灰度图上效果不好）
+                    ROS_WARN_THROTTLE(2.0, "Input image is grayscale (MONO8). MiDaS depth estimation may be inaccurate!");
+                    cv_ptr = cv_bridge::toCvCopy(image_msg, sensor_msgs::image_encodings::MONO8);
+                    cv::cvtColor(cv_ptr->image, bgr_image, cv::COLOR_GRAY2BGR);
+                }
+                else {
+                    // 尝试自动转换
+                    cv_ptr = cv_bridge::toCvCopy(image_msg, sensor_msgs::image_encodings::BGR8);
+                    bgr_image = cv_ptr->image;
+                }
+                
+                ROS_DEBUG("Image encoding: %s, channels: %d", image_msg->encoding.c_str(), bgr_image.channels());
+            }
+            catch (cv_bridge::Exception& e) {
+                ROS_ERROR("cv_bridge exception: %s", e.what());
+                // 降级处理：尝试MONO8
+                cv_ptr = cv_bridge::toCvCopy(image_msg, sensor_msgs::image_encodings::MONO8);
+                cv::cvtColor(cv_ptr->image, bgr_image, cv::COLOR_GRAY2BGR);
+            }
 
             estimator_ptr->processImage(image, feature_msg->header, bgr_image);
 
@@ -378,9 +408,24 @@ int main(int argc, char **argv)
     // 在读取参数后创建 Estimator 对象
     Estimator estimator;
     estimator_ptr = &estimator;
-    // 初始化深度估计器（如果启用）
+    // 初始化深度估计器
     estimator.initDepthEstimator();
     estimator.setParameter();
+
+    // 可选：在后台检查模型加载状态
+    std::thread status_check([&estimator]() {
+        int wait_count = 0;
+        while (!estimator.isDepthEstimatorReady() && wait_count < 100) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            wait_count++;
+        }
+        if (estimator.isDepthEstimatorReady()) {
+            ROS_INFO("Depth model is ready!");
+        } else {
+            ROS_WARN("Depth model is still loading in background...");
+        }
+    });
+    status_check.detach();
 
     // 如果定义了EIGEN_DONT_PARALLELIZE宏（禁用Eigen并行计算），输出调试日志
 #ifdef EIGEN_DONT_PARALLELIZE
