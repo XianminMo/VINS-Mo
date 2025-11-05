@@ -334,12 +334,15 @@ void Estimator::processImage(const map<int, vector<pair<int, Eigen::Matrix<doubl
                 if(ESTIMATE_EXTRINSIC != 2 && (header.stamp.toSec() - initial_timestamp) > 0.1)
                 {
                     // 步骤 1: 纯视觉SFM（Structure from Motion）
+                    TicToc t_init; // 记录初始化开始时间
                     if (initialStructure())
                     {
                         // 步骤 2: 视觉-IMU对齐
                         if (visualInitialAlign())
                         {
                             is_init_success = true; // 初始化成功
+                            double t_init_cost = t_init.toc();
+                            ROS_INFO("VINS-Mono Init Succeeded! Took %.2f ms.", t_init_cost);
                         }
                     }
                    initial_timestamp = header.stamp.toSec();

@@ -348,7 +348,7 @@ void process()
                 }
                 else if (image_msg->encoding == sensor_msgs::image_encodings::MONO8) {
                     // 灰度图：警告并转换（MiDaS在灰度图上效果不好）
-                    ROS_WARN_THROTTLE(2.0, "Input image is grayscale (MONO8). MiDaS depth estimation may be inaccurate!");
+                    // ROS_WARN_THROTTLE(2.0, "Input image is grayscale (MONO8). MiDaS depth estimation may be inaccurate!");
                     cv_ptr = cv_bridge::toCvCopy(image_msg, sensor_msgs::image_encodings::MONO8);
                     cv::cvtColor(cv_ptr->image, bgr_image, cv::COLOR_GRAY2BGR);
                 }

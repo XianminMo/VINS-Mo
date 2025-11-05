@@ -524,7 +524,6 @@ bool FastInitializer::solveLinearSystem(const std::vector<ObservationData>& obse
 
     // 使用无约束解的方向 和 全局参数 G.norm() 确定约束后的重力
     Eigen::Vector3d g_normed = g_svd.normalized() * G.norm();
-    // 替换第732-733行
     ROS_DEBUG("g_svd: [%.6f, %.6f, %.6f], norm: %.6f", 
         g_svd.x(), g_svd.y(), g_svd.z(), g_svd.norm());
 
@@ -538,7 +537,7 @@ bool FastInitializer::solveLinearSystem(const std::vector<ObservationData>& obse
     Eigen::MatrixXd Ay_Sy = A_y * S_y;
 
     // --- 7. SVD 求解 A_y * y = b_y ---
-    // **关键**: Ay_Sy 是 N x 5 (N >= 10)，使用 ThinU/V
+    // 关键: Ay_Sy 是 N x 5 (N >= 10)，使用 ThinU/V
     Eigen::JacobiSVD<Eigen::MatrixXd> svd_constrained(Ay_Sy, Eigen::ComputeThinU | Eigen::ComputeThinV);
 
     // 检查 SVD 是否成功以及条件数
