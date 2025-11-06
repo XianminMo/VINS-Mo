@@ -1,9 +1,11 @@
 %YAML:1.0
 
 #common parameters
-imu_topic: "/camera/imu/data_raw"
-image_topic: "/camera/color/image_raw"
-output_path: "/home/tony-ws1/output/"
+imu_topic: "/camera/imu"
+image_topic: "/camera/infra1/image_rect_raw"
+output_path: "/home/linux/mxm/output/"
+depth_model_path: "/home/linux/mxm/proj/VINS-Mo/src/VINS-Mo/vins_estimator/models/Midas-V2.onnx" # path to depth estimation model
+use_fast_init: 0     # 0: normal initialization; 1: use fast initialization with depth estimation
 
 #camera calibration 
 model_type: PINHOLE

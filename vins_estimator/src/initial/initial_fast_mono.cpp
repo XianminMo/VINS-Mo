@@ -472,18 +472,21 @@ bool FastInitializer::solveLinearSystem(const std::vector<ObservationData>& obse
      }
 
     // --- 2. 应用数值预处理 (缩放矩阵 S) ---
-    Eigen::Matrix<double, 8, 8> S = Eigen::Matrix<double, 8, 8>::Identity();
-    S(0, 0) = 0.1;   // a: 深度尺度因子，通常在0.01-1范围内，缩放到合理尺度
-    S(1, 1) = 1.0;   // b: 深度偏移，通常较小，保持原尺度
-    S(2, 2) = 10.0; S(3, 3) = 10.0; S(4, 4) = 10.0; // v (m/s)
-    S(5, 5) = 100.0; S(6, 6) = 100.0; S(7, 7) = 100.0; // g (m/s²)
+    Eigen::VectorXd col_scale(5);
+    for (int j = 0; j < 5; ++j) {
+        double s = A.col(j).norm() / std::sqrt(static_cast<double>(A.rows()));
+        if (s < 1e-8) s = 1.0;
+        col_scale(j) = s;
+    }
+    Eigen::Matrix<double,5,5> S = Eigen::Matrix<double,5,5>::Identity();
+    for (int j = 0; j < 5; ++j) S(j,j) = 1.0 / col_scale(j);
     Eigen::MatrixXd A_S = A * S; // 缩放后的矩阵
 
     // --- 3. 求解无约束最小二乘问题 (SVD) ---
-    // **关键**: A_S 是 N x 8 (N >= 8)，使用 ThinU/V
+    // 关键: A_S 是 N x 8 (N >= 8)，使用 ThinU/V
     Eigen::JacobiSVD<Eigen::MatrixXd> svd_unconstrained(A_S, Eigen::ComputeThinU | Eigen::ComputeThinV);
 
-    // 检查 SVD 是否成功以及条件数
+    // 检查 无约束 SVD 是否成功以及条件数
     double cond_num_unconstrained = std::numeric_limits<double>::infinity();
     const double min_singular_value_threshold = 1e-8;
     if (svd_unconstrained.singularValues().size() > 0 && svd_unconstrained.singularValues().minCoeff() > min_singular_value_threshold) {
@@ -491,19 +494,13 @@ bool FastInitializer::solveLinearSystem(const std::vector<ObservationData>& obse
     }
     ROS_INFO("solveLinearSystem (Unconstrained): Condition number = %.2e", cond_num_unconstrained);
 
-    // 可以选择性地基于条件数判断是否继续
-    // const double FINAL_FIT_COND_THRESHOLD = 1e12; // 设定一个最终拟合的条件数阈值
-    // if (cond_num_unconstrained > FINAL_FIT_COND_THRESHOLD) {
-    //    ROS_WARN("solveLinearSystem Warning: Poor condition number (%.2e) in final unconstrained fit. Result may be unreliable.", cond_num_unconstrained);
-    //    // return false; // 或者继续尝试施加约束
-    // }
 
     Eigen::Matrix<double, 8, 1> x_scaled_svd = svd_unconstrained.solve(b);
     if (x_scaled_svd.hasNaN()) {
          ROS_ERROR("solveLinearSystem Error: Unconstrained SVD solve resulted in NaN!");
          return false;
     }
-    Eigen::Matrix<double, 8, 1> x_svd = S * x_scaled_svd; // 恢复原始尺度
+    Eigen::Matrix<double, 8, 1> x_svd = S.inverse() * x_scaled_svd; // 恢复原始尺度
 
     // --- 4. 施加重力大小约束 ---
     Eigen::Vector3d g_svd = x_svd.segment<3>(5);
@@ -524,7 +521,7 @@ bool FastInitializer::solveLinearSystem(const std::vector<ObservationData>& obse
 
     // 使用无约束解的方向 和 全局参数 G.norm() 确定约束后的重力
     Eigen::Vector3d g_normed = g_svd.normalized() * G.norm();
-    ROS_DEBUG("g_svd: [%.6f, %.6f, %.6f], norm: %.6f", 
+    ROS_INFO("g_svd: [%.6f, %.6f, %.6f], norm: %.6f", 
         g_svd.x(), g_svd.y(), g_svd.z(), g_svd.norm());
 
     // --- 5. 固定 g_normed，重新求解 y = [a, b, v_I0]^T ---
@@ -532,39 +529,65 @@ bool FastInitializer::solveLinearSystem(const std::vector<ObservationData>& obse
     Eigen::MatrixXd A_g = A.rightCols<3>(); // 后 3 列
     Eigen::VectorXd b_y = b - A_g * g_normed; // 新的 RHS
 
-    // --- 6. 应用数值预处理 (y 部分) ---
-    Eigen::Matrix<double, 5, 5> S_y = S.block<5, 5>(0, 0); // S 的左上 5x5
+    // --- 6. 自适应列缩放（替代固定 S_y） ---
+    Eigen::VectorXd col_scale(5);
+    for (int j = 0; j < 5; ++j) {
+        double s = A_y.col(j).norm() / std::sqrt(static_cast<double>(A_y.rows()));
+        if (s < 1e-8) s = 1.0;
+        col_scale(j) = s;
+    }
+    Eigen::Matrix<double,5,5> S_y = Eigen::Matrix<double,5,5>::Identity();
+    for (int j = 0; j < 5; ++j) S_y(j,j) = 1.0 / col_scale(j);
     Eigen::MatrixXd Ay_Sy = A_y * S_y;
 
-    // --- 7. SVD 求解 A_y * y = b_y ---
-    // 关键: Ay_Sy 是 N x 5 (N >= 10)，使用 ThinU/V
-    Eigen::JacobiSVD<Eigen::MatrixXd> svd_constrained(Ay_Sy, Eigen::ComputeThinU | Eigen::ComputeThinV);
+    // 7. IRLS 参数（Huber）与正则（Tikhonov），可配置
+    const int irls_iters = 3;
+    const double huber_delta = 1.5e-2; // 和像平面噪声量级匹配
+    const double lambda_a = 1e-3;
+    const double lambda_b = 5e-3;      // 稍强，抑制 b 漂移
+    const double lambda_v = 1e-3;
 
-    // 检查 SVD 是否成功以及条件数
-    double cond_num_constrained = std::numeric_limits<double>::infinity();
-     if (svd_constrained.singularValues().size() > 0 && svd_constrained.singularValues().minCoeff() > min_singular_value_threshold) {
-        cond_num_constrained = svd_constrained.singularValues().maxCoeff() / svd_constrained.singularValues().minCoeff();
-     }
-    ROS_INFO("solveLinearSystem (Constrained Fit for y): Condition number = %.2e", cond_num_constrained);
+    // 初始化 y（用一次最小二乘作为初值）
+    Eigen::MatrixXd H0 = Ay_Sy.transpose() * Ay_Sy;
+    Eigen::VectorXd g0 = Ay_Sy.transpose() * b_y;
+    Eigen::Matrix<double,5,5> Reg = Eigen::Matrix<double,5,5>::Zero();
+    Reg(0,0) = lambda_a;       // a
+    Reg(1,1) = lambda_b;       // b
+    Reg.block<3,3>(2,2).setIdentity();
+    Reg.block<3,3>(2,2) *= lambda_v;
 
-    Eigen::Matrix<double, 5, 1> y_scaled = svd_constrained.solve(b_y);
-     if (y_scaled.hasNaN()) {
-         ROS_ERROR("solveLinearSystem Error: Constrained SVD solve for y resulted in NaN!");
-         // 尝试回退到无约束解
-         ROS_WARN("Falling back to the unconstrained solution.");
-         x_out = x_svd;
-         // 再次检查回退解的有效性
-         if (std::abs(x_out(0)) < 1e-4 || x_out.segment<3>(5).norm() < 5.0) {
-              ROS_ERROR("solveLinearSystem Error: Fallback unconstrained solution is also unreasonable. Failed.");
-              return false;
-         }
-         return true;
-     }
-    Eigen::Matrix<double, 5, 1> y = S_y * y_scaled; // 恢复原始尺度
+    Eigen::Matrix<double,5,1> y_scaled = (H0 + Reg).ldlt().solve(g0);
 
-    // --- 8. 组合最终解 ---
-    x_out.head<5>() = y;          // a, b, v_I0
-    x_out.tail<3>() = g_normed;   // 约束后的 g
+    // 8) IRLS 迭代
+    for (int it = 0; it < irls_iters; ++it) {
+        Eigen::VectorXd r = Ay_Sy * y_scaled - b_y; // N
+        // 行权重（Huber）
+        Eigen::VectorXd w = Eigen::VectorXd::Ones(r.size());
+        for (int i = 0; i < r.size(); ++i) {
+            double a = std::abs(r(i));
+            if (a > huber_delta) w(i) = huber_delta / a;
+        }
+        // 构造加权 A、b
+        Eigen::VectorXd sqrtw = w.array().sqrt();
+        Eigen::MatrixXd Aw = Ay_Sy;
+        for (int i = 0; i < Aw.rows(); ++i) Aw.row(i) *= sqrtw(i);
+        Eigen::VectorXd bw = b_y.cwiseProduct(sqrtw);
+
+        // 正则化加权正规方程
+        Eigen::MatrixXd H = Aw.transpose() * Aw + Reg;
+        Eigen::VectorXd gvec = Aw.transpose() * bw;
+        y_scaled = H.ldlt().solve(gvec);
+    }
+
+    // 恢复原尺度并组装解
+    Eigen::Matrix<double,5,1> y = S_y.inverse() * y_scaled; // 这里 S_y 是 1/scale，对应逆回来
+    x_out.head<5>() = y;
+    x_out.tail<3>() = g_normed;
+
+    // 记录加权系统的近似条件数
+    Eigen::JacobiSVD<Eigen::MatrixXd> svd_w(Ay_Sy, Eigen::ComputeThinU | Eigen::ComputeThinV);
+    double cond_w = svd_w.singularValues()(0) / svd_w.singularValues().tail(1)(0);
+    ROS_INFO("solveLinearSystem (Constrained+IRLS): approx cond = %.2e", cond_w);
 
     ROS_INFO("solveLinearSystem finished successfully.");
     return true;
@@ -594,9 +617,26 @@ bool FastInitializer::getValidDepthFromMap(const cv::Mat& depth_map, int u, int 
         return false;
     }
     
-    float d_hat_inv = depth_map.at<float>(v, u);
-    d_out = static_cast<double>(d_hat_inv);
-    
+    // 双线性插值读取深度
+    int u0 = static_cast<int>(std::floor(u));
+    int v0 = static_cast<int>(std::floor(v));
+    int u1 = std::min(u0 + 1, depth_map.cols - 1);
+    int v1 = std::min(v0 + 1, depth_map.rows - 1);
+    double du = u - u0;
+    double dv = v - v0;
+
+    float d00 = depth_map.at<float>(v0, u0);
+    float d01 = depth_map.at<float>(v0, u1);
+    float d10 = depth_map.at<float>(v1, u0);
+    float d11 = depth_map.at<float>(v1, u1);
+
+    auto valid = [](float x){ return std::isfinite(x) && x > 0.f && x <= 10.f; };
+    if (!valid(d00) || !valid(d01) || !valid(d10) || !valid(d11)) return false;
+
+    double d0 = d00 * (1.0 - du) + d01 * du;
+    double d1 = d10 * (1.0 - du) + d11 * du;
+    d_out = d0 * (1.0 - dv) + d1 * dv;
+
     return isValidDepth(d_out);
 }
 
