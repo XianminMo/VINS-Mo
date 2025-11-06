@@ -472,14 +472,14 @@ bool FastInitializer::solveLinearSystem(const std::vector<ObservationData>& obse
      }
 
     // --- 2. 应用数值预处理 (缩放矩阵 S) ---
-    Eigen::VectorXd col_scale(5);
-    for (int j = 0; j < 5; ++j) {
+    Eigen::VectorXd col_scale(8);
+    for (int j = 0; j < 8; ++j) {
         double s = A.col(j).norm() / std::sqrt(static_cast<double>(A.rows()));
         if (s < 1e-8) s = 1.0;
         col_scale(j) = s;
     }
-    Eigen::Matrix<double,5,5> S = Eigen::Matrix<double,5,5>::Identity();
-    for (int j = 0; j < 5; ++j) S(j,j) = 1.0 / col_scale(j);
+    Eigen::Matrix<double,8,8> S = Eigen::Matrix<double,8,8>::Identity();
+    for (int j = 0; j < 8; ++j) S(j,j) = 1.0 / col_scale(j);
     Eigen::MatrixXd A_S = A * S; // 缩放后的矩阵
 
     // --- 3. 求解无约束最小二乘问题 (SVD) ---
