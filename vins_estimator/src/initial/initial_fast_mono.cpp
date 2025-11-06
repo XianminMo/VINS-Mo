@@ -530,14 +530,14 @@ bool FastInitializer::solveLinearSystem(const std::vector<ObservationData>& obse
     Eigen::VectorXd b_y = b - A_g * g_normed; // 新的 RHS
 
     // --- 6. 自适应列缩放（替代固定 S_y） ---
-    Eigen::VectorXd col_scale(5);
+    Eigen::VectorXd col_scale_y(5);
     for (int j = 0; j < 5; ++j) {
         double s = A_y.col(j).norm() / std::sqrt(static_cast<double>(A_y.rows()));
         if (s < 1e-8) s = 1.0;
-        col_scale(j) = s;
+        col_scale_y(j) = s;
     }
     Eigen::Matrix<double,5,5> S_y = Eigen::Matrix<double,5,5>::Identity();
-    for (int j = 0; j < 5; ++j) S_y(j,j) = 1.0 / col_scale(j);
+    for (int j = 0; j < 5; ++j) S_y(j,j) = 1.0 / col_scale_y(j);
     Eigen::MatrixXd Ay_Sy = A_y * S_y;
 
     // 7. IRLS 参数（Huber）与正则（Tikhonov），可配置
