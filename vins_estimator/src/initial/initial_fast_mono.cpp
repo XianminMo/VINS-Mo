@@ -472,11 +472,14 @@ bool FastInitializer::solveLinearSystem(const std::vector<ObservationData>& obse
      }
 
     // --- 2. 应用数值预处理 (缩放矩阵 S) ---
-    Eigen::Matrix<double, 8, 8> S = Eigen::Matrix<double, 8, 8>::Identity();
-    S(0, 0) = 0.1;   // a: 深度尺度因子
-    S(1, 1) = 1.0;   // b: 深度偏移
-    S(2, 2) = 10.0; S(3, 3) = 10.0; S(4, 4) = 10.0; // v (m/s)
-    S(5, 5) = 100.0; S(6, 6) = 100.0; S(7, 7) = 100.0; // g (m/s²)
+    Eigen::VectorXd col_scale(8);
+    for (int j = 0; j < 8; ++j) {
+        double s = A.col(j).norm() / std::sqrt(static_cast<double>(A.rows()));
+        if (s < 1e-8) s = 1.0;
+        col_scale(j) = s;
+    }
+    Eigen::Matrix<double,8,8> S = Eigen::Matrix<double,8,8>::Identity();
+    for (int j = 0; j < 8; ++j) S(j,j) = 1.0 / col_scale(j);
     Eigen::MatrixXd A_S = A * S; // 缩放后的矩阵
 
     // --- 3. 求解无约束最小二乘问题 (SVD) ---
@@ -527,7 +530,14 @@ bool FastInitializer::solveLinearSystem(const std::vector<ObservationData>& obse
     Eigen::VectorXd b_y = b - A_g * g_normed; // 新的 RHS
 
     // --- 6. 自适应列缩放（替代固定 S_y） ---
-    Eigen::Matrix<double, 8, 8> S_y = S.block<5, 5>(0, 0);
+    Eigen::VectorXd col_scale_y(5);
+    for (int j = 0; j < 5; ++j) {
+        double s = A_y.col(j).norm() / std::sqrt(static_cast<double>(A_y.rows()));
+        if (s < 1e-8) s = 1.0;
+        col_scale_y(j) = s;
+    }
+    Eigen::Matrix<double,5,5> S_y = Eigen::Matrix<double,5,5>::Identity();
+    for (int j = 0; j < 5; ++j) S_y(j,j) = 1.0 / col_scale_y(j);
     Eigen::MatrixXd Ay_Sy = A_y * S_y;
 
     // 7. IRLS 参数（Huber）与正则（Tikhonov），可配置
