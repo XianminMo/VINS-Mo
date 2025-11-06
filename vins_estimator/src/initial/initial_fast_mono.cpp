@@ -507,16 +507,21 @@ bool FastInitializer::solveLinearSystem(const std::vector<ObservationData>& obse
     double g_norm_svd = g_svd.norm();
 
     // 检查无约束解的有效性
-    if (g_norm_svd < 1.0) { // 如果无约束解的重力接近零，说明数据可能有问题
-        ROS_WARN("solveLinearSystem Warning: Unconstrained solve resulted in near-zero gravity (%.3f). Using this result without constraint.", g_norm_svd);
-        // 在这种情况下，强行施加约束可能更糟，直接返回无约束解
+    if (g_norm_svd < 1.0 || a_svd < 1e-3) { 
+        ROS_WARN("solveLinearSystem Warning: Unconstrained solve resulted in invalid values (g_norm=%.3f, a=%.6f).", 
+                 g_norm_svd, a_svd);
+        // 如果无约束解已经不合理，直接返回失败
+        if (a_svd < 1e-3) {
+            ROS_ERROR("solveLinearSystem Error: Unconstrained solution has invalid a=%.6f. Failed.", a_svd);
+            return false;
+        }
+        // 如果只是重力小，尝试使用无约束解
         x_out = x_svd;
-        // 仍然需要检查这个解是否合理
-         if (std::abs(x_out(0)) < 1e-4 || x_out.segment<3>(5).norm() < 1.0) { // 如果 a 或 g 仍然无效
-              ROS_ERROR("solveLinearSystem Error: Unconstrained solution is also unreasonable. Failed.");
-              return false;
-         }
-        return true; // 返回无约束但（可能）合理的解
+        if (std::abs(x_out(0)) < 1e-4 || x_out.segment<3>(5).norm() < 1.0) {
+            ROS_ERROR("solveLinearSystem Error: Unconstrained solution is also unreasonable. Failed.");
+            return false;
+        }
+        return true;
     }
 
     // 使用无约束解的方向 和 全局参数 G.norm() 确定约束后的重力
@@ -543,7 +548,7 @@ bool FastInitializer::solveLinearSystem(const std::vector<ObservationData>& obse
     // 7. IRLS 参数（Huber）与正则（Tikhonov），可配置
     const int irls_iters = 3;
     const double huber_delta = 1.5e-2; // 和像平面噪声量级匹配
-    const double lambda_a = 1e-3;
+    const double lambda_a = 1e-2;
     const double lambda_b = 5e-3;      // 稍强，抑制 b 漂移
     const double lambda_v = 1e-3;
 
