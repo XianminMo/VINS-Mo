@@ -152,6 +152,20 @@ bool FastInitializer::initialize(const std::map<double, ImageFrame>& image_frame
              G_gravity_world.x(), G_gravity_world.y(), G_gravity_world.z(), 
              G_gravity_world.norm());
     
+    // 输出第一帧IMU的坐标（参考坐标系W'）
+    if (Ps_out.find(0) != Ps_out.end() && Rs_out.find(0) != Rs_out.end()) {
+        Eigen::Vector3d p_I0 = Ps_out[0];
+        Eigen::Quaterniond q_I0 = Rs_out[0];
+        Eigen::Vector3d euler_I0 = Utility::R2ypr(q_I0.toRotationMatrix());
+        ROS_INFO("  First frame IMU pose (W' reference frame):");
+        ROS_INFO("    Position: [%.6f, %.6f, %.6f] m", 
+                 p_I0.x(), p_I0.y(), p_I0.z());
+        ROS_INFO("    Rotation (quaternion): [%.6f, %.6f, %.6f, %.6f] (w, x, y, z)", 
+                 q_I0.w(), q_I0.x(), q_I0.y(), q_I0.z());
+        ROS_INFO("    Rotation (yaw-pitch-roll): [%.6f, %.6f, %.6f] deg", 
+                 euler_I0.x(), euler_I0.y(), euler_I0.z());
+    }
+    
     return true;
 }
 
@@ -736,12 +750,13 @@ int FastInitializer::collectValidObservations(
             continue;
         }
         
-        const int base_local_id = feature.feature_per_frame[0].frame_id;
+        const int base_local_id = obs_frame_0.frame_id;
         // 遍历该特征在后续帧的观测
         for (size_t frame_idx = 1; frame_idx < feature.feature_per_frame.size(); ++frame_idx) {
             const FeaturePerFrame& obs_frame_k = feature.feature_per_frame[frame_idx];
             
-            int frame_k_window_index = obs_frame_k.frame_id - base_local_id;
+            // int frame_k_window_index = obs_frame_k.frame_id - base_local_id;
+            int frame_k_window_index = static_cast<int>(frame_idx);
 
             if (frame_k_window_index <= 0 ||
                 frame_k_window_index > WINDOW_SIZE ||
