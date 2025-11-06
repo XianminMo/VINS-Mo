@@ -505,6 +505,7 @@ bool FastInitializer::solveLinearSystem(const std::vector<ObservationData>& obse
     // --- 4. 施加重力大小约束 ---
     Eigen::Vector3d g_svd = x_svd.segment<3>(5);
     double g_norm_svd = g_svd.norm();
+    double a_svd = x_svd(0);
 
     // 检查无约束解的有效性
     if (g_norm_svd < 1.0 || a_svd < 1e-3) { 
@@ -735,13 +736,14 @@ int FastInitializer::collectValidObservations(
             continue;
         }
         
+        const int base_local_id = feature.feature_per_frame[0].frame_id;
         // 遍历该特征在后续帧的观测
         for (size_t frame_idx = 1; frame_idx < feature.feature_per_frame.size(); ++frame_idx) {
             const FeaturePerFrame& obs_frame_k = feature.feature_per_frame[frame_idx];
-            int frame_k_window_index = obs_frame_k.frame_id - window_start_frame_id;
             
-            // 确保帧索引在有效范围内
-            if (frame_k_window_index <= 0 || 
+            int frame_k_window_index = obs_frame_k.frame_id - base_local_id;
+
+            if (frame_k_window_index <= 0 ||
                 frame_k_window_index > WINDOW_SIZE ||
                 frame_k_window_index >= static_cast<int>(pre_integrations_compound.size())) {
                 continue;
