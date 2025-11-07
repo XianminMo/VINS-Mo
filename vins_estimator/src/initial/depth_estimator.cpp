@@ -159,23 +159,15 @@ bool DepthEstimator::waitForReady(int timeout_ms) const
 void DepthEstimator::warmup()
 {
     if (!m_session) {
-        ROS_WARN("DepthEstimator::warmup(): Session not ready, skipping warmup.");
         return;
     }
-
-    ROS_INFO("DepthEstimator::warmup(): Warming up model...");
     TicToc t_warmup;
     
     // 创建一个小的虚拟图像进行推理
     cv::Mat dummy_img(m_model_input_height, m_model_input_width, CV_8UC3, cv::Scalar(128, 128, 128));
     cv::Mat dummy_output;
     
-    bool success = predictInternal(dummy_img, dummy_output, false);
-    if (success) {
-        ROS_INFO("DepthEstimator::warmup(): Model warmed up successfully (%.2f ms).", t_warmup.toc());
-    } else {
-        ROS_WARN("DepthEstimator::warmup(): Warmup failed, but continuing...");
-    }
+    (void)predictInternal(dummy_img, dummy_output, false, true);
 }
 
 // 预处理函数 
@@ -266,12 +258,13 @@ bool DepthEstimator::predict(const cv::Mat& image, cv::Mat& norm_inv_depth_map)
 }
 
 // 预测内部实现
-bool DepthEstimator::predictInternal(const cv::Mat& image, cv::Mat& norm_inv_depth_map, bool save_debug_images)
+bool DepthEstimator::predictInternal(const cv::Mat& image, cv::Mat& norm_inv_depth_map, bool save_debug_images, bool quiet)
 {
+    TicToc t_infer;
     static bool saved_input = false;
     if (!saved_input && save_debug_images) {
         cv::imwrite("/tmp/first_frame_input_image.png", image);
-        ROS_INFO("Saved input image to /tmp/first_frame_input_image.png (channels: %d)", image.channels());
+        if (!quiet) ROS_INFO("Saved input image to /tmp/first_frame_input_image.png (channels: %d)", image.channels());
         saved_input = true;
     }
 
@@ -310,19 +303,58 @@ bool DepthEstimator::predictInternal(const cv::Mat& image, cv::Mat& norm_inv_dep
         double raw_min = 0.0, raw_max = 0.0;
         cv::minMaxLoc(raw_inv_depth, &raw_min, &raw_max);
         cv::Scalar raw_mean = cv::mean(raw_inv_depth);
-        ROS_INFO("MiDaS raw_inv_depth: min=%.6f max=%.6f mean=%.6f", raw_min, raw_max, raw_mean[0]);
+        if (!quiet) ROS_DEBUG("MiDaS raw_inv_depth: min=%.6f max=%.6f mean=%.6f", raw_min, raw_max, raw_mean[0]);
 
-        // 4.3 归一化到 [1, 2]（按你的设置保留）
+        // 4.3 归一化到 [1, 2]：使用分位数裁剪增强鲁棒性（1%~99%）
         cv::Mat normalized_float_map;
-        cv::normalize(raw_inv_depth, normalized_float_map, 1.0, 2.0, cv::NORM_MINMAX, CV_32F);
+        {
+            // 提取有效像素到向量
+            std::vector<float> vals;
+            vals.reserve(static_cast<size_t>(raw_inv_depth.total()));
+            for (int r = 0; r < raw_inv_depth.rows; ++r) {
+                const float* ptr = raw_inv_depth.ptr<float>(r);
+                for (int c = 0; c < raw_inv_depth.cols; ++c) {
+                    float v = ptr[c];
+                    if (std::isfinite(v)) vals.push_back(v);
+                }
+            }
+            if (!vals.empty()) {
+                size_t n = vals.size();
+                size_t i1 = static_cast<size_t>(std::max<size_t>(0, static_cast<size_t>(0.01 * n) - 1));
+                size_t i99 = static_cast<size_t>(std::min<size_t>(n - 1, static_cast<size_t>(0.99 * n)));
+                std::nth_element(vals.begin(), vals.begin() + i1, vals.end());
+                float p1 = vals[i1];
+                std::nth_element(vals.begin(), vals.begin() + i99, vals.end());
+                float p99 = vals[i99];
+                if (p99 <= p1) { p99 = p1 + 1e-6f; }
+
+                normalized_float_map.create(raw_inv_depth.size(), CV_32F);
+                for (int r = 0; r < raw_inv_depth.rows; ++r) {
+                    const float* src = raw_inv_depth.ptr<float>(r);
+                    float* dst = normalized_float_map.ptr<float>(r);
+                    for (int c = 0; c < raw_inv_depth.cols; ++c) {
+                        float v = src[c];
+                        if (!std::isfinite(v)) { v = p1; }
+                        v = std::min(std::max(v, p1), p99);
+                        // 线性映射到 [1, 2]
+                        dst[c] = 1.0f + (v - p1) * (1.0f / (p99 - p1));
+                    }
+                }
+            } else {
+                cv::normalize(raw_inv_depth, normalized_float_map, 1.0, 2.0, cv::NORM_MINMAX, CV_32F);
+            }
+        }
 
         // 4.4 统计 norm 的 min/max/mean
         double n_min = 0.0, n_max = 0.0;
         cv::minMaxLoc(normalized_float_map, &n_min, &n_max);
         cv::Scalar n_mean = cv::mean(normalized_float_map);
-        ROS_INFO("MiDaS norm_inv_depth: min=%.6f max=%.6f mean=%.6f", n_min, n_max, n_mean[0]);
+        if (!quiet) ROS_DEBUG("MiDaS norm_inv_depth: min=%.6f max=%.6f mean=%.6f", n_min, n_max, n_mean[0]);
 
-        // 4.5 保存首帧的可视化图（只保存一次，便于人工确认是否“扁平”）
+        // 4.5 缩放回原图尺寸
+        cv::resize(normalized_float_map, norm_inv_depth_map, image.size(), 0, 0, cv::INTER_LINEAR);
+
+        // 4.6 保存首帧的可视化图（只保存一次，便于人工确认是否“扁平”）
         static bool dumped = false;
         if (!dumped && save_debug_images)
         {
@@ -336,17 +368,56 @@ bool DepthEstimator::predictInternal(const cv::Mat& image, cv::Mat& norm_inv_dep
             cv::applyColorMap(raw_vis_8u, raw_vis_color, cv::COLORMAP_JET);
             cv::applyColorMap(norm_vis_8u, norm_vis_color, cv::COLORMAP_JET);
             
-            // 保存彩色和黑白两种版本
+            // 保存彩色版本
             cv::imwrite("/tmp/first_frame_raw_inv_depth.png", raw_vis_color);
             cv::imwrite("/tmp/first_frame_norm_inv_depth.png", norm_vis_color);
-            cv::imwrite("/tmp/first_frame_raw_inv_depth_gray.png", raw_vis_8u);
-            cv::imwrite("/tmp/first_frame_norm_inv_depth_gray.png", norm_vis_8u);
-            ROS_INFO("Saved MiDaS debug images to /tmp/first_frame_raw_inv_depth.png and /tmp/first_frame_norm_inv_depth.png");
+
+            // 生成与原图同尺寸的可视化图，并添加颜色-距离注释
+            cv::Mat resized_vis_8u;
+            cv::normalize(norm_inv_depth_map, resized_vis_8u, 0, 255, cv::NORM_MINMAX, CV_8U);
+            cv::Mat resized_vis_color;
+            cv::applyColorMap(resized_vis_8u, resized_vis_color, cv::COLORMAP_JET);
+
+            // 注释：Jet colormap 低值(蓝) -> 远， 高值(红) -> 近 （对归一化逆深度）
+            const std::string legend = "Jet: blue=far, red=near (norm inv depth)";
+            int baseline = 0;
+            cv::Size ts = cv::getTextSize(legend, cv::FONT_HERSHEY_SIMPLEX, 0.5, 1, &baseline);
+            cv::Point box_tl(5, resized_vis_color.rows - ts.height - 10);
+            cv::Point box_br(5 + ts.width + 10, resized_vis_color.rows - 5);
+            cv::rectangle(resized_vis_color, box_tl, box_br, cv::Scalar(0, 0, 0), cv::FILLED);
+            cv::putText(resized_vis_color, legend, cv::Point(10, resized_vis_color.rows - 10),
+                        cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(255, 255, 255), 1, cv::LINE_AA);
+
+            cv::imwrite("/tmp/first_frame_resized_norm_inv_depth.png", resized_vis_color);
+
+            ROS_INFO("Saved MiDaS debug images to /tmp/first_frame_raw_inv_depth.png, /tmp/first_frame_norm_inv_depth.png, and /tmp/first_frame_resized_norm_inv_depth.png");
             dumped = true;
         }
 
-        // 4.6 缩放回原图尺寸
-        cv::resize(normalized_float_map, norm_inv_depth_map, image.size(), 0, 0, cv::INTER_LINEAR);
+        // 4.7 有效性与汇总输出（只打一条高信息量日志）
+        cv::Mat isfinite_mask = norm_inv_depth_map == norm_inv_depth_map; // NaN 检测
+        int finite_count = cv::countNonZero(isfinite_mask);
+        int total_count = norm_inv_depth_map.rows * norm_inv_depth_map.cols;
+        double finite_ratio = (total_count > 0) ? (100.0 * static_cast<double>(finite_count) / static_cast<double>(total_count)) : 0.0;
+
+        double out_min = 0.0, out_max = 0.0;
+        cv::minMaxLoc(norm_inv_depth_map, &out_min, &out_max);
+        cv::Scalar out_mean = cv::mean(norm_inv_depth_map);
+
+        if (!quiet)
+            ROS_INFO("DepthEstimator: predict OK (%.2f ms). in=%dx%d -> net=%dx%d -> out=%dx%d | raw[min=%.5f,max=%.5f,mean=%.5f] norm[min=%.5f,max=%.5f,mean=%.5f] resized[min=%.5f,max=%.5f,mean=%.5f,finite=%.1f%%]",
+                     t_infer.toc(),
+                     image.cols, image.rows,
+                     m_model_input_width, m_model_input_height,
+                     norm_inv_depth_map.cols, norm_inv_depth_map.rows,
+                     raw_min, raw_max, raw_mean[0],
+                     n_min, n_max, n_mean[0],
+                     out_min, out_max, out_mean[0], finite_ratio);
+
+        if (!quiet && finite_ratio < 95.0)
+        {
+            ROS_WARN("DepthEstimator: Low finite ratio in output depth map (%.1f%%). Check input image and model.", finite_ratio);
+        }
     }
     catch (const Ort::Exception& e)
     {

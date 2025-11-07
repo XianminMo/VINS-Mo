@@ -26,6 +26,27 @@ double TD, TR;
 std::string DEPTH_MODEL_PATH;
 int USE_FAST_INIT; // <-- 添加这行定义
 
+// Fast Init parameters (defaults will be overridden by YAML if provided)
+int FAST_INIT_MIN_FEATURES;
+double FAST_INIT_MIN_ACC_VAR;
+int FAST_INIT_RANSAC_MIN_MEASUREMENTS;
+int FAST_INIT_RANSAC_MAX_ITERATIONS;
+double FAST_INIT_RANSAC_THRESHOLD_SQ;
+int FAST_INIT_RANSAC_MIN_INLIERS;
+double FAST_INIT_SVD_MIN_SIGMA;
+double FAST_INIT_COND_THRESHOLD;
+double FAST_INIT_DEPTH_INV_MIN;
+double FAST_INIT_DEPTH_INV_MAX;
+double FAST_INIT_DEPTH_Z_MIN;
+double FAST_INIT_DEPTH_Z_MAX;
+int FAST_INIT_MIN_VALID_DEPTH_FEATURES;
+int FAST_INIT_IRLS_ITERS;
+double FAST_INIT_IRLS_HUBER_DELTA;
+double FAST_INIT_REG_LAMBDA_A;
+double FAST_INIT_REG_LAMBDA_B;
+double FAST_INIT_REG_LAMBDA_V;
+double FAST_INIT_EARLY_EXIT_INLIER_RATIO;
+
 template <typename T>
 T readParam(ros::NodeHandle &n, std::string name)
 {
@@ -164,5 +185,50 @@ void readParameters(ros::NodeHandle &n)
         ROS_INFO("Using standard VINS-Mono SFM Initialization.");
     }
     
+    // Helper to read a value with default
+    auto readOr = [&](const std::string &key, auto def_val)
+    {
+        cv::FileNode node = fsSettings[key];
+        if (!node.empty())
+        {
+            decltype(def_val) v; node >> v; return v;
+        }
+        return def_val;
+    };
+
+    // Load Fast Init parameters with sensible defaults
+    FAST_INIT_MIN_FEATURES = readOr("fast_init.min_features", 50);
+    FAST_INIT_MIN_ACC_VAR = readOr("fast_init.min_acc_var", 0.15);
+    FAST_INIT_RANSAC_MIN_MEASUREMENTS = readOr("fast_init.ransac.min_measurements", 4);
+    FAST_INIT_RANSAC_MAX_ITERATIONS = readOr("fast_init.ransac.max_iterations", 500);
+    // residual threshold is pixel residual; store squared as used by code
+    double ransac_residual_thresh_px = readOr("fast_init.ransac.residual_thresh_px", 0.01);
+    FAST_INIT_RANSAC_THRESHOLD_SQ = ransac_residual_thresh_px * ransac_residual_thresh_px;
+    FAST_INIT_RANSAC_MIN_INLIERS = readOr("fast_init.ransac.min_inliers", 20);
+    FAST_INIT_SVD_MIN_SIGMA = readOr("fast_init.svd.min_sigma", 1e-8);
+    FAST_INIT_COND_THRESHOLD = readOr("fast_init.cond.threshold", 3e5);
+    FAST_INIT_DEPTH_INV_MIN = readOr("fast_init.depth.inv_min", 1e-6);
+    FAST_INIT_DEPTH_INV_MAX = readOr("fast_init.depth.inv_max", 10.0);
+    FAST_INIT_DEPTH_Z_MIN = readOr("fast_init.depth.z_min", 0.1);
+    FAST_INIT_DEPTH_Z_MAX = readOr("fast_init.depth.z_max", 50.0);
+    FAST_INIT_MIN_VALID_DEPTH_FEATURES = readOr("fast_init.depth.min_valid_features", 10);
+    FAST_INIT_IRLS_ITERS = readOr("fast_init.irls.iters", 3);
+    FAST_INIT_IRLS_HUBER_DELTA = readOr("fast_init.irls.huber_delta", 1.5e-2);
+    FAST_INIT_REG_LAMBDA_A = readOr("fast_init.reg.lambda_a", 1e-2);
+    FAST_INIT_REG_LAMBDA_B = readOr("fast_init.reg.lambda_b", 1e-2);
+    FAST_INIT_REG_LAMBDA_V = readOr("fast_init.reg.lambda_v", 1e-3);
+    FAST_INIT_EARLY_EXIT_INLIER_RATIO = readOr("fast_init.ransac.early_exit_inlier_ratio", 0.7);
+
+    ROS_INFO("FastInit Params: min_features=%d, min_acc_var=%.3f, ransac[min_meas=%d, max_iter=%d, thr_px=%.4f, min_inliers=%d], svd_min=%.1e, cond_thr=%.1e",
+             FAST_INIT_MIN_FEATURES, FAST_INIT_MIN_ACC_VAR, FAST_INIT_RANSAC_MIN_MEASUREMENTS,
+             FAST_INIT_RANSAC_MAX_ITERATIONS, ransac_residual_thresh_px, FAST_INIT_RANSAC_MIN_INLIERS,
+             FAST_INIT_SVD_MIN_SIGMA, FAST_INIT_COND_THRESHOLD);
+    ROS_INFO("FastInit Depth: inv[%g,%g], z[%g,%g], min_valid=%d",
+             FAST_INIT_DEPTH_INV_MIN, FAST_INIT_DEPTH_INV_MAX, FAST_INIT_DEPTH_Z_MIN, FAST_INIT_DEPTH_Z_MAX,
+             FAST_INIT_MIN_VALID_DEPTH_FEATURES);
+    ROS_INFO("FastInit IRLS: iters=%d, huber=%.3e, reg[a=%.2e, b=%.2e, v=%.2e], early_exit_ratio=%.2f",
+             FAST_INIT_IRLS_ITERS, FAST_INIT_IRLS_HUBER_DELTA, FAST_INIT_REG_LAMBDA_A,
+             FAST_INIT_REG_LAMBDA_B, FAST_INIT_REG_LAMBDA_V, FAST_INIT_EARLY_EXIT_INLIER_RATIO);
+
     fsSettings.release();
 }

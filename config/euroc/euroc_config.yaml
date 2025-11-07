@@ -7,6 +7,27 @@ output_path: "/home/linux/mxm/output/mh05"
 depth_model_path: "/home/linux/mxm/proj/VINS-Mo/src/VINS-Mo/vins_estimator/models/Midas-V2.onnx" # path to depth estimation model
 use_fast_init: 1      # 0: normal initialization; 1: use fast initialization with depth estimation
 
+# fast init parameters (optional; defaults used if omitted)
+fast_init.min_features: 50                 # 最小特征数阈值（初始化前检测）
+fast_init.min_acc_var: 0.15               # IMU加速度方差下限，用于激励检测（无单位）
+fast_init.ransac.min_measurements: 4      # RANSAC最小观测对数量
+fast_init.ransac.max_iterations: 500      # RANSAC最大迭代次数
+fast_init.ransac.residual_thresh_px: 0.01 # RANSAC残差阈值（像素）
+fast_init.ransac.min_inliers: 20          # RANSAC最少内点数
+fast_init.ransac.early_exit_inlier_ratio: 0.6 # 早停：内点比例超过该值即提前退出
+fast_init.svd.min_sigma: 1.0e-8           # SVD最小奇异值阈值（数值稳定性）
+fast_init.cond.threshold: 1.0e6           # 线性系统条件数上限（数值稳定性）
+fast_init.depth.inv_min: 1.0e-6           # 归一化逆深度最小值（有效性检查）
+fast_init.depth.inv_max: 10.0             # 归一化逆深度最大值（有效性检查）
+fast_init.depth.z_min: 0.1                # 有效景深下限（米）
+fast_init.depth.z_max: 50.0               # 有效景深上限（米）
+fast_init.depth.min_valid_features: 10    # 有效深度特征的最少数量
+fast_init.irls.iters: 3                   # IRLS迭代次数
+fast_init.irls.huber_delta: 1.5e-2        # IRLS Huber阈值（像面误差尺度）
+fast_init.reg.lambda_a: 1.0e-2            # 正则：尺度因子a的权重
+fast_init.reg.lambda_b: 5.0e-3            # 正则：深度偏移b的权重
+fast_init.reg.lambda_v: 1.0e-3            # 正则：初始速度v的权重
+
 
 #camera calibration 
 model_type: PINHOLE

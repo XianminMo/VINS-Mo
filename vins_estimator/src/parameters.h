@@ -42,6 +42,27 @@ extern double ROW, COL;
 extern std::string DEPTH_MODEL_PATH;
 extern int USE_FAST_INIT;
 
+// Fast Init configurable parameters (read from YAML with defaults)
+extern int FAST_INIT_MIN_FEATURES;
+extern double FAST_INIT_MIN_ACC_VAR;
+extern int FAST_INIT_RANSAC_MIN_MEASUREMENTS;
+extern int FAST_INIT_RANSAC_MAX_ITERATIONS;
+extern double FAST_INIT_RANSAC_THRESHOLD_SQ;
+extern int FAST_INIT_RANSAC_MIN_INLIERS;
+extern double FAST_INIT_SVD_MIN_SIGMA;
+extern double FAST_INIT_COND_THRESHOLD;
+extern double FAST_INIT_DEPTH_INV_MIN;
+extern double FAST_INIT_DEPTH_INV_MAX;
+extern double FAST_INIT_DEPTH_Z_MIN;
+extern double FAST_INIT_DEPTH_Z_MAX;
+extern int FAST_INIT_MIN_VALID_DEPTH_FEATURES;
+extern int FAST_INIT_IRLS_ITERS;
+extern double FAST_INIT_IRLS_HUBER_DELTA;
+extern double FAST_INIT_REG_LAMBDA_A;
+extern double FAST_INIT_REG_LAMBDA_B;
+extern double FAST_INIT_REG_LAMBDA_V;
+extern double FAST_INIT_EARLY_EXIT_INLIER_RATIO;
+
 
 void readParameters(ros::NodeHandle &n);
 

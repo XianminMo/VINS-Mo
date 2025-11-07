@@ -484,7 +484,6 @@ void Estimator::processImage(const map<int, vector<pair<int, Eigen::Matrix<doubl
       // 1. 特征数门槛：可以比原版更低（原版需要80+，快速初始化可以降至50-60）
       //    因为深度图提供了额外的约束，不依赖大量特征点的三角化
       int feature_count = f_manager.getFeatureCount();
-      const int FAST_INIT_MIN_FEATURES = 50;  // 比原版80更低
       if (feature_count < FAST_INIT_MIN_FEATURES) {
           ROS_WARN_THROTTLE(1.0, "Fast-Init gate: too few features (%d < %d).", 
                            feature_count, FAST_INIT_MIN_FEATURES);
@@ -539,7 +538,6 @@ void Estimator::processImage(const map<int, vector<pair<int, Eigen::Matrix<doubl
       
       // 快速初始化的优势：可以接受更低的IMU激励（原版0.25，这里可以0.15-0.2）
       // 因为深度图提供了尺度约束，对IMU激励的依赖降低
-      const double FAST_INIT_MIN_ACC_VAR = 0.15;  // 比原版0.25更低
       if (acc_var < FAST_INIT_MIN_ACC_VAR) {
           ROS_WARN_THROTTLE(1.0, "Fast-Init gate: insufficient IMU excitation (acc variance: %.4f < %.2f).", 
                            acc_var, FAST_INIT_MIN_ACC_VAR);
@@ -596,6 +594,15 @@ void Estimator::processImage(const map<int, vector<pair<int, Eigen::Matrix<doubl
             }
         }
     }
+
+    // 追加：仅估计陀螺仪零偏并重积分（重力已由 fast-init 求得）
+    solveGyroscopeBias(all_image_frame, Bgs);
+    for (int i = 0; i <= WINDOW_SIZE; i++)
+    {
+        if (pre_integrations[i])
+            pre_integrations[i]->repropagate(Vector3d::Zero(), Bgs[i]);
+    }
+    ROS_INFO("Fast-Init post bias: gyro bias refined and pre-integrations repropagated.");
  }
 
 /**

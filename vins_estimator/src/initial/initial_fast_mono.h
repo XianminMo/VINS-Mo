@@ -14,16 +14,7 @@
 #include "../utility/utility.h"       // skewSymmetric, g2R 等工具函数
 #include "initial_alignment.h"        // 为了 ImageFrame 的定义
 
-/**
- * @brief RANSAC 算法的相关参数
- */
-namespace fast_mono
-{
-    const int RANSAC_MIN_MEASUREMENTS = 4; 
-    const int RANSAC_MAX_ITERATIONS = 500;  // 增加迭代次数，从250改为500
-    const double RANSAC_THRESHOLD_SQ = 0.01 * 0.01; // 从1.0*1.0改为0.01*0.01 (更严格)
-    const int RANSAC_MIN_INLIERS = 20;   // 从10改为20 (需要更多内点，提高鲁棒性)
-} // namespace fast_mono
+// RANSAC 与其它阈值参数改为从全局参数模块读取（见 parameters.h）
 
 
 /**
@@ -47,7 +38,8 @@ public:
      * @param G_gravity_world [out] 如果初始化成功，将被设置为估计出的重力向量 (在 W' 系，即重力对齐系)。
      * @param Ps_out [out] 如果初始化成功，将被填充为窗口内各帧的初始位置 (在 W' 系)。
      * @param Vs_out [out] 如果初始化成功，将被填充为窗口内各帧的初始速度 (在 W' 系)。
-     * @param Rs_out [out] 如果初始化成功，将被填充为窗口内各帧的初始姿态 (从 W' 系到 Body 系的旋转)。
+     * @param Rs_out [out] 如果初始化成功，将被填充为窗口内各帧的初始姿态。
+     *                     约定：存储的是 Body->W' 的旋转（R_wb）。
      * @return true 如果初始化成功，false 如果失败。
      */
     bool initialize(const std::map<double, ImageFrame>& image_frames,
@@ -148,7 +140,7 @@ private:
     * @param d_out [out] 输出的深度值
     * @return true 如果成功获取有效深度值，false 否则
     */
-    static bool getValidDepthFromMap(const cv::Mat& depth_map, int u, int v, double& d_out);
+    static bool getValidDepthFromMap(const cv::Mat& depth_map, double u, double v, double& d_out);
     
     /**
     * @brief 计算复合 IMU 预积分（从第一帧 I0 到当前帧 Ik）

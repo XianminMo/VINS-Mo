@@ -28,3 +28,6 @@ class ImageFrame
 };
 
 bool VisualIMUAlignment(map<double, ImageFrame> &all_image_frame, Vector3d* Bgs, Vector3d &g, VectorXd &x);
+
+// 仅陀螺仪零偏求解（用于快速初始化后的小步校准）
+void solveGyroscopeBias(map<double, ImageFrame> &all_image_frame, Vector3d* Bgs);

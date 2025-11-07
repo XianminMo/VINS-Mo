@@ -67,9 +67,9 @@ bool FastInitializer::initialize(const std::map<double, ImageFrame>& image_frame
              all_observations.size(), num_obs);
     
     // 检查是否有足够的观测来进行 RANSAC
-    if (all_observations.size() < fast_mono::RANSAC_MIN_MEASUREMENTS) {
+    if (all_observations.size() < static_cast<size_t>(FAST_INIT_RANSAC_MIN_MEASUREMENTS)) {
         ROS_WARN("FastInit: Not enough valid observations (%zu < %d) to initialize.", 
-                 all_observations.size(), fast_mono::RANSAC_MIN_MEASUREMENTS);
+                 all_observations.size(), FAST_INIT_RANSAC_MIN_MEASUREMENTS);
         return false;
     }
     
@@ -86,7 +86,9 @@ bool FastInitializer::initialize(const std::map<double, ImageFrame>& image_frame
     // ========================================================================
     // 步骤 3: 解析 RANSAC 解并验证
     // ========================================================================
-    double a = x_best(0);                         // 深度尺度因子
+    // 使用 softplus 重参数化保证 a > 0: a = eps + log(1 + exp(s))，其中 s 为线性解出的尺度
+    const double SOFTPLUS_EPS = 1e-5;
+    double a = SOFTPLUS_EPS + std::log1p(std::exp(x_best(0)));
     double b = x_best(1);                         // 深度偏移
     Eigen::Vector3d v_I0_in_I0 = x_best.segment<3>(2); // 第一帧速度（I0系）
     Eigen::Vector3d g_in_I0 = x_best.segment<3>(5);     // 重力向量（I0系）
@@ -113,7 +115,7 @@ bool FastInitializer::initialize(const std::map<double, ImageFrame>& image_frame
              depth_stats.min_depth, depth_stats.max_depth, depth_stats.mean_depth);
     
     // 验证有效深度特征数量
-    const int MIN_VALID_DEPTH_FEATURES = 10;
+    const int MIN_VALID_DEPTH_FEATURES = FAST_INIT_MIN_VALID_DEPTH_FEATURES;
     if (depth_stats.valid_count < MIN_VALID_DEPTH_FEATURES) {
         ROS_WARN("FastInit: Not enough valid depth features (%d < %d).", 
                  depth_stats.valid_count, MIN_VALID_DEPTH_FEATURES);
@@ -260,7 +262,7 @@ bool FastInitializer::solveRANSAC(const std::vector<ObservationData>& all_observ
 
     // 检查是否有足够的观测数据来进行最小集采样
     // 建议 RANSAC_MIN_MEASUREMENTS 设回 4 或 5
-    const int current_min_measurements = fast_mono::RANSAC_MIN_MEASUREMENTS;
+    const int current_min_measurements = FAST_INIT_RANSAC_MIN_MEASUREMENTS;
     if (num_observations < current_min_measurements) {
         ROS_WARN("RANSAC Error: Not enough observations (%d) available to form a minimal set (%d required).",
                  num_observations, current_min_measurements);
@@ -270,7 +272,7 @@ bool FastInitializer::solveRANSAC(const std::vector<ObservationData>& all_observ
     std::uniform_int_distribution<int> distribution(0, num_observations - 1);
 
     // --- RANSAC 主循环 ---
-    for (int iter = 0; iter < fast_mono::RANSAC_MAX_ITERATIONS; ++iter)
+    for (int iter = 0; iter < FAST_INIT_RANSAC_MAX_ITERATIONS; ++iter)
     {
         // 1. 随机采样最小集
         std::set<int> used_indices;  // 使用set提高查找效率
@@ -311,11 +313,14 @@ bool FastInitializer::solveRANSAC(const std::vector<ObservationData>& all_observ
         if (!build_ok) continue;
 
         // 3. 应用数值预处理 (缩放矩阵 S)
+        Eigen::VectorXd col_scale(8);
+        for (int j = 0; j < 8; ++j) {
+            double s = A_min.col(j).norm() / std::sqrt(static_cast<double>(A_min.rows()));
+            if (s < 1e-8) s = 1.0;
+            col_scale(j) = 1.0 / s;
+        }
         Eigen::Matrix<double, 8, 8> S = Eigen::Matrix<double, 8, 8>::Identity();
-        S(0, 0) = 0.1;   // a: 深度尺度因子，通常在0.01-1范围内，缩放到合理尺度
-        S(1, 1) = 1.0;   // b: 深度偏移，通常较小，保持原尺度
-        S(2, 2) = 10.0; S(3, 3) = 10.0; S(4, 4) = 10.0; // v (m/s)
-        S(5, 5) = 100.0; S(6, 6) = 100.0; S(7, 7) = 100.0; // g (m/s²)
+        for (int j = 0; j < 8; ++j) S(j, j) = col_scale(j);
         Eigen::MatrixXd Am_S = A_min * S;
 
         // 4. 计算 SVD 和条件数
@@ -326,13 +331,13 @@ bool FastInitializer::solveRANSAC(const std::vector<ObservationData>& all_observ
              svd.compute(Am_S, Eigen::ComputeThinU | Eigen::ComputeThinV);
         }
         double cond_num = std::numeric_limits<double>::infinity();
-        const double min_singular_value_threshold = 1e-8;
+        const double min_singular_value_threshold = FAST_INIT_SVD_MIN_SIGMA;
         if (svd.singularValues().size() > 0 && svd.singularValues().minCoeff() > min_singular_value_threshold) {
             cond_num = svd.singularValues().maxCoeff() / svd.singularValues().minCoeff();
         }
 
         // --- 条件数阈值检查 ---
-        const double CONDITION_NUMBER_THRESHOLD = 1e8; // << 需要调整
+        const double CONDITION_NUMBER_THRESHOLD = FAST_INIT_COND_THRESHOLD; // 可配置
         if (cond_num > CONDITION_NUMBER_THRESHOLD || std::isinf(cond_num) || std::isnan(cond_num))
         {
             // if (iter < 20) ROS_WARN("RANSAC Iter %d: Poor condition number (%.2e). Discarding sample.", iter, cond_num);
@@ -354,8 +359,11 @@ bool FastInitializer::solveRANSAC(const std::vector<ObservationData>& all_observ
             continue; // 跳过物理上不可能的解
         }
 
+        // 使用 softplus(a_cand) 做正性检查
+        const double SOFTPLUS_EPS = 1e-5;
         double a_cand = x_candidate(0);
-        if (a_cand < 1e-3 || a_cand > 100.0) {
+        double a_check = SOFTPLUS_EPS + std::log1p(std::exp(a_cand));
+        if (a_check < 1e-3 || a_check > 100.0) {
             continue; // a 必须在合理范围内
         }
 
@@ -374,7 +382,7 @@ bool FastInitializer::solveRANSAC(const std::vector<ObservationData>& all_observ
             if (std::isnan(residual_sq_norm) || std::isinf(residual_sq_norm)) continue;
 
             // 建议 RANSAC_THRESHOLD_SQ 设回较小值，如 0.1*0.1
-            if (residual_sq_norm < fast_mono::RANSAC_THRESHOLD_SQ) {
+            if (residual_sq_norm < FAST_INIT_RANSAC_THRESHOLD_SQ) {
                 current_inlier_indices.push_back(i);
             }
         }
@@ -384,10 +392,10 @@ bool FastInitializer::solveRANSAC(const std::vector<ObservationData>& all_observ
             best_inlier_indices = current_inlier_indices;
             best_x_ransac = x_candidate; // 存储当前这个最好的候选解
             best_condition_number = cond_num;
-            ROS_INFO("RANSAC Iter %d: Found new best model with %zu inliers (Cond Num=%.2e, g_norm=%.3f)",
+            ROS_DEBUG("RANSAC Iter %d: Found new best model with %zu inliers (Cond Num=%.2e, g_norm=%.3f)",
                       iter, best_inlier_indices.size(), best_condition_number, g_norm_cand);
              // (可选) 提前退出
-             // if (best_inlier_indices.size() > num_observations * 0.5) break;
+             if (best_inlier_indices.size() > static_cast<size_t>(num_observations * FAST_INIT_EARLY_EXIT_INLIER_RATIO)) break;
         }
 
     } // --- RANSAC 主循环结束 ---
@@ -395,9 +403,9 @@ bool FastInitializer::solveRANSAC(const std::vector<ObservationData>& all_observ
     ROS_INFO("RANSAC finished. Best model has %zu inliers.", best_inlier_indices.size());
 
     // 10. 检查是否找到足够内点
-    if (best_inlier_indices.size() < fast_mono::RANSAC_MIN_INLIERS) {
+    if (best_inlier_indices.size() < static_cast<size_t>(FAST_INIT_RANSAC_MIN_INLIERS)) {
         ROS_WARN("RANSAC failed: Not enough inliers found (%zu / %d required).",
-                 best_inlier_indices.size(), fast_mono::RANSAC_MIN_INLIERS);
+                 best_inlier_indices.size(), FAST_INIT_RANSAC_MIN_INLIERS);
         return false;
     }
 
@@ -502,11 +510,11 @@ bool FastInitializer::solveLinearSystem(const std::vector<ObservationData>& obse
 
     // 检查 无约束 SVD 是否成功以及条件数
     double cond_num_unconstrained = std::numeric_limits<double>::infinity();
-    const double min_singular_value_threshold = 1e-8;
+    const double min_singular_value_threshold = FAST_INIT_SVD_MIN_SIGMA;
     if (svd_unconstrained.singularValues().size() > 0 && svd_unconstrained.singularValues().minCoeff() > min_singular_value_threshold) {
         cond_num_unconstrained = svd_unconstrained.singularValues().maxCoeff() / svd_unconstrained.singularValues().minCoeff();
     }
-    ROS_INFO("solveLinearSystem (Unconstrained): Condition number = %.2e", cond_num_unconstrained);
+    ROS_DEBUG("solveLinearSystem (Unconstrained): Condition number = %.2e", cond_num_unconstrained);
 
 
     Eigen::Matrix<double, 8, 1> x_scaled_svd = svd_unconstrained.solve(b);
@@ -561,11 +569,11 @@ bool FastInitializer::solveLinearSystem(const std::vector<ObservationData>& obse
     Eigen::MatrixXd Ay_Sy = A_y * S_y;
 
     // 7. IRLS 参数（Huber）与正则（Tikhonov），可配置
-    const int irls_iters = 3;
-    const double huber_delta = 1.5e-2; // 和像平面噪声量级匹配
-    const double lambda_a = 1e-2;
-    const double lambda_b = 5e-3;      // 稍强，抑制 b 漂移
-    const double lambda_v = 1e-3;
+    const int irls_iters = FAST_INIT_IRLS_ITERS;
+    const double huber_delta = FAST_INIT_IRLS_HUBER_DELTA; // 和像平面噪声量级匹配
+    const double lambda_a = FAST_INIT_REG_LAMBDA_A;
+    const double lambda_b = FAST_INIT_REG_LAMBDA_B;      // 稍强，抑制 b 漂移
+    const double lambda_v = FAST_INIT_REG_LAMBDA_V;
 
     // 初始化 y（用一次最小二乘作为初值）
     Eigen::MatrixXd H0 = Ay_Sy.transpose() * Ay_Sy;
@@ -601,13 +609,16 @@ bool FastInitializer::solveLinearSystem(const std::vector<ObservationData>& obse
 
     // 恢复原尺度并组装解
     Eigen::Matrix<double,5,1> y = S_y * y_scaled; // 这里 S_y 是 1/scale，对应逆回来
+    // 组装解并对 a 应用 softplus 保证正性
     x_out.head<5>() = y;
+    const double SOFTPLUS_EPS = 1e-5;
+    x_out(0) = SOFTPLUS_EPS + std::log1p(std::exp(x_out(0)));
     x_out.tail<3>() = g_normed;
 
     // 记录加权系统的近似条件数
     Eigen::JacobiSVD<Eigen::MatrixXd> svd_w(Ay_Sy, Eigen::ComputeThinU | Eigen::ComputeThinV);
     double cond_w = svd_w.singularValues()(0) / svd_w.singularValues().tail(1)(0);
-    ROS_INFO("solveLinearSystem (Constrained+IRLS): approx cond = %.2e", cond_w);
+    ROS_DEBUG("solveLinearSystem (Constrained+IRLS): approx cond = %.2e", cond_w);
 
     ROS_INFO("solveLinearSystem finished successfully.");
     return true;
@@ -616,8 +627,8 @@ bool FastInitializer::solveLinearSystem(const std::vector<ObservationData>& obse
 
 bool FastInitializer::isValidDepth(double d_hat_inv)
 {
-    // 深度值必须：有限、大于0、在合理范围内（归一化逆深度通常为[1,2]）
-    return std::isfinite(d_hat_inv) && d_hat_inv > 0.0 && d_hat_inv <= 10.0;
+    // 深度值必须：有限、在合理范围内
+    return std::isfinite(d_hat_inv) && d_hat_inv > FAST_INIT_DEPTH_INV_MIN && d_hat_inv <= FAST_INIT_DEPTH_INV_MAX;
 }
 
 bool FastInitializer::isValidPixelCoord(int u, int v, int rows, int cols)
@@ -631,7 +642,7 @@ bool FastInitializer::isValidNormalizedCoord(const Eigen::Vector3d& z)
     return z.allFinite() && z.z() > 1e-6;
 }
 
-bool FastInitializer::getValidDepthFromMap(const cv::Mat& depth_map, int u, int v, double& d_out)
+bool FastInitializer::getValidDepthFromMap(const cv::Mat& depth_map, double u, double v, double& d_out)
 {
     if (!isValidPixelCoord(u, v, depth_map.rows, depth_map.cols)) {
         return false;
@@ -650,7 +661,7 @@ bool FastInitializer::getValidDepthFromMap(const cv::Mat& depth_map, int u, int 
     float d10 = depth_map.at<float>(v1, u0);
     float d11 = depth_map.at<float>(v1, u1);
 
-    auto valid = [](float x){ return std::isfinite(x) && x > 0.f && x <= 10.f; };
+    auto valid = [](float x){ return std::isfinite(x) && x > static_cast<float>(FAST_INIT_DEPTH_INV_MIN) && x <= static_cast<float>(FAST_INIT_DEPTH_INV_MAX); };
     if (!valid(d00) || !valid(d01) || !valid(d10) || !valid(d11)) return false;
 
     double d0 = d00 * (1.0 - du) + d01 * du;
@@ -743,8 +754,8 @@ int FastInitializer::collectValidObservations(
         }
         
         // 获取深度值
-        int u = static_cast<int>(std::round(obs_frame_0.uv.x()));
-        int v = static_cast<int>(std::round(obs_frame_0.uv.y()));
+        double u = obs_frame_0.uv.x();
+        double v = obs_frame_0.uv.y();
         double d_hat_i_inv;
         if (!getValidDepthFromMap(depth_map, u, v, d_hat_i_inv)) {
             continue;
@@ -848,7 +859,7 @@ bool FastInitializer::computeDepthStatistics(
         stats_out.max_depth = std::max(stats_out.max_depth, z);
         
         // 统计有效深度（在合理范围内：0.1 ~ 50 米）
-        if (z > 0.1 && z < 50.0) {
+        if (z > FAST_INIT_DEPTH_Z_MIN && z < FAST_INIT_DEPTH_Z_MAX) {
             stats_out.valid_count++;
         }
     }
@@ -872,7 +883,7 @@ bool FastInitializer::computeDepthStatistics(
         }
         
         double z = a * (1.0 / d_hat_inv) + b;
-        if (z > 0.1 && z < 50.0) {
+        if (z > FAST_INIT_DEPTH_Z_MIN && z < FAST_INIT_DEPTH_Z_MAX) {
             z_sum += z;
             valid_sum_count++;
         }
