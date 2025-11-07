@@ -351,6 +351,10 @@ void Estimator::processImage(const map<int, vector<pair<int, Eigen::Matrix<doubl
             // --- 统一处理初始化结果 ---
             if(is_init_success)
             {
+                // 打印初始化刚完成时对应图像时间戳（用于对齐真值）
+                double init_ts = header.stamp.toSec();
+                ROS_INFO("Init completed at stamp: %.9f s", init_ts);
+
                 solver_flag = NON_LINEAR; // 切换到非线性优化模式
                 solveOdometry();          // 立即进行一次后端优化
                 slideWindow();            // 滑动窗口
@@ -1123,7 +1127,10 @@ void Estimator::double2vector()
         double drift_correct_yaw;
         drift_correct_yaw = Utility::R2ypr(prev_relo_r).x() - Utility::R2ypr(relo_r).x();
         drift_correct_r = Utility::ypr2R(Vector3d(drift_correct_yaw, 0, 0));
-        drift_correct_t = prev_relo_t - drift_correct_r * relo_t;   
+        drift_correct_t = prev_relo_t - drift_correct_r * relo_t;  
+        ROS_WARN("Drift updated: |t|=%.4f m, yaw=%.3f deg",
+            drift_correct_t.norm(),
+            Utility::R2ypr(drift_correct_r).x()); 
         
         // 计算重定位帧与当前帧的相对位姿
         relo_relative_t = relo_r.transpose() * (Ps[relo_frame_local_index] - relo_t);
@@ -1720,7 +1727,8 @@ void Estimator::setReloFrame(double _frame_stamp, int _frame_index, vector<Vecto
     // 在当前滑动窗口中查找重定位帧
     for(int i = 0; i < WINDOW_SIZE; i++)
     {
-        if(relo_frame_stamp == Headers[i].stamp.toSec())
+        const double RELO_TIME_TOL = 0.01; // 10ms
+        if (std::fabs(relo_frame_stamp - Headers[i].stamp.toSec()) < RELO_TIME_TOL)
         {
             relo_frame_local_index = i; // 找到它在滑动窗口中的局部索引
             relocalization_info = 1;    // 设置标志，以便在下一次优化中加入闭环约束

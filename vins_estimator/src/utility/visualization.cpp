@@ -153,6 +153,22 @@ void pubOdometry(const Estimator &estimator, const std_msgs::Header &header)
         relo_path.poses.push_back(pose_stamped);
         pub_relo_path.publish(relo_path);
 
+        // periodic drift logging to verify loop-closure correction is applied
+        {
+            static int drift_log_count = 0;
+            drift_log_count++;
+            if (drift_log_count % 30 == 0)
+            {
+                Eigen::Quaterniond q_drift(estimator.drift_correct_r);
+                double qw = std::max(-1.0, std::min(1.0, (double)q_drift.w()));
+                double angle_rad = 2.0 * std::acos(qw);
+                double angle_deg = angle_rad * 57.29577951308232; // 180/pi
+                double t_norm = estimator.drift_correct_t.norm();
+                ROS_DEBUG("drift |t|=%.4f m, angle=%.3f deg, path(open=%zu, closed=%zu)",
+                         t_norm, angle_deg, path.poses.size(), relo_path.poses.size());
+            }
+        }
+
         // write result to CSV (legacy)
         ofstream foutC(VINS_RESULT_PATH, ios::app);
         foutC.setf(ios::fixed, ios::floatfield);
@@ -171,27 +187,62 @@ void pubOdometry(const Estimator &estimator, const std_msgs::Header &header)
               << estimator.Vs[WINDOW_SIZE].z() << "," << endl;
         foutC.close();
 
-        // write full corrected trajectory to TUM format: timestamp_s tx ty tz qx qy qz qw
-        // overwrite file each time to keep only the latest complete trajectory
-        ofstream foutT(VINS_TUM_RESULT_PATH, ios::out);
-        foutT.setf(ios::fixed, ios::floatfield);
-        for (size_t i = 0; i < relo_path.poses.size(); ++i)
+        // write full open-loop trajectory (uncorrected path) to TUM, overwrite with latest complete
         {
-            const geometry_msgs::PoseStamped &ps = relo_path.poses[i];
-            double ts = ps.header.stamp.toSec();
-            const geometry_msgs::Pose &pp = ps.pose;
-            foutT.precision(9);
-            foutT << ts << " ";
-            foutT.precision(6);
-            foutT << pp.position.x << " "
-                  << pp.position.y << " "
-                  << pp.position.z << " "
-                  << pp.orientation.x << " "
-                  << pp.orientation.y << " "
-                  << pp.orientation.z << " "
-                  << pp.orientation.w << "\n";
+            ofstream fout_open(VINS_TUM_OPEN_PATH, ios::out);
+            fout_open.setf(ios::fixed, ios::floatfield);
+            for (size_t i = 0; i < path.poses.size(); ++i)
+            {
+                const geometry_msgs::PoseStamped &ps = path.poses[i];
+                double ts = ps.header.stamp.toSec();
+                const geometry_msgs::Pose &pp = ps.pose;
+                fout_open.precision(9);
+                fout_open << ts << " ";
+                fout_open.precision(6);
+                fout_open << pp.position.x << " "
+                          << pp.position.y << " "
+                          << pp.position.z << " "
+                          << pp.orientation.x << " "
+                          << pp.orientation.y << " "
+                          << pp.orientation.z << " "
+                          << pp.orientation.w << "\n";
+            }
+            fout_open.close();
         }
-        foutT.close();
+
+        // write full closed-loop trajectory (corrected relo_path) to TUM, overwrite with latest complete
+        {
+            ofstream fout_closed(VINS_TUM_CLOSED_PATH, ios::out);
+            fout_closed.setf(ios::fixed, ios::floatfield);
+        
+            Eigen::Quaterniond q_drift(estimator.drift_correct_r);
+            for (size_t i = 0; i < path.poses.size(); ++i)
+            {
+                const geometry_msgs::PoseStamped &ps = path.poses[i];
+                const geometry_msgs::Pose &pp = ps.pose;
+        
+                // 原始开环位姿
+                Eigen::Vector3d p(pp.position.x, pp.position.y, pp.position.z);
+                Eigen::Quaterniond q(pp.orientation.w, pp.orientation.x, pp.orientation.y, pp.orientation.z);
+        
+                // 应用当前 drift 做全局一致校正
+                Eigen::Vector3d p_corr = estimator.drift_correct_r * p + estimator.drift_correct_t;
+                Eigen::Quaterniond q_corr = q_drift * q;
+        
+                // 写 TUM：timestamp_s tx ty tz qx qy qz qw
+                fout_closed.precision(9);
+                fout_closed << ps.header.stamp.toSec() << " ";
+                fout_closed.precision(6);
+                fout_closed << p_corr.x() << " "
+                            << p_corr.y() << " "
+                            << p_corr.z() << " "
+                            << q_corr.x() << " "
+                            << q_corr.y() << " "
+                            << q_corr.z() << " "
+                            << q_corr.w() << "\n";
+            }
+            fout_closed.close();
+        }
     }
 }
 

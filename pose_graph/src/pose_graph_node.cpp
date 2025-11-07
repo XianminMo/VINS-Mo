@@ -504,12 +504,7 @@ int main(int argc, char **argv)
         VISUALIZE_IMU_FORWARD = fsSettings["visualize_imu_forward"];
         LOAD_PREVIOUS_POSE_GRAPH = fsSettings["load_previous_pose_graph"];
         FAST_RELOCALIZATION = fsSettings["fast_relocalization"];
-        VINS_RESULT_PATH = VINS_RESULT_PATH + "/vins_result_loop.csv";
-        VINS_TUM_RESULT_PATH = VINS_RESULT_PATH.substr(0, VINS_RESULT_PATH.find_last_of('/')) + "/vins_result_loop.tum";
-        std::ofstream fout(VINS_RESULT_PATH, std::ios::out);
-        fout.close();
-        std::ofstream fout_tum(VINS_TUM_RESULT_PATH, std::ios::out);
-        fout_tum.close();
+        // 不再在pose_graph中创建/写入闭环关键帧轨迹文件，统一由vins_estimator输出逐帧开/闭环TUM
         fsSettings.release();
 
         if (LOAD_PREVIOUS_POSE_GRAPH)

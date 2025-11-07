@@ -9,7 +9,7 @@
 #include <fstream>
 
 const double FOCAL_LENGTH = 460.0;
-const int WINDOW_SIZE = 20;
+const int WINDOW_SIZE = 10;
 const int NUM_OF_CAM = 1;
 const int NUM_OF_F = 1000;
 //#define UNIT_SPHERE_ERROR
@@ -31,7 +31,8 @@ extern double SOLVER_TIME;
 extern int NUM_ITERATIONS;
 extern std::string EX_CALIB_RESULT_PATH;
 extern std::string VINS_RESULT_PATH;
-extern std::string VINS_TUM_RESULT_PATH;
+extern std::string VINS_TUM_OPEN_PATH;
+extern std::string VINS_TUM_CLOSED_PATH;
 extern std::string IMU_TOPIC;
 extern std::string IMAGE_TOPIC; // <-- 新增
 extern double TD;

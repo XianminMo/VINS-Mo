@@ -19,7 +19,8 @@ int ESTIMATE_TD;
 int ROLLING_SHUTTER;
 std::string EX_CALIB_RESULT_PATH;
 std::string VINS_RESULT_PATH;
-std::string VINS_TUM_RESULT_PATH;
+std::string VINS_TUM_OPEN_PATH;
+std::string VINS_TUM_CLOSED_PATH;
 std::string IMU_TOPIC;
 std::string IMAGE_TOPIC; // <-- 新增
 double ROW, COL;
@@ -85,7 +86,8 @@ void readParameters(ros::NodeHandle &n)
     std::string OUTPUT_PATH;
     fsSettings["output_path"] >> OUTPUT_PATH;
     VINS_RESULT_PATH = OUTPUT_PATH + "/vins_result_no_loop.csv";
-    VINS_TUM_RESULT_PATH = OUTPUT_PATH + "/vins_result_no_loop.tum";
+    VINS_TUM_OPEN_PATH = OUTPUT_PATH + "/vins_open_loop.tum";
+    VINS_TUM_CLOSED_PATH = OUTPUT_PATH + "/vins_closed_loop.tum";
     std::cout << "result path " << VINS_RESULT_PATH << std::endl;
 
     // create folder if not exists
@@ -93,8 +95,10 @@ void readParameters(ros::NodeHandle &n)
 
     std::ofstream fout(VINS_RESULT_PATH, std::ios::out);
     fout.close();
-    std::ofstream fout_tum(VINS_TUM_RESULT_PATH, std::ios::out);
-    fout_tum.close();
+    std::ofstream fout_tum_open(VINS_TUM_OPEN_PATH, std::ios::out);
+    fout_tum_open.close();
+    std::ofstream fout_tum_closed(VINS_TUM_CLOSED_PATH, std::ios::out);
+    fout_tum_closed.close();
 
     ACC_N = fsSettings["acc_n"];
     ACC_W = fsSettings["acc_w"];

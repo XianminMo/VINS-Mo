@@ -4,7 +4,11 @@
 imu_topic: "/imu0"
 image_topic: "/cam0/image_raw"
 # output_path: "/home/linux/mxm/output/mh05/deep"
-output_path: "/home/linux/mxm/output/mh05/original"
+output_path: "/home/linux/mxm/output/mh05"
+
+# output_path: "/home/linux/mxm/output/mh01/deep"
+# output_path: "/home/linux/mxm/output/mh01/original"
+
 depth_model_path: "/home/linux/mxm/proj/VINS-Mo/src/VINS-Mo/vins_estimator/models/Midas-V2.onnx" # path to depth estimation model
 use_fast_init: 0      # 0: normal initialization; 1: use fast initialization with depth estimation
 
@@ -90,7 +94,7 @@ g_norm: 9.81007     # gravity magnitude
 #loop closure parameters
 loop_closure: 1                    # start loop closure
 load_previous_pose_graph: 0        # load and reuse previous pose graph; load from 'pose_graph_save_path'
-fast_relocalization: 0             # useful in real-time and large project
+fast_relocalization: 1             # useful in real-time and large project
 pose_graph_save_path: "/home/linux/mxm/output/pose_graph/" # save and load path
 
 #unsynchronization parameters
