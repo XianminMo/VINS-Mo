@@ -529,12 +529,16 @@ bool FastInitializer::solveLinearSystem(const std::vector<ObservationData>& obse
     double g_norm_svd = g_svd.norm();
     double a_svd = x_svd(0);
 
+    const double SOFTPLUS_EPS = 1e-5;
+    auto softplus = [&](double s){ return SOFTPLUS_EPS + std::log1p(std::exp(s)); };
+    double a_hat = softplus(a_svd);
+
     // 检查无约束解的有效性
-    if (g_norm_svd < 1.0 || a_svd < 1e-3) { 
+    if (g_norm_svd < 1.0 || a_hat < 1e-3) { 
         ROS_WARN("solveLinearSystem Warning: Unconstrained solve resulted in invalid values (g_norm=%.3f, a=%.6f).", 
-                 g_norm_svd, a_svd);
+                 g_norm_svd, a_hat);
         // 如果无约束解已经不合理，直接返回失败
-        if (a_svd < 1e-3) {
+        if (a_hat < 1e-3) {
             ROS_ERROR("solveLinearSystem Error: Unconstrained solution has invalid a=%.6f. Failed.", a_svd);
             return false;
         }
@@ -611,7 +615,6 @@ bool FastInitializer::solveLinearSystem(const std::vector<ObservationData>& obse
     Eigen::Matrix<double,5,1> y = S_y * y_scaled; // 这里 S_y 是 1/scale，对应逆回来
     // 组装解并对 a 应用 softplus 保证正性
     x_out.head<5>() = y;
-    const double SOFTPLUS_EPS = 1e-5;
     x_out(0) = SOFTPLUS_EPS + std::log1p(std::exp(x_out(0)));
     x_out.tail<3>() = g_normed;
 

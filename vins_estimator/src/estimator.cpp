@@ -588,9 +588,12 @@ void Estimator::processImage(const map<int, vector<pair<int, Eigen::Matrix<doubl
             Rs[k] = Rs_init.at(k).toRotationMatrix(); // Quaterniond -> Matrix3d
             
             // 将所有初始化的帧标记为关键帧
-            double timestamp = Headers[k].stamp.toSec();
-            if (all_image_frame.count(timestamp)) {
-                all_image_frame[timestamp].is_key_frame = true;
+            double ts = Headers[k].stamp.toSec();
+            auto it = all_image_frame.find(ts);
+            if (it != all_image_frame.end()) {
+                it->second.R = Rs[k];      // 同步旋转
+                it->second.T = Ps[k];      // 同步平移
+                it->second.is_key_frame = true;
             }
         }
     }
