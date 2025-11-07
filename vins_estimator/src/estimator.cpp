@@ -1265,83 +1265,83 @@ void Estimator::optimization()
     
     // c. 添加视觉重投影约束
     int f_m_cnt = 0;
-int feature_index = -1;
-for (auto &it_per_id : f_manager.feature)
-{
-    it_per_id.used_num = it_per_id.feature_per_frame.size();
-    if (!(it_per_id.used_num >= 2 && it_per_id.start_frame < WINDOW_SIZE - 2))
-        continue;
- 
-    ++feature_index;
-    
-    int imu_i = it_per_id.start_frame;
-    Vector3d pts_i = it_per_id.feature_per_frame[0].point;
-    
-    // 方案1：第一帧作为参考，与其他所有帧建立约束（保证全局一致性）
-    for (int idx = 1; idx < it_per_id.feature_per_frame.size(); idx++)
+    int feature_index = -1;
+    for (auto &it_per_id : f_manager.feature)
     {
-        int imu_j = it_per_id.start_frame + idx;
-        Vector3d pts_j = it_per_id.feature_per_frame[idx].point;
-        
-        if (ESTIMATE_TD)
-        {
-            ProjectionTdFactor *f_td = new ProjectionTdFactor(
-                pts_i, pts_j, 
-                it_per_id.feature_per_frame[0].velocity, 
-                it_per_id.feature_per_frame[idx].velocity,
-                it_per_id.feature_per_frame[0].cur_td, 
-                it_per_id.feature_per_frame[idx].cur_td,
-                it_per_id.feature_per_frame[0].uv.y(), 
-                it_per_id.feature_per_frame[idx].uv.y());
-            problem.AddResidualBlock(f_td, loss_function, 
-                para_Pose[imu_i], para_Pose[imu_j], 
-                para_Ex_Pose[0], para_Feature[feature_index], para_Td[0]);
-        }
-        else
-        {
-            ProjectionFactor *f = new ProjectionFactor(pts_i, pts_j);
-            problem.AddResidualBlock(f, loss_function, 
-                para_Pose[imu_i], para_Pose[imu_j], 
-                para_Ex_Pose[0], para_Feature[feature_index]);
-        }
-        f_m_cnt++;
-    }
+        it_per_id.used_num = it_per_id.feature_per_frame.size();
+        if (!(it_per_id.used_num >= 2 && it_per_id.start_frame < WINDOW_SIZE - 2))
+            continue;
     
-    // 方案2：相邻帧对之间建立约束（提高局部精度）
-    for (int idx = 0; idx < it_per_id.feature_per_frame.size() - 1; idx++)
-    {
-        int imu_i_adj = it_per_id.start_frame + idx;
-        int imu_j_adj = it_per_id.start_frame + idx + 1;
-        Vector3d pts_i_adj = it_per_id.feature_per_frame[idx].point;
-        Vector3d pts_j_adj = it_per_id.feature_per_frame[idx + 1].point;
+        ++feature_index;
         
-        // 跳过第一帧参考的约束（避免重复）
-        if (idx == 0) continue;  // 因为 (0,1) 已经在方案1中建立了
+        int imu_i = it_per_id.start_frame;
+        Vector3d pts_i = it_per_id.feature_per_frame[0].point;
         
-        if (ESTIMATE_TD)
+        // 方案1：第一帧作为参考，与其他所有帧建立约束（保证全局一致性）
+        for (int idx = 1; idx < it_per_id.feature_per_frame.size(); idx++)
         {
-            ProjectionTdFactor *f_td = new ProjectionTdFactor(
-                pts_i_adj, pts_j_adj, 
-                it_per_id.feature_per_frame[idx].velocity, 
-                it_per_id.feature_per_frame[idx + 1].velocity,
-                it_per_id.feature_per_frame[idx].cur_td, 
-                it_per_id.feature_per_frame[idx + 1].cur_td,
-                it_per_id.feature_per_frame[idx].uv.y(), 
-                it_per_id.feature_per_frame[idx + 1].uv.y());
-            problem.AddResidualBlock(f_td, loss_function, 
-                para_Pose[imu_i_adj], para_Pose[imu_j_adj], 
-                para_Ex_Pose[0], para_Feature[feature_index], para_Td[0]);
+            int imu_j = it_per_id.start_frame + idx;
+            Vector3d pts_j = it_per_id.feature_per_frame[idx].point;
+            
+            if (ESTIMATE_TD)
+            {
+                ProjectionTdFactor *f_td = new ProjectionTdFactor(
+                    pts_i, pts_j, 
+                    it_per_id.feature_per_frame[0].velocity, 
+                    it_per_id.feature_per_frame[idx].velocity,
+                    it_per_id.feature_per_frame[0].cur_td, 
+                    it_per_id.feature_per_frame[idx].cur_td,
+                    it_per_id.feature_per_frame[0].uv.y(), 
+                    it_per_id.feature_per_frame[idx].uv.y());
+                problem.AddResidualBlock(f_td, loss_function, 
+                    para_Pose[imu_i], para_Pose[imu_j], 
+                    para_Ex_Pose[0], para_Feature[feature_index], para_Td[0]);
+            }
+            else
+            {
+                ProjectionFactor *f = new ProjectionFactor(pts_i, pts_j);
+                problem.AddResidualBlock(f, loss_function, 
+                    para_Pose[imu_i], para_Pose[imu_j], 
+                    para_Ex_Pose[0], para_Feature[feature_index]);
+            }
+            f_m_cnt++;
         }
-        else
+        
+        // 方案2：相邻帧对之间建立约束（提高局部精度）
+        for (int idx = 0; idx < it_per_id.feature_per_frame.size() - 1; idx++)
         {
-            ProjectionFactor *f = new ProjectionFactor(pts_i_adj, pts_j_adj);
-            problem.AddResidualBlock(f, loss_function, 
-                para_Pose[imu_i_adj], para_Pose[imu_j_adj], 
-                para_Ex_Pose[0], para_Feature[feature_index]);
+            int imu_i_adj = it_per_id.start_frame + idx;
+            int imu_j_adj = it_per_id.start_frame + idx + 1;
+            Vector3d pts_i_adj = it_per_id.feature_per_frame[idx].point;
+            Vector3d pts_j_adj = it_per_id.feature_per_frame[idx + 1].point;
+            
+            // 跳过第一帧参考的约束（避免重复）
+            if (idx == 0) continue;  // 因为 (0,1) 已经在方案1中建立了
+            
+            if (ESTIMATE_TD)
+            {
+                ProjectionTdFactor *f_td = new ProjectionTdFactor(
+                    pts_i_adj, pts_j_adj, 
+                    it_per_id.feature_per_frame[idx].velocity, 
+                    it_per_id.feature_per_frame[idx + 1].velocity,
+                    it_per_id.feature_per_frame[idx].cur_td, 
+                    it_per_id.feature_per_frame[idx + 1].cur_td,
+                    it_per_id.feature_per_frame[idx].uv.y(), 
+                    it_per_id.feature_per_frame[idx + 1].uv.y());
+                problem.AddResidualBlock(f_td, loss_function, 
+                    para_Pose[imu_i_adj], para_Pose[imu_j_adj], 
+                    para_Ex_Pose[0], para_Feature[feature_index], para_Td[0]);
+            }
+            else
+            {
+                ProjectionFactor *f = new ProjectionFactor(pts_i_adj, pts_j_adj);
+                problem.AddResidualBlock(f, loss_function, 
+                    para_Pose[imu_i_adj], para_Pose[imu_j_adj], 
+                    para_Ex_Pose[0], para_Feature[feature_index]);
+            }
+            f_m_cnt++;
         }
-        f_m_cnt++;
     }
-}
 
     ROS_DEBUG("visual measurement count: %d", f_m_cnt);
     ROS_DEBUG("prepare for ceres: %f", t_prepare.toc());
