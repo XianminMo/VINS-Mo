@@ -31,6 +31,7 @@ extern double SOLVER_TIME;
 extern int NUM_ITERATIONS;
 extern std::string EX_CALIB_RESULT_PATH;
 extern std::string VINS_RESULT_PATH;
+extern std::string VINS_TUM_RESULT_PATH;
 extern std::string IMU_TOPIC;
 extern std::string IMAGE_TOPIC; // <-- 新增
 extern double TD;

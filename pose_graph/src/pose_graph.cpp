@@ -641,6 +641,21 @@ void PoseGraph::updatePath()
                   << Q.z() << ","
                   << endl;
             loop_path_file.close();
+
+            // TUM format: timestamp_s tx ty tz qx qy qz qw
+            ofstream loop_path_tum(VINS_TUM_RESULT_PATH, ios::app);
+            loop_path_tum.setf(ios::fixed, ios::floatfield);
+            loop_path_tum.precision(9);
+            loop_path_tum << (*it)->time_stamp << " ";
+            loop_path_tum.precision(6);
+            loop_path_tum << P.x() << " "
+                          << P.y() << " "
+                          << P.z() << " "
+                          << Q.x() << " "
+                          << Q.y() << " "
+                          << Q.z() << " "
+                          << Q.w() << "\n";
+            loop_path_tum.close();
         }
         //draw local connection
         if (SHOW_S_EDGE)

@@ -310,11 +310,10 @@ void Estimator::processImage(const map<int, vector<pair<int, Eigen::Matrix<doubl
                         std::map<int, Eigen::Quaterniond> Rs_init;
                         
                         if (performFastInitialization(Ps_init, Vs_init, Rs_init)) {
-                            ROS_INFO("Fast Monocular Init Succeeded! (%.2f ms, rotation: %.3f rad)", 
-                                    t_fast_init.toc(), rot_sum);
-                            
                             // 步骤 4: 更新估计器状态
                             updateEstimatorStateFromFastInit(Ps_init, Vs_init, Rs_init);
+                            ROS_INFO("Fast Monocular Init Succeeded! (%.2f ms, rotation: %.3f rad)", 
+                                t_fast_init.toc(), rot_sum);
                             is_init_success = true;
                         }
                         else {
@@ -585,27 +584,52 @@ void Estimator::processImage(const map<int, vector<pair<int, Eigen::Matrix<doubl
         if (Ps_init.count(k) && Vs_init.count(k) && Rs_init.count(k)) {
             Ps[k] = Ps_init.at(k);
             Vs[k] = Vs_init.at(k);
-            Rs[k] = Rs_init.at(k).toRotationMatrix(); // Quaterniond -> Matrix3d
-            
-            // 将所有初始化的帧标记为关键帧
+            Rs[k] = Rs_init.at(k).toRotationMatrix();
+    
             double ts = Headers[k].stamp.toSec();
             auto it = all_image_frame.find(ts);
             if (it != all_image_frame.end()) {
-                it->second.R = Rs[k];      // 同步旋转
-                it->second.T = Ps[k];      // 同步平移
+                it->second.R = Rs[k];
+                it->second.T = Ps[k];
                 it->second.is_key_frame = true;
+            } else {
+                // 最近邻回退，容忍小的时间误差
+                const double tol = 1e-3; // 秒，按你的时间戳精度可调
+                auto it2 = all_image_frame.lower_bound(ts);
+                auto choose = it2;
+                if (it2 != all_image_frame.begin()) {
+                    auto it_prev = std::prev(it2);
+                    if (it2 == all_image_frame.end() ||
+                        std::abs(it_prev->first - ts) < std::abs(it2->first - ts)) {
+                        choose = it_prev;
+                    }
+                }
+                if (choose != all_image_frame.end() && std::abs(choose->first - ts) < tol) {
+                    choose->second.R = Rs[k];
+                    choose->second.T = Ps[k];
+                    choose->second.is_key_frame = true;
+                } else {
+                    ROS_WARN_STREAM("Fast-Init: cannot sync pose to all_image_frame at ts=" << std::fixed << ts);
+                }
             }
         }
     }
 
-    // 追加：仅估计陀螺仪零偏并重积分（重力已由 fast-init 求得）
-    solveGyroscopeBias(all_image_frame, Bgs);
-    for (int i = 0; i <= WINDOW_SIZE; i++)
+    // 追加：仅估计陀螺仪零偏并在成功时重积分（重力已由 fast-init 求得）
+    bool bias_updated = solveGyroscopeBias(all_image_frame, Bgs);
+    if (bias_updated)
     {
-        if (pre_integrations[i])
-            pre_integrations[i]->repropagate(Vector3d::Zero(), Bgs[i]);
+        for (int i = 0; i <= WINDOW_SIZE; i++)
+        {
+            if (pre_integrations[i])
+                pre_integrations[i]->repropagate(Vector3d::Zero(), Bgs[i]);
+        }
+        ROS_INFO("Fast-Init post bias: gyro bias refined and pre-integrations repropagated.");
     }
-    ROS_INFO("Fast-Init post bias: gyro bias refined and pre-integrations repropagated.");
+    else
+    {
+        ROS_INFO("Fast-Init post bias: skipped (no valid bias update).");
+    }
  }
 
 /**

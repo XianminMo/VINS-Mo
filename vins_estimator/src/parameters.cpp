@@ -19,6 +19,7 @@ int ESTIMATE_TD;
 int ROLLING_SHUTTER;
 std::string EX_CALIB_RESULT_PATH;
 std::string VINS_RESULT_PATH;
+std::string VINS_TUM_RESULT_PATH;
 std::string IMU_TOPIC;
 std::string IMAGE_TOPIC; // <-- 新增
 double ROW, COL;
@@ -84,6 +85,7 @@ void readParameters(ros::NodeHandle &n)
     std::string OUTPUT_PATH;
     fsSettings["output_path"] >> OUTPUT_PATH;
     VINS_RESULT_PATH = OUTPUT_PATH + "/vins_result_no_loop.csv";
+    VINS_TUM_RESULT_PATH = OUTPUT_PATH + "/vins_result_no_loop.tum";
     std::cout << "result path " << VINS_RESULT_PATH << std::endl;
 
     // create folder if not exists
@@ -91,6 +93,8 @@ void readParameters(ros::NodeHandle &n)
 
     std::ofstream fout(VINS_RESULT_PATH, std::ios::out);
     fout.close();
+    std::ofstream fout_tum(VINS_TUM_RESULT_PATH, std::ios::out);
+    fout_tum.close();
 
     ACC_N = fsSettings["acc_n"];
     ACC_W = fsSettings["acc_w"];
@@ -198,9 +202,9 @@ void readParameters(ros::NodeHandle &n)
 
     // Load Fast Init parameters with sensible defaults
     FAST_INIT_MIN_FEATURES = readOr("fast_init.min_features", 50);
-    FAST_INIT_MIN_ACC_VAR = readOr("fast_init.min_acc_var", 0.15);
-    FAST_INIT_RANSAC_MIN_MEASUREMENTS = readOr("fast_init.ransac.min_measurements", 4);
-    FAST_INIT_RANSAC_MAX_ITERATIONS = readOr("fast_init.ransac.max_iterations", 500);
+    FAST_INIT_MIN_ACC_VAR = readOr("fast_init.min_acc_var", 0.2);
+    FAST_INIT_RANSAC_MIN_MEASUREMENTS = readOr("fast_init.ransac.min_measurements", 6);
+    FAST_INIT_RANSAC_MAX_ITERATIONS = readOr("fast_init.ransac.max_iterations", 250);
     // residual threshold is pixel residual; store squared as used by code
     double ransac_residual_thresh_px = readOr("fast_init.ransac.residual_thresh_px", 0.01);
     FAST_INIT_RANSAC_THRESHOLD_SQ = ransac_residual_thresh_px * ransac_residual_thresh_px;

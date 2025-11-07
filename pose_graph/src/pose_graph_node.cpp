@@ -62,6 +62,7 @@ nav_msgs::Path no_loop_path;
 std::string BRIEF_PATTERN_FILE;
 std::string POSE_GRAPH_SAVE_PATH;
 std::string VINS_RESULT_PATH;
+std::string VINS_TUM_RESULT_PATH;
 CameraPoseVisualization cameraposevisual(1, 0, 0, 1);
 Eigen::Vector3d last_t(-100, -100, -100);
 double last_image_time = -1;
@@ -504,8 +505,11 @@ int main(int argc, char **argv)
         LOAD_PREVIOUS_POSE_GRAPH = fsSettings["load_previous_pose_graph"];
         FAST_RELOCALIZATION = fsSettings["fast_relocalization"];
         VINS_RESULT_PATH = VINS_RESULT_PATH + "/vins_result_loop.csv";
+        VINS_TUM_RESULT_PATH = VINS_RESULT_PATH.substr(0, VINS_RESULT_PATH.find_last_of('/')) + "/vins_result_loop.tum";
         std::ofstream fout(VINS_RESULT_PATH, std::ios::out);
         fout.close();
+        std::ofstream fout_tum(VINS_TUM_RESULT_PATH, std::ios::out);
+        fout_tum.close();
         fsSettings.release();
 
         if (LOAD_PREVIOUS_POSE_GRAPH)

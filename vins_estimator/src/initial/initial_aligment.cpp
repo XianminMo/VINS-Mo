@@ -11,48 +11,93 @@
  * @param all_image_frame 时间戳到ImageFrame的映射，包含滑窗内所有帧的视/IMU信息
  * @param Bgs 存储每一帧的gyroscope bias（在滑窗初始化阶段可直接修改为矫正结果）
  */
-void solveGyroscopeBias(map<double, ImageFrame> &all_image_frame, Vector3d* Bgs)
+bool solveGyroscopeBias(map<double, ImageFrame> &all_image_frame, Vector3d* Bgs)
 {
-    Matrix3d A;      // 用于积累线性系统Ax=b中的A
-    Vector3d b;      // 用于积累线性系统Ax=b中的b
-    Vector3d delta_bg; // 求解得到的陀螺仪bias修正量
-    A.setZero();
-    b.setZero();
+    // 收集候选观测（带旋转幅值与残差）
+    struct ObsRow { Matrix3d J; Vector3d r; double angle; double res_norm; };
+    std::vector<ObsRow> rows;
+    rows.reserve(all_image_frame.size());
 
     map<double, ImageFrame>::iterator frame_i;
     map<double, ImageFrame>::iterator frame_j;
 
-    // 遍历所有相邻帧（i, j），i为前一帧，j为后一帧
+    const double MIN_ROT_ANGLE = 2.0 * M_PI / 180.0; // 放宽门限，提高低激励可用性
+    const int MAX_SPAN = 3; // 跨多帧复合预积分，最多跨 3 段
+
     for (frame_i = all_image_frame.begin(); next(frame_i) != all_image_frame.end(); frame_i++)
     {
-        frame_j = next(frame_i);
+        // 复合到多步的 j（跨度 1..MAX_SPAN）
+        map<double, ImageFrame>::iterator fi = frame_i;
+        Eigen::Matrix3d R_i = fi->second.R;
+        Eigen::Quaterniond dq_imu_comp = Eigen::Quaterniond::Identity();
+        Matrix3d J_comp = Matrix3d::Zero();
 
-        // 用于临时存储一组系数
-        MatrixXd tmp_A(3, 3);
-        tmp_A.setZero();
-        VectorXd tmp_b(3);
-        tmp_b.setZero();
+        for (int span = 1; span <= MAX_SPAN; ++span)
+        {
+            map<double, ImageFrame>::iterator fj = std::next(fi, span);
+            if (fj == all_image_frame.end()) break;
 
-        // 视觉恢复的两帧之间的相对旋转
-        // q_ij: i->j的旋转（由R_i, R_j计算得到，R*为右乘旋转）
-        Eigen::Quaterniond q_ij(frame_i->second.R.transpose() * frame_j->second.R);
+            // 复合 IMU 旋转（右乘）与累加雅可比（小角度近似叠加）
+            dq_imu_comp = dq_imu_comp * fj->second.pre_integration->delta_q;
+            J_comp += fj->second.pre_integration->jacobian.template block<3,3>(O_R, O_BG);
 
-        // 预积分中的jacobian块，对应于陀螺仪偏置对旋转的影响
-        tmp_A = frame_j->second.pre_integration->jacobian.template block<3, 3>(O_R, O_BG);
+            // 视觉相对旋转（i->j）
+            Eigen::Quaterniond q_ij(R_i.transpose() * fj->second.R);
 
-        // 将IMU旋转增量与视觉旋转对比，构建线性观测模型
-        // delta_q.inverse() * q_ij 表示IMU预积分旋转与视觉旋转的差异（四元数误差的向量部分）
-        // 这里乘以2是因为单位四元数误差近似的线性化关系
-        tmp_b = 2 * (frame_j->second.pre_integration->delta_q.inverse() * q_ij).vec();
+            double theta_imu = Eigen::AngleAxisd(dq_imu_comp).angle();
+            if (theta_imu < MIN_ROT_ANGLE) continue;
 
-        // 将该对帧对整体系统做累加,正规方程：
-        // A = Σ(J^T * J)
-        // b = Σ(J^T * residual)
-        A += tmp_A.transpose() * tmp_A;
-        b += tmp_A.transpose() * tmp_b;
+            Vector3d r = 2.0 * (dq_imu_comp.inverse() * q_ij).vec();
+            double rn = r.norm();
+            rows.push_back({J_comp, r, theta_imu, rn});
+        }
     }
+
+    if (rows.size() < 3)
+    {
+        ROS_WARN("solveGyroscopeBias: insufficient valid pairs (%zu)", rows.size());
+        return false;
+    }
+
+    // 鲁棒剔除：按残差分位数丢弃最大 20%
+    std::vector<double> res_norms; res_norms.reserve(rows.size());
+    for (auto &row : rows) res_norms.push_back(row.res_norm);
+    size_t n = res_norms.size();
+    size_t idx80 = static_cast<size_t>(std::floor(0.8 * n));
+    std::nth_element(res_norms.begin(), res_norms.begin() + idx80, res_norms.end());
+    double thr = res_norms[idx80];
+
+    // 组装加权正规方程（权重 ∝ 旋转幅值，且只保留残差较小的）
+    Matrix3d A = Matrix3d::Zero();
+    Vector3d b = Vector3d::Zero();
+    size_t used = 0;
+    for (auto &row : rows)
+    {
+        if (row.res_norm > thr) continue;
+        double w = std::max(row.angle, MIN_ROT_ANGLE);
+        Matrix3d Jw = std::sqrt(w) * row.J;
+        Vector3d rw = std::sqrt(w) * row.r;
+        A += Jw.transpose() * Jw;
+        b += Jw.transpose() * rw;
+        used++;
+    }
+
+    if (used < 3)
+    {
+        ROS_WARN("solveGyroscopeBias: too few rows after robust filtering (%zu)", used);
+        return false;
+    }
+
     // 求解线性方程，得到最佳的陀螺仪偏置修正量
-    delta_bg = A.ldlt().solve(b);
+    Vector3d delta_bg = A.ldlt().solve(b);
+    // 大幅度保护门：如 >0.5 rad/s 则认为数据不一致，跳过本次更新
+    double mag = delta_bg.norm();
+    const double MAX_GYR_BIAS_STEP = 0.5; // 可配
+    if (mag > MAX_GYR_BIAS_STEP) {
+        ROS_WARN_STREAM("solveGyroscopeBias: delta_bg too large (" << mag
+                        << " rad/s). Skip applying this update.");
+        return false;
+    }
 
     ROS_WARN_STREAM("gyroscope bias initial calibration " << delta_bg.transpose());
 
@@ -67,6 +112,7 @@ void solveGyroscopeBias(map<double, ImageFrame> &all_image_frame, Vector3d* Bgs)
         // 注意：这里加速度bias置零，仅重新设置陀螺仪bias
         frame_j->second.pre_integration->repropagate(Vector3d::Zero(), Bgs[0]);
     }
+    return true;
 }
 
 

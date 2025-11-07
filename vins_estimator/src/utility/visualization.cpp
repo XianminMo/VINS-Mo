@@ -153,7 +153,7 @@ void pubOdometry(const Estimator &estimator, const std_msgs::Header &header)
         relo_path.poses.push_back(pose_stamped);
         pub_relo_path.publish(relo_path);
 
-        // write result to file
+        // write result to CSV (legacy)
         ofstream foutC(VINS_RESULT_PATH, ios::app);
         foutC.setf(ios::fixed, ios::floatfield);
         foutC.precision(0);
@@ -170,6 +170,21 @@ void pubOdometry(const Estimator &estimator, const std_msgs::Header &header)
               << estimator.Vs[WINDOW_SIZE].y() << ","
               << estimator.Vs[WINDOW_SIZE].z() << "," << endl;
         foutC.close();
+
+        // write result to TUM format: timestamp_s tx ty tz qx qy qz qw
+        ofstream foutT(VINS_TUM_RESULT_PATH, ios::app);
+        foutT.setf(ios::fixed, ios::floatfield);
+        foutT.precision(9);
+        foutT << header.stamp.toSec() << " ";
+        foutT.precision(6);
+        foutT << estimator.Ps[WINDOW_SIZE].x() << " "
+              << estimator.Ps[WINDOW_SIZE].y() << " "
+              << estimator.Ps[WINDOW_SIZE].z() << " "
+              << tmp_Q.x() << " "
+              << tmp_Q.y() << " "
+              << tmp_Q.z() << " "
+              << tmp_Q.w() << "\n";
+        foutT.close();
     }
 }
 

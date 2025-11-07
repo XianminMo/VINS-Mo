@@ -22,6 +22,7 @@ extern std::string POSE_GRAPH_SAVE_PATH;
 extern int ROW;
 extern int COL;
 extern std::string VINS_RESULT_PATH;
+extern std::string VINS_TUM_RESULT_PATH;
 extern int DEBUG_IMAGE;
 extern int FAST_RELOCALIZATION;
 
