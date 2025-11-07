@@ -31,4 +31,4 @@ bool VisualIMUAlignment(map<double, ImageFrame> &all_image_frame, Vector3d* Bgs,
 
 // 仅陀螺仪零偏求解（用于快速初始化后的小步校准）
 // 返回 true 表示已成功应用零偏更新并对 all_image_frame 的预积分完成重传播；false 表示本轮跳过
-bool solveGyroscopeBias(map<double, ImageFrame> &all_image_frame, Vector3d* Bgs);
+bool solveGyroscopeBiasNew(map<double, ImageFrame> &all_image_frame, Vector3d* Bgs);

@@ -171,19 +171,26 @@ void pubOdometry(const Estimator &estimator, const std_msgs::Header &header)
               << estimator.Vs[WINDOW_SIZE].z() << "," << endl;
         foutC.close();
 
-        // write result to TUM format: timestamp_s tx ty tz qx qy qz qw
-        ofstream foutT(VINS_TUM_RESULT_PATH, ios::app);
+        // write full corrected trajectory to TUM format: timestamp_s tx ty tz qx qy qz qw
+        // overwrite file each time to keep only the latest complete trajectory
+        ofstream foutT(VINS_TUM_RESULT_PATH, ios::out);
         foutT.setf(ios::fixed, ios::floatfield);
-        foutT.precision(9);
-        foutT << header.stamp.toSec() << " ";
-        foutT.precision(6);
-        foutT << estimator.Ps[WINDOW_SIZE].x() << " "
-              << estimator.Ps[WINDOW_SIZE].y() << " "
-              << estimator.Ps[WINDOW_SIZE].z() << " "
-              << tmp_Q.x() << " "
-              << tmp_Q.y() << " "
-              << tmp_Q.z() << " "
-              << tmp_Q.w() << "\n";
+        for (size_t i = 0; i < relo_path.poses.size(); ++i)
+        {
+            const geometry_msgs::PoseStamped &ps = relo_path.poses[i];
+            double ts = ps.header.stamp.toSec();
+            const geometry_msgs::Pose &pp = ps.pose;
+            foutT.precision(9);
+            foutT << ts << " ";
+            foutT.precision(6);
+            foutT << pp.position.x << " "
+                  << pp.position.y << " "
+                  << pp.position.z << " "
+                  << pp.orientation.x << " "
+                  << pp.orientation.y << " "
+                  << pp.orientation.z << " "
+                  << pp.orientation.w << "\n";
+        }
         foutT.close();
     }
 }

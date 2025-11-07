@@ -616,7 +616,7 @@ void Estimator::processImage(const map<int, vector<pair<int, Eigen::Matrix<doubl
     }
 
     // 追加：仅估计陀螺仪零偏并在成功时重积分（重力已由 fast-init 求得）
-    bool bias_updated = solveGyroscopeBias(all_image_frame, Bgs);
+    bool bias_updated = solveGyroscopeBiasNew(all_image_frame, Bgs);
     if (bias_updated)
     {
         for (int i = 0; i <= WINDOW_SIZE; i++)
