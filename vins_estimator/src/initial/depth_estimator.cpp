@@ -217,7 +217,7 @@ void DepthEstimator::preprocess(const cv::Mat& image, std::vector<float>& input_
 
     // 2) 缩放到模型输入尺寸，浮点化并归一化到 [0,1]
     cv::Mat resized_image;
-    cv::resize(img_rgb, resized_image, cv::Size(m_model_input_width, m_model_input_height), 0, 0, cv::INTER_CUBIC);
+    cv::resize(img_rgb, resized_image, cv::Size(m_model_input_width, m_model_input_height), 0, 0, cv::INTER_LINEAR);
     resized_image.convertTo(resized_image, CV_32F, 1.0 / 255.0);
 
     // 3) 按 NCHW 填充，并用 ImageNet 均值方差做标准化（RGB 顺序）

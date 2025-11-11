@@ -49,13 +49,13 @@ public:
     bool predict(const cv::Mat& image, cv::Mat& norm_inv_depth_map);
 
 private:
-    void preprocess(const cv::Mat& image, std::vector<float>& input_tensor_values, bool save_debug_images = true);
+    void preprocess(const cv::Mat& image, std::vector<float>& input_tensor_values, bool save_debug_images = false);
 
     /**
      * @brief 内部预测方法（用于 warmup，不检查就绪状态）
      */
     bool predictInternal(const cv::Mat& image, cv::Mat& norm_inv_depth_map,
-                         bool save_debug_images = true, bool quiet = false);
+                         bool save_debug_images = false, bool quiet = false);
     
     // 异步初始化的工作函数
     void initWorker(const std::string& model_path);

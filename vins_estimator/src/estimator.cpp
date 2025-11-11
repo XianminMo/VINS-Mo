@@ -544,7 +544,7 @@ void Estimator::processImage(const map<int, vector<pair<int, Eigen::Matrix<doubl
       if (acc_var < FAST_INIT_MIN_ACC_VAR) {
           ROS_WARN_THROTTLE(1.0, "Fast-Init gate: insufficient IMU excitation (acc variance: %.4f < %.2f).", 
                            acc_var, FAST_INIT_MIN_ACC_VAR);
-          return false;
+        //   return false;
       }
       
       // 3. 可选：计算旋转激励用于日志记录（用于对比分析，但不作为硬性要求）
