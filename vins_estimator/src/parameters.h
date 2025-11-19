@@ -44,6 +44,18 @@ extern double ROW, COL;
 extern std::string DEPTH_MODEL_PATH;
 extern int USE_FAST_INIT;
 
+// --- 深度传感器因子约束参数 (Backend Depth Constraint) ---
+// 是否在后端优化中启用深度约束: 0=关闭, 1=开启
+extern int ESTIMATE_DEPTH_SCALE_SHIFT;
+// 深度尺度因子初始值 (affine transformation: 1/d_metric = a * d_nn + b)
+extern double DEPTH_SCALE_A;
+// 深度偏移因子初始值
+extern double DEPTH_SHIFT_B;
+// 深度因子的权重 (影响约束强度)
+extern double DEPTH_FACTOR_WEIGHT;
+// 深度因子的Huber鲁棒核阈值 (用于抑制异常值)
+extern double DEPTH_FACTOR_HUBER_THRESHOLD;
+
 // Fast Init configurable parameters (read from YAML with defaults)
 extern int FAST_INIT_MIN_FEATURES;
 extern double FAST_INIT_MIN_ACC_VAR;

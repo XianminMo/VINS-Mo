@@ -170,13 +170,14 @@ void DepthEstimator::warmup()
     (void)predictInternal(dummy_img, dummy_output, false, true);
 }
 
-// 预处理函数 
+// 预处理函数
 void DepthEstimator::preprocess(const cv::Mat& image, std::vector<float>& input_tensor_values, bool save_debug_images)
 {
     static bool first_preprocess = true;
     if (first_preprocess && save_debug_images) {
-        ROS_INFO("DepthEstimator::preprocess(): Input image - channels: %d, type: %d, size: %dx%d", 
-                 image.channels(), image.type(), image.cols, image.rows);
+        // 注释掉详细的输入信息，只在出错时才需要
+        // ROS_INFO("DepthEstimator::preprocess(): Input image - channels: %d, type: %d, size: %dx%d",
+        //          image.channels(), image.type(), image.cols, image.rows);
         first_preprocess = false;
     }
 
@@ -189,8 +190,8 @@ void DepthEstimator::preprocess(const cv::Mat& image, std::vector<float>& input_
     else if (image.channels() == 3)
     {
         img_bgr = image;
-        
-        // 仅在启用调试时检查伪彩色
+
+        // 仅在启用调试时检查伪彩色（只检查一次，避免重复警告）
         if (save_debug_images) {
             static bool checked_pseudo_color = false;
             if (!checked_pseudo_color) {
@@ -202,10 +203,11 @@ void DepthEstimator::preprocess(const cv::Mat& image, std::vector<float>& input_
                 double max_diff1, max_diff2;
                 cv::minMaxLoc(diff1, nullptr, &max_diff1);
                 cv::minMaxLoc(diff2, nullptr, &max_diff2);
-                
+
                 if (max_diff1 < 5.0 && max_diff2 < 5.0) {
-                    ROS_WARN("DepthEstimator: Input appears to be pseudo-color (grayscale converted to BGR). "
-                             "All channels are nearly identical. MiDaS depth estimation may fail!");
+                    // 注释掉警告，这对灰度图像来说是正常的
+                    // ROS_WARN("DepthEstimator: Input appears to be pseudo-color (grayscale converted to BGR). "
+                    //          "All channels are nearly identical. MiDaS depth estimation may fail!");
                 }
                 checked_pseudo_color = true;
             }
@@ -261,12 +263,13 @@ bool DepthEstimator::predict(const cv::Mat& image, cv::Mat& norm_inv_depth_map)
 bool DepthEstimator::predictInternal(const cv::Mat& image, cv::Mat& norm_inv_depth_map, bool save_debug_images, bool quiet)
 {
     TicToc t_infer;
-    static bool saved_input = false;
-    if (!saved_input && save_debug_images) {
-        cv::imwrite("/tmp/first_frame_input_image.png", image);
-        if (!quiet) ROS_INFO("Saved input image to /tmp/first_frame_input_image.png (channels: %d)", image.channels());
-        saved_input = true;
-    }
+    // 注释掉保存调试图像，仅在需要调试时手动启用
+    // static bool saved_input = false;
+    // if (!saved_input && save_debug_images) {
+    //     cv::imwrite("/tmp/first_frame_input_image.png", image);
+    //     if (!quiet) ROS_INFO("Saved input image to /tmp/first_frame_input_image.png (channels: %d)", image.channels());
+    //     saved_input = true;
+    // }
 
     if (!m_session)
     {
@@ -354,69 +357,36 @@ bool DepthEstimator::predictInternal(const cv::Mat& image, cv::Mat& norm_inv_dep
         // 4.5 缩放回原图尺寸
         cv::resize(normalized_float_map, norm_inv_depth_map, image.size(), 0, 0, cv::INTER_LINEAR);
 
-        // 4.6 保存首帧的可视化图（只保存一次，便于人工确认是否“扁平”）
-        static bool dumped = false;
-        if (!dumped && save_debug_images)
-        {
-            // 使用伪彩色显示深度图，而不是黑白
-            cv::Mat raw_vis_8u, norm_vis_8u;
-            cv::normalize(raw_inv_depth, raw_vis_8u, 0, 255, cv::NORM_MINMAX, CV_8U);
-            cv::normalize(normalized_float_map, norm_vis_8u, 0, 255, cv::NORM_MINMAX, CV_8U);
-            
-            // 转为伪彩色（Jet colormap）
-            cv::Mat raw_vis_color, norm_vis_color;
-            cv::applyColorMap(raw_vis_8u, raw_vis_color, cv::COLORMAP_JET);
-            cv::applyColorMap(norm_vis_8u, norm_vis_color, cv::COLORMAP_JET);
-            
-            // 保存彩色版本
-            cv::imwrite("/tmp/first_frame_raw_inv_depth.png", raw_vis_color);
-            cv::imwrite("/tmp/first_frame_norm_inv_depth.png", norm_vis_color);
+        // 4.6 保存首帧的可视化图（注释掉，仅在需要调试时启用）
+        // static bool dumped = false;
+        // if (!dumped && save_debug_images)
+        // {
+        //     ... 保存调试图像的代码 ...
+        // }
 
-            // 生成与原图同尺寸的可视化图，并添加颜色-距离注释
-            cv::Mat resized_vis_8u;
-            cv::normalize(norm_inv_depth_map, resized_vis_8u, 0, 255, cv::NORM_MINMAX, CV_8U);
-            cv::Mat resized_vis_color;
-            cv::applyColorMap(resized_vis_8u, resized_vis_color, cv::COLORMAP_JET);
-
-            // 注释：Jet colormap 低值(蓝) -> 远， 高值(红) -> 近 （对归一化逆深度）
-            const std::string legend = "Jet: blue=far, red=near (norm inv depth)";
-            int baseline = 0;
-            cv::Size ts = cv::getTextSize(legend, cv::FONT_HERSHEY_SIMPLEX, 0.5, 1, &baseline);
-            cv::Point box_tl(5, resized_vis_color.rows - ts.height - 10);
-            cv::Point box_br(5 + ts.width + 10, resized_vis_color.rows - 5);
-            cv::rectangle(resized_vis_color, box_tl, box_br, cv::Scalar(0, 0, 0), cv::FILLED);
-            cv::putText(resized_vis_color, legend, cv::Point(10, resized_vis_color.rows - 10),
-                        cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(255, 255, 255), 1, cv::LINE_AA);
-
-            cv::imwrite("/tmp/first_frame_resized_norm_inv_depth.png", resized_vis_color);
-
-            ROS_INFO("Saved MiDaS debug images to /tmp/first_frame_raw_inv_depth.png, /tmp/first_frame_norm_inv_depth.png, and /tmp/first_frame_resized_norm_inv_depth.png");
-            dumped = true;
-        }
-
-        // 4.7 有效性与汇总输出（只打一条高信息量日志）
+        // 4.7 有效性与汇总输出（简化版本）
         cv::Mat isfinite_mask = norm_inv_depth_map == norm_inv_depth_map; // NaN 检测
         int finite_count = cv::countNonZero(isfinite_mask);
         int total_count = norm_inv_depth_map.rows * norm_inv_depth_map.cols;
         double finite_ratio = (total_count > 0) ? (100.0 * static_cast<double>(finite_count) / static_cast<double>(total_count)) : 0.0;
 
-        double out_min = 0.0, out_max = 0.0;
-        cv::minMaxLoc(norm_inv_depth_map, &out_min, &out_max);
-        cv::Scalar out_mean = cv::mean(norm_inv_depth_map);
+        // 只在首次或异常情况下输出
+        static int predict_count = 0;
+        predict_count++;
 
         if (!quiet)
-            ROS_INFO("DepthEstimator: predict OK (%.2f ms). in=%dx%d -> net=%dx%d -> out=%dx%d | raw[min=%.5f,max=%.5f,mean=%.5f] norm[min=%.5f,max=%.5f,mean=%.5f] resized[min=%.5f,max=%.5f,mean=%.5f,finite=%.1f%%]",
-                     t_infer.toc(),
-                     image.cols, image.rows,
-                     m_model_input_width, m_model_input_height,
-                     norm_inv_depth_map.cols, norm_inv_depth_map.rows,
-                     raw_min, raw_max, raw_mean[0],
-                     n_min, n_max, n_mean[0],
-                     out_min, out_max, out_mean[0], finite_ratio);
-
-        if (!quiet && finite_ratio < 95.0)
         {
-            ROS_WARN("DepthEstimator: Low finite ratio in output depth map (%.1f%%). Check input image and model.", finite_ratio);
+            // 首次预测时输出完整信息
+            if (predict_count == 1)
+            {
+                ROS_INFO("[DepthEstimator] First prediction: %.1f ms, size=%dx%d, finite=%.1f%%",
+                         t_infer.toc(), norm_inv_depth_map.cols, norm_inv_depth_map.rows, finite_ratio);
+            }
+            // 后续只在有问题时输出
+            else if (finite_ratio < 95.0)
+            {
+                ROS_WARN("[DepthEstimator] Low finite ratio: %.1f%% at frame %d", finite_ratio, predict_count);
+            }
         }
     }
     catch (const Ort::Exception& e)

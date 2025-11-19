@@ -14,10 +14,10 @@ class ImageFrame
 {
     public:
         ImageFrame(){};
-        ImageFrame(const map<int, vector<pair<int, Eigen::Matrix<double, 7, 1>>>>& _points, 
+        ImageFrame(const map<int, vector<pair<int, Eigen::Matrix<double, 7, 1>>>>& _points,
             double _t, IntegrationBase* _pre_integration, const cv::Mat& _raw_image)
-            : points{_points}, t{_t}, pre_integration{_pre_integration}, raw_image{_raw_image.clone()}, 
-            is_key_frame{false} {}
+            : points{_points}, t{_t}, pre_integration{_pre_integration}, raw_image{_raw_image.clone()},
+            is_key_frame{false}, depth_map_computed{false} {}
         map<int, vector<pair<int, Eigen::Matrix<double, 7, 1>> > > points;
         double t;
         Matrix3d R;
@@ -25,6 +25,12 @@ class ImageFrame
         IntegrationBase *pre_integration;
         cv::Mat raw_image;
         bool is_key_frame;
+
+        // --- 深度传感器因子约束扩展 (Backend Depth Constraint) ---
+        // 存储MiDaS预测的归一化逆深度图 (CV_32F格式)
+        cv::Mat predicted_depth_map;
+        // 标志位：该帧的深度图是否已计算
+        bool depth_map_computed;
 };
 
 bool VisualIMUAlignment(map<double, ImageFrame> &all_image_frame, Vector3d* Bgs, Vector3d &g, VectorXd &x);
