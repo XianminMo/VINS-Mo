@@ -28,6 +28,13 @@ double TD, TR;
 std::string DEPTH_MODEL_PATH;
 int USE_FAST_INIT; // <-- 添加这行定义
 
+// --- 深度传感器因子约束参数 (Backend Depth Constraint) ---
+int ESTIMATE_DEPTH_SCALE_SHIFT;
+double DEPTH_SCALE_A;
+double DEPTH_SHIFT_B;
+double DEPTH_FACTOR_WEIGHT;
+double DEPTH_FACTOR_HUBER_THRESHOLD;
+
 // Fast Init parameters (defaults will be overridden by YAML if provided)
 int FAST_INIT_MIN_FEATURES;
 double FAST_INIT_MIN_ACC_VAR;
@@ -171,28 +178,12 @@ void readParameters(ros::NodeHandle &n)
     if (USE_FAST_INIT)
     {
         ROS_INFO("Fast Monocular Initialization ENABLED.");
-        if (DEPTH_MODEL_PATH.empty())
-        {
-            ROS_FATAL("Fast Init is enabled, but 'deep_model' path is not set in config file!");
-        }
-        else
-        {
-            std::ifstream f(DEPTH_MODEL_PATH.c_str());
-            if (!f.good())
-            {
-                ROS_FATAL("Fast Init enabled, but deep_model file not found at: %s", DEPTH_MODEL_PATH.c_str());
-            }
-            else
-            {
-                ROS_INFO("Fast Init will use model: %s", DEPTH_MODEL_PATH.c_str());
-            }
-        }
     }
     else
     {
         ROS_INFO("Using standard VINS-Mono SFM Initialization.");
     }
-    
+
     // Helper to read a value with default
     auto readOr = [&](const std::string &key, auto def_val)
     {
@@ -237,6 +228,48 @@ void readParameters(ros::NodeHandle &n)
     ROS_INFO("FastInit IRLS: iters=%d, huber=%.3e, reg[a=%.2e, b=%.2e, v=%.2e], early_exit_ratio=%.2f",
              FAST_INIT_IRLS_ITERS, FAST_INIT_IRLS_HUBER_DELTA, FAST_INIT_REG_LAMBDA_A,
              FAST_INIT_REG_LAMBDA_B, FAST_INIT_REG_LAMBDA_V, FAST_INIT_EARLY_EXIT_INLIER_RATIO);
+
+    // --- 读取深度传感器因子约束参数 (Backend Depth Constraint) ---
+    ESTIMATE_DEPTH_SCALE_SHIFT = readOr("depth_constraint.estimate_scale_shift", 0);
+    DEPTH_SCALE_A = readOr("depth_constraint.initial_scale_a", 1.0);
+    DEPTH_SHIFT_B = readOr("depth_constraint.initial_shift_b", 0.0);
+    DEPTH_FACTOR_WEIGHT = readOr("depth_constraint.weight", 1.0);
+    DEPTH_FACTOR_HUBER_THRESHOLD = readOr("depth_constraint.huber_threshold", 1.0);
+
+    if (ESTIMATE_DEPTH_SCALE_SHIFT)
+    {
+        ROS_INFO("Backend Depth Constraint ENABLED:");
+        ROS_INFO("  Initial Scale (a): %.4f", DEPTH_SCALE_A);
+        ROS_INFO("  Initial Shift (b): %.4f", DEPTH_SHIFT_B);
+        ROS_INFO("  Factor Weight: %.4f", DEPTH_FACTOR_WEIGHT);
+        ROS_INFO("  Huber Threshold: %.4f", DEPTH_FACTOR_HUBER_THRESHOLD);
+    }
+    else
+    {
+        ROS_INFO("Backend Depth Constraint DISABLED.");
+    }
+
+    // 统一验证深度模型路径：只要启用了快速初始化或深度约束后端，都需要深度模型
+    if (USE_FAST_INIT || ESTIMATE_DEPTH_SCALE_SHIFT)
+    {
+        if (DEPTH_MODEL_PATH.empty())
+        {
+            ROS_FATAL("Depth model is required (fast_init=%d, depth_constraint=%d) but 'depth_model_path' is not set in config file!",
+                     USE_FAST_INIT, ESTIMATE_DEPTH_SCALE_SHIFT);
+        }
+        else
+        {
+            std::ifstream f(DEPTH_MODEL_PATH.c_str());
+            if (!f.good())
+            {
+                ROS_FATAL("Depth model file not found at: %s", DEPTH_MODEL_PATH.c_str());
+            }
+            else
+            {
+                ROS_INFO("Depth model path verified: %s", DEPTH_MODEL_PATH.c_str());
+            }
+        }
+    }
 
     fsSettings.release();
 }

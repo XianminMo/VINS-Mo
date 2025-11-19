@@ -4,10 +4,15 @@
 imu_topic: "/imu0"
 image_topic: "/cam0/image_raw"
 # output_path: "/home/linux/mxm/output/mh05/deep"
-output_path: "/home/linux/mxm/output/mh05"
+# output_path: "/home/linux/mxm/output/mh05"
 
 # output_path: "/home/linux/mxm/output/mh01/deep"
 # output_path: "/home/linux/mxm/output/mh01/original"
+
+# output_path: "/home/linux/mxm/output/v101/deep"
+# output_path: "/home/linux/mxm/output/v101/original"
+
+output_path: "/home/linux/mxm/output/v203-test1119/o-d"
 
 depth_model_path: "/home/linux/mxm/proj/VINS-Mo/src/VINS-Mo/vins_estimator/models/Midas-V2.onnx" # path to depth estimation model
 use_fast_init: 0      # 0: normal initialization; 1: use fast initialization with depth estimation
@@ -33,6 +38,19 @@ fast_init.reg.lambda_a: 1.0e-2            # 正则：尺度因子a的权重
 fast_init.reg.lambda_b: 1.0e-2            # 正则：深度偏移b的权重
 fast_init.reg.lambda_v: 1.0e-3            # 正则：初始速度v的权重
 
+# --- Backend Depth Constraint Parameters (深度传感器因子约束参数) ---
+# 是否在后端优化中启用深度约束因子 (0: 关闭, 1: 开启)
+depth_constraint.estimate_scale_shift: 1
+# 深度仿射变换尺度因子 a 的初始值 (1/d_metric = a * d_nn + b)
+depth_constraint.initial_scale_a: 1.0
+# 深度仿射变换偏移因子 b 的初始值
+depth_constraint.initial_shift_b: 0.0
+# 深度因子的权重（控制深度约束对优化的影响强度）
+# 值越大，深度约束越强；建议从 0.1 到 10.0 范围内调整
+depth_constraint.weight: 5.0
+# 深度因子的Huber鲁棒核阈值（用于抑制深度估计的异常值）
+# 值越大，对异常值越宽容；建议从 0.5 到 5.0 范围内调整
+depth_constraint.huber_threshold: 1.0
 
 #camera calibration 
 model_type: PINHOLE

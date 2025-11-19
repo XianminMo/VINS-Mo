@@ -17,6 +17,7 @@
 #include "factor/projection_factor.h"
 #include "factor/projection_td_factor.h"
 #include "factor/marginalization_factor.h"
+#include "factor/depth_factor.h"  // 深度传感器因子
 
 #include <unordered_map>
 #include <queue>
@@ -168,6 +169,13 @@ class Estimator
     double para_Retrive_Pose[SIZE_POSE];
     double para_Td[1][1];
     double para_Tr[1][1];
+
+    // --- 深度传感器因子约束状态变量 (Backend Depth Constraint) ---
+    // 存储深度仿射变换的尺度和偏移参数: [a, b]
+    // 关系: 1/d_metric = a * d_nn + b
+    // d_nn: MiDaS预测的归一化逆深度
+    // d_metric: 真实的度量深度
+    double para_DepthScaleShift[1][2];
 
     int loop_window_index;
 

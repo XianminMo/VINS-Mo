@@ -18,13 +18,14 @@ Estimator::Estimator(): f_manager{Rs}
  */
 void Estimator::initDepthEstimator()
 {
-    if (USE_FAST_INIT)
+    // 如果启用了快速初始化或者启用了深度约束后端，则需要初始化深度估计器
+    if (USE_FAST_INIT || ESTIMATE_DEPTH_SCALE_SHIFT)
     {
         ROS_INFO("Initializing DepthEstimator asynchronously...");
-        
+
         // 创建一个深度估计器的智能指针实例
         mp_depth_estimator = std::make_unique<DepthEstimator>();
-        
+
         // 使用配置文件中指定的模型路径初始化深度估计器
         if (!mp_depth_estimator->initAsync(DEPTH_MODEL_PATH))
         {
@@ -36,7 +37,11 @@ void Estimator::initDepthEstimator()
         }
 
         // 注意：这里不等待模型加载完成，让它在后台进行
+    }
 
+    // 快速初始化器只在USE_FAST_INIT为true时初始化
+    if (USE_FAST_INIT)
+    {
         ROS_INFO("Initializing FastInitializer...");
         mp_fast_initializer = std::make_unique<FastInitializer>(&f_manager);
     }
@@ -140,6 +145,11 @@ void Estimator::clearState()
 
     // 清空特征管理器中的所有特征点状态
     f_manager.clearState();
+
+    // --- 深度传感器因子约束状态初始化 (Backend Depth Constraint) ---
+    // 从全局配置参数初始化深度仿射变换参数
+    para_DepthScaleShift[0][0] = DEPTH_SCALE_A;  // 尺度因子 a
+    para_DepthScaleShift[0][1] = DEPTH_SHIFT_B;  // 偏移因子 b
 
     // 添加对我们新成员变量的重置
     {
@@ -377,6 +387,48 @@ void Estimator::processImage(const map<int, vector<pair<int, Eigen::Matrix<doubl
     }
     else // 如果系统已完成初始化，进入正常的非线性优化流程
     {
+        // --- 深度传感器因子约束：计算滑动窗口帧的深度图 (Backend Depth Constraint) ---
+        // 为当前滑动窗口中的所有帧计算深度图（如果尚未计算）
+        if (ESTIMATE_DEPTH_SCALE_SHIFT && mp_depth_estimator && mp_depth_estimator->isReady())
+        {
+            TicToc t_depth_backend;
+            int depth_computed_count = 0;
+
+            // 遍历滑动窗口中的所有帧
+            for (int i = 0; i <= WINDOW_SIZE; i++)
+            {
+                double timestamp = Headers[i].stamp.toSec();
+                auto frame_it = all_image_frame.find(timestamp);
+
+                // 检查帧是否存在且有原始图像
+                if (frame_it != all_image_frame.end() && !frame_it->second.raw_image.empty())
+                {
+                    auto& frame = frame_it->second;
+
+                    // 如果该帧的深度图尚未计算，则计算之
+                    if (!frame.depth_map_computed)
+                    {
+                        if (mp_depth_estimator->predict(frame.raw_image, frame.predicted_depth_map))
+                        {
+                            frame.depth_map_computed = true;
+                            depth_computed_count++;
+                            ROS_DEBUG("Backend: computed depth for frame %d (t=%.3f)", i, timestamp);
+                        }
+                        else
+                        {
+                            ROS_DEBUG("Backend: depth prediction failed for frame %d", i);
+                        }
+                    }
+                }
+            }
+
+            if (depth_computed_count > 0)
+            {
+                ROS_INFO("[Backend] Computed depth maps for %d frames (%.1f ms)",
+                         depth_computed_count, t_depth_backend.toc());
+            }
+        }
+
         TicToc t_solve;
         // 核心步骤：执行后端优化
         solveOdometry();
@@ -1025,10 +1077,16 @@ void Estimator::vector2double()
     VectorXd dep = f_manager.getDepthVector();
     for (int i = 0; i < f_manager.getFeatureCount(); i++)
         para_Feature[i][0] = dep(i);
-    
+
     // 转换时间延迟td
     if (ESTIMATE_TD)
         para_Td[0][0] = td;
+
+    // --- 深度传感器因子约束状态转换 (Backend Depth Constraint) ---
+    // 注意：para_DepthScaleShift 在Ceres优化中是持久的，
+    // 它会在clearState时初始化，在优化过程中被Ceres修改，
+    // 在double2vector中被同步回全局变量。
+    // 这里不需要每次都从全局变量重新赋值。
 }
 
 /**
@@ -1107,10 +1165,34 @@ void Estimator::double2vector()
     for (int i = 0; i < f_manager.getFeatureCount(); i++)
         dep(i) = para_Feature[i][0];
     f_manager.setDepth(dep);
-    
+
     // 转换时间延迟
     if (ESTIMATE_TD)
         td = para_Td[0][0];
+
+    // --- 深度传感器因子约束状态转换 (Backend Depth Constraint) ---
+    // 将Ceres优化后的深度仿射变换参数同步回全局变量
+    if (ESTIMATE_DEPTH_SCALE_SHIFT)
+    {
+        double old_a = DEPTH_SCALE_A;
+        double old_b = DEPTH_SHIFT_B;
+
+        DEPTH_SCALE_A = para_DepthScaleShift[0][0];  // 尺度因子 a
+        DEPTH_SHIFT_B = para_DepthScaleShift[0][1];  // 偏移因子 b
+
+        // 计算参数变化量
+        double delta_a = DEPTH_SCALE_A - old_a;
+        double delta_b = DEPTH_SHIFT_B - old_b;
+
+        // 打印优化结果（定期输出或参数变化显著时输出）
+        ROS_DEBUG("Depth Scale/Shift updated: a=%.6f, b=%.6f", DEPTH_SCALE_A, DEPTH_SHIFT_B);
+
+        if (std::abs(delta_a) > 1e-4 || std::abs(delta_b) > 1e-4)
+        {
+            ROS_INFO_THROTTLE(3.0, "[Backend] Depth params optimized: a=%.4f (delta%.4f), b=%.4f (delta%.4f)",
+                             DEPTH_SCALE_A, delta_a, DEPTH_SHIFT_B, delta_b);
+        }
+    }
 
     // 如果有重定位信息，计算漂移修正
     if(relocalization_info)
@@ -1344,6 +1426,108 @@ void Estimator::optimization()
     }
 
     ROS_DEBUG("visual measurement count: %d", f_m_cnt);
+    ROS_INFO_THROTTLE(5.0, "[Backend] Visual factors: %d", f_m_cnt);
+
+    // --- 深度传感器因子约束：添加深度约束残差块 (Backend Depth Constraint) ---
+    if (ESTIMATE_DEPTH_SCALE_SHIFT)
+    {
+        // 首先添加 para_DepthScaleShift 参数块
+        problem.AddParameterBlock(para_DepthScaleShift[0], 2);
+
+        TicToc t_depth_factor;
+        int depth_factor_cnt = 0;
+
+        // 创建鲁棒核函数（用于处理深度估计的异常值）
+        ceres::LossFunction *depth_loss_function = new ceres::CauchyLoss(DEPTH_FACTOR_HUBER_THRESHOLD);
+
+        // 重新遍历所有特征点，为有深度图的观测添加深度约束
+        feature_index = -1;
+        for (auto &it_per_id : f_manager.feature)
+        {
+            // 使用与视觉约束相同的筛选条件
+            if (!(it_per_id.used_num >= 2 && it_per_id.start_frame < WINDOW_SIZE - 2))
+                continue;
+
+            ++feature_index;
+
+            int first_obs_frame_id = it_per_id.start_frame;
+            Vector3d pts_i = it_per_id.feature_per_frame[0].point;  // 特征在首次观测帧的归一化坐标
+
+            // 遍历该特征点的所有观测
+            for (int idx = 0; idx < it_per_id.feature_per_frame.size(); idx++)
+            {
+                int current_obs_frame_id = it_per_id.start_frame + idx;
+
+                // 避免重复参数块：如果首次观测帧和当前观测帧是同一帧，跳过
+                if (first_obs_frame_id == current_obs_frame_id)
+                    continue;
+
+                // 找到对应的 ImageFrame
+                double timestamp = Headers[current_obs_frame_id].stamp.toSec();
+                auto frame_it = all_image_frame.find(timestamp);
+
+                // 检查深度图是否已计算
+                if (frame_it == all_image_frame.end() || !frame_it->second.depth_map_computed)
+                    continue;  // 没有可用的深度图
+
+                auto& frame = frame_it->second;
+                const cv::Mat& depth_map = frame.predicted_depth_map;
+
+                // 获取特征点的像素坐标
+                Vector2d uv = it_per_id.feature_per_frame[idx].uv;
+
+                // 边界检查
+                int u = static_cast<int>(uv.x() + 0.5);
+                int v = static_cast<int>(uv.y() + 0.5);
+                if (v < 0 || v >= depth_map.rows || u < 0 || u >= depth_map.cols)
+                    continue;
+
+                // 查找测量值：从深度图中提取预测的逆深度
+                // 假设 MiDaS 输出是 CV_32F 格式的归一化逆深度
+                double d_nn = static_cast<double>(depth_map.at<float>(v, u));
+
+                // 检查测量值有效性
+                const double min_valid_inv_depth = 1e-6;
+                const double max_valid_inv_depth = 10.0;
+                if (d_nn <= min_valid_inv_depth || d_nn > max_valid_inv_depth)
+                    continue;  // 无效测量
+
+                // 创建深度因子
+                DepthFactor* depth_factor = new DepthFactor(d_nn, pts_i);
+
+                // 添加残差块：连接 Pose_i, Pose_j, Ex_Pose, Feature, ScaleShift
+                problem.AddResidualBlock(depth_factor, depth_loss_function,
+                    para_Pose[first_obs_frame_id],     // 首次观测帧位姿
+                    para_Pose[current_obs_frame_id],   // 当前观测帧位姿
+                    para_Ex_Pose[0],                   // 外参
+                    para_Feature[feature_index],       // 特征点逆深度
+                    para_DepthScaleShift[0]);          // 尺度偏移参数
+
+                depth_factor_cnt++;
+            }
+        }
+
+        ROS_DEBUG("depth factor count: %d, time: %.2f ms", depth_factor_cnt, t_depth_factor.toc());
+
+        // 输出深度约束信息
+        if (depth_factor_cnt > 0)
+        {
+            ROS_INFO_THROTTLE(5.0, "[Backend] Depth factors: %d (Scale a=%.4f, Shift b=%.4f)",
+                             depth_factor_cnt, DEPTH_SCALE_A, DEPTH_SHIFT_B);
+        }
+        else
+        {
+            ROS_WARN_THROTTLE(10.0, "[Backend] No depth factors added (depth maps may not be computed yet)");
+        }
+
+        // 如果没有添加任何深度因子，则将参数块设为常量（避免欠约束）
+        if (depth_factor_cnt == 0)
+        {
+            ROS_DEBUG("No depth factors added, fixing para_DepthScaleShift");
+            problem.SetParameterBlockConstant(para_DepthScaleShift[0]);
+        }
+    }
+
     ROS_DEBUG("prepare for ceres: %f", t_prepare.toc());
 
     // d. 如果有重定位信息，添加闭环约束
@@ -1482,6 +1666,105 @@ void Estimator::optimization()
             }
         }
 
+        // --- 深度传感器因子约束：将与frame 0相关的深度因子添加到边缘化 (Backend Depth Constraint) ---
+        if (ESTIMATE_DEPTH_SCALE_SHIFT)
+        {
+            // 创建鲁棒核函数（必须与optimization中使用的一致）
+            ceres::LossFunction *depth_loss_function = new ceres::CauchyLoss(DEPTH_FACTOR_HUBER_THRESHOLD);
+
+            int feature_index = -1;
+            for (auto &it_per_id : f_manager.feature)
+            {
+                // 使用与视觉约束相同的筛选条件
+                if (!(it_per_id.used_num >= 2 && it_per_id.start_frame < WINDOW_SIZE - 2))
+                    continue;
+
+                ++feature_index;
+
+                int first_obs_frame_id = it_per_id.start_frame;
+                Vector3d pts_i = it_per_id.feature_per_frame[0].point;
+
+                // 遍历该特征点的所有观测
+                for (int idx = 0; idx < it_per_id.feature_per_frame.size(); idx++)
+                {
+                    int current_obs_frame_id = it_per_id.start_frame + idx;
+
+                    // 只添加与frame 0相关的因子到边缘化
+                    // 条件：首次观测帧是0 或 当前观测帧是0
+                    if (first_obs_frame_id != 0 && current_obs_frame_id != 0)
+                        continue;
+
+                    // 避免重复参数块：如果首次观测帧和当前观测帧是同一帧，跳过
+                    if (first_obs_frame_id == current_obs_frame_id)
+                        continue;
+
+                    // 找到对应的 ImageFrame
+                    double timestamp = Headers[current_obs_frame_id].stamp.toSec();
+                    auto frame_it = all_image_frame.find(timestamp);
+
+                    // 检查深度图是否已计算
+                    if (frame_it == all_image_frame.end() || !frame_it->second.depth_map_computed)
+                        continue;
+
+                    auto& frame = frame_it->second;
+                    const cv::Mat& depth_map = frame.predicted_depth_map;
+
+                    // 获取特征点的像素坐标
+                    Vector2d uv = it_per_id.feature_per_frame[idx].uv;
+
+                    // 边界检查
+                    int u = static_cast<int>(uv.x() + 0.5);
+                    int v = static_cast<int>(uv.y() + 0.5);
+                    if (v < 0 || v >= depth_map.rows || u < 0 || u >= depth_map.cols)
+                        continue;
+
+                    // 查找测量值
+                    double d_nn = static_cast<double>(depth_map.at<float>(v, u));
+
+                    // 检查测量值有效性
+                    const double min_valid_inv_depth = 1e-6;
+                    const double max_valid_inv_depth = 10.0;
+                    if (d_nn <= min_valid_inv_depth || d_nn > max_valid_inv_depth)
+                        continue;
+
+                    // 创建深度因子
+                    DepthFactor* depth_factor = new DepthFactor(d_nn, pts_i);
+
+                    // 定义参数块
+                    std::vector<double*> para_blocks = {
+                        para_Pose[first_obs_frame_id],
+                        para_Pose[current_obs_frame_id],
+                        para_Ex_Pose[0],
+                        para_Feature[feature_index],
+                        para_DepthScaleShift[0]
+                    };
+
+                    // 定义哪些参数块需要被丢弃（边缘化）
+                    std::vector<int> drop_set;
+                    if (first_obs_frame_id == 0)
+                        drop_set.push_back(0);  // para_Pose[0]
+                    if (current_obs_frame_id == 0)
+                        drop_set.push_back(1);  // para_Pose[0] (if first_obs != 0)
+                    // 如果特征的起始帧是0，特征也会被边缘化
+                    if (it_per_id.start_frame == 0 && it_per_id.feature_per_frame.size() == 1)
+                        drop_set.push_back(3);  // para_Feature (只有一个观测的特征)
+
+                    // 如果没有需要边缘化的参数块，跳过
+                    if (drop_set.empty())
+                    {
+                        delete depth_factor;
+                        continue;
+                    }
+
+                    // 添加到边缘化信息
+                    ResidualBlockInfo *residual_block_info = new ResidualBlockInfo(
+                        depth_factor, depth_loss_function, para_blocks, drop_set);
+
+                    marginalization_info->addResidualBlockInfo(residual_block_info);
+                }
+            }
+        }
+
         // 执行边缘化，计算先验信息
         TicToc t_pre_margin;
         marginalization_info->preMarginalize();
@@ -1503,6 +1786,12 @@ void Estimator::optimization()
         if (ESTIMATE_TD)
         {
             addr_shift[reinterpret_cast<long>(para_Td[0])] = para_Td[0];
+        }
+        // --- 深度传感器因子约束：添加ScaleShift参数块地址映射 (Backend Depth Constraint) ---
+        // para_DepthScaleShift是全局参数，在滑动窗口中保持不变
+        if (ESTIMATE_DEPTH_SCALE_SHIFT)
+        {
+            addr_shift[reinterpret_cast<long>(para_DepthScaleShift[0])] = para_DepthScaleShift[0];
         }
         vector<double *> parameter_blocks = marginalization_info->getParameterBlocks(addr_shift);
 
@@ -1570,7 +1859,12 @@ void Estimator::optimization()
             {
                 addr_shift[reinterpret_cast<long>(para_Td[0])] = para_Td[0];
             }
-            
+            // --- 深度传感器因子约束：添加ScaleShift参数块地址映射 (Backend Depth Constraint) ---
+            if (ESTIMATE_DEPTH_SCALE_SHIFT)
+            {
+                addr_shift[reinterpret_cast<long>(para_DepthScaleShift[0])] = para_DepthScaleShift[0];
+            }
+
             vector<double *> parameter_blocks = marginalization_info->getParameterBlocks(addr_shift);
             if (last_marginalization_info)
                 delete last_marginalization_info;
