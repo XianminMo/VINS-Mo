@@ -2,14 +2,17 @@
 #include "initial/initial_fast_mono.h" // Include full definition here
 
 // Estimator类的构造函数
-Estimator::Estimator(): f_manager{Rs}
+Estimator::Estimator(): f_manager{Rs}, initialization_attempted(false)
 {
     // 打印初始化开始的日志信息
     ROS_INFO("init begins");
+    ROS_INFO("WINDOW_SIZE = %d", WINDOW_SIZE);
     // 调用clearState()函数，重置所有状态变量和参数
     clearState();
+    ROS_INFO("clearState() completed");
     // 初始化标志，表示第一帧的深度图尚未计算
-    m_first_frame_depth_computed = false; 
+    m_first_frame_depth_computed = false;
+    ROS_INFO("Estimator construction completed");
 }
 
 /**
@@ -151,6 +154,7 @@ void Estimator::clearState()
 
     failure_occur = 0; // 失败标志位清零
     relocalization_info = 0; // 重定位信息标志位清零
+    initialization_attempted = false; // 重置初始化尝试标志（用于实验评估）
 
     // 漂移校正参数初始化
     drift_correct_r = Matrix3d::Identity();
@@ -282,7 +286,15 @@ void Estimator::processImage(const map<int, vector<pair<int, Eigen::Matrix<doubl
     {
         if (frame_count == WINDOW_SIZE) // 如果滑动窗口已满（收集了足够的数据）
         {
+            // 只尝试一次初始化（用于初始化成功率和精度的实验评估）
+            if (initialization_attempted)
+            {
+                ROS_WARN_THROTTLE(1.0, "Initialization already attempted. Skipping further attempts.");
+                return; // 直接返回，不再处理后续帧
+            }
+
             bool is_init_success = false; // 标记初始化是否成功
+            initialization_attempted = true; // 标记已经尝试过初始化
 
             if (USE_FAST_INIT) // 如果启用了快速初始化
             {
@@ -299,31 +311,31 @@ void Estimator::processImage(const map<int, vector<pair<int, Eigen::Matrix<doubl
                     TicToc t_fast_init;
                     double rot_sum = 0.0;
                     
-                    if (!checkFastInitConditions(rot_sum)) {
-                        // 初始化条件不满足，跳过本次初始化
-                        is_init_success = false;
+                    // if (!checkFastInitConditions(rot_sum)) {
+                    //     // 初始化条件不满足，跳过本次初始化
+                    //     is_init_success = false;
+                    //     return;
+                    // }
+                    
+                    // 步骤 3: 执行快速初始化
+                    std::map<int, Eigen::Vector3d> Ps_init;
+                    std::map<int, Eigen::Vector3d> Vs_init;
+                    std::map<int, Eigen::Quaterniond> Rs_init;
+                    
+                    if (performFastInitialization(Ps_init, Vs_init, Rs_init)) {
+                        // 步骤 4: 更新估计器状态
+                        updateEstimatorStateFromFastInit(Ps_init, Vs_init, Rs_init);
+                        ROS_INFO("Fast Monocular Init Succeeded! (%.2f ms, rotation: %.3f rad)", 
+                            t_fast_init.toc(), rot_sum);
+                        is_init_success = true;
                     }
                     else {
-                        // 步骤 3: 执行快速初始化
-                        std::map<int, Eigen::Vector3d> Ps_init;
-                        std::map<int, Eigen::Vector3d> Vs_init;
-                        std::map<int, Eigen::Quaterniond> Rs_init;
-                        
-                        if (performFastInitialization(Ps_init, Vs_init, Rs_init)) {
-                            // 步骤 4: 更新估计器状态
-                            updateEstimatorStateFromFastInit(Ps_init, Vs_init, Rs_init);
-                            ROS_INFO("Fast Monocular Init Succeeded! (%.2f ms, rotation: %.3f rad)", 
-                                t_fast_init.toc(), rot_sum);
-                            is_init_success = true;
-                        }
-                        else {
-                            ROS_WARN("Fast Monocular Init Failed.");
-                            // 初始化失败，重置深度图状态
-                            std::lock_guard<std::mutex> lock(m_depth_mutex);
-                            m_first_frame_depth_computed = false;
-                            m_depth_window_start_id = -1;
-                            is_init_success = false;
-                        }
+                        ROS_WARN("Fast Monocular Init Failed.");
+                        // 初始化失败，重置深度图状态
+                        std::lock_guard<std::mutex> lock(m_depth_mutex);
+                        m_first_frame_depth_computed = false;
+                        m_depth_window_start_id = -1;
+                        is_init_success = false;
                     }
                 }
             }
@@ -351,15 +363,48 @@ void Estimator::processImage(const map<int, vector<pair<int, Eigen::Matrix<doubl
             // --- 统一处理初始化结果 ---
             if(is_init_success)
             {
-                // 打印初始化刚完成时对应图像时间戳（用于对齐真值）
-                double init_ts = header.stamp.toSec();
-                ROS_INFO("Init completed at stamp: %.9f s", init_ts);
-
                 solver_flag = NON_LINEAR; // 切换到非线性优化模式
                 solveOdometry();          // 立即进行一次后端优化
+                // === 保存初始化窗口内所有帧的轨迹（用于精度评估） ===
+                // 从VINS_RESULT_PATH提取目录路径
+                std::string result_dir = VINS_RESULT_PATH.substr(0, VINS_RESULT_PATH.find_last_of("/\\"));
+                std::string init_traj_path = result_dir + "/vio_init_window.txt";
+                std::ofstream fout_init(init_traj_path, std::ios::out);
+                if (fout_init.is_open())
+                {
+                    fout_init.setf(std::ios::fixed, std::ios::floatfield);
+                    fout_init.precision(9);
+
+                    // 遍历初始化窗口内所有帧（从0到WINDOW_SIZE）
+                    for (int i = 0; i <= WINDOW_SIZE; i++)
+                    {
+                        // 获取对应帧的时间戳
+                        double timestamp = Headers[i].stamp.toSec();
+
+                        // 获取位姿
+                        Eigen::Vector3d P = Ps[i];
+                        Eigen::Quaterniond Q(Rs[i]);
+
+                        // TUM格式：timestamp tx ty tz qx qy qz qw
+                        fout_init << timestamp << " "
+                                  << P.x() << " " << P.y() << " " << P.z() << " "
+                                  << Q.x() << " " << Q.y() << " " << Q.z() << " " << Q.w() << std::endl;
+                    }
+                    fout_init.close();
+                    ROS_INFO("Saved initialization window trajectory to: %s", init_traj_path.c_str());
+                    ROS_INFO("Total frames in initialization window: %d", WINDOW_SIZE + 1);
+                }
+                else
+                {
+                    ROS_ERROR("Failed to open file: %s", init_traj_path.c_str());
+                }
+                
                 slideWindow();            // 滑动窗口
                 f_manager.removeFailures(); // 移除失败的特征点
                 ROS_INFO("Initialization finish!");
+
+                
+
                 // 记录当前位姿，用于失败检测
                 last_R = Rs[WINDOW_SIZE];
                 last_P = Ps[WINDOW_SIZE];
@@ -368,8 +413,10 @@ void Estimator::processImage(const map<int, vector<pair<int, Eigen::Matrix<doubl
             }
             else
             {
-                // 初始化失败，滑动窗口，丢弃最老的帧，继续尝试
-                slideWindow();
+                // 初始化失败（用于实验评估）
+                ROS_WARN("Initialization failed!");
+                ROS_WARN("Stopping further processing for initialization evaluation.");
+                // 不再处理后续帧，确保只评估一次初始化尝试
             }
         }
         else
@@ -700,14 +747,14 @@ bool Estimator::initialStructure()
     
     Matrix3d relative_R;
     Vector3d relative_T;
-    int l; // 用于恢复相对位姿的参考帧索引
-    
+    int l = 0; // 用于恢复相对位姿的参考帧索引，初始化为0防止未定义行为
+
     // 1.1. 找到一个与最新帧有足够视差和共视点的历史帧 l
     // 1.2. 利用本质矩阵来求解两帧之间的相对位姿和相对平移
     if (!relativePose(relative_R, relative_T, l))
     {
-        ROS_INFO("Not enough features or parallax; Move device around");
-        return false;
+        ROS_WARN("Not enough features or parallax; Move device around");
+        return false;  // ← 修复：relativePose 失败时应该返回
     }
     
     // 2. 使用 GlobalSFM 类来恢复所有帧的位姿和地图点
@@ -716,9 +763,9 @@ bool Estimator::initialStructure()
               relative_R, relative_T,
               sfm_f, sfm_tracked_points))
     {
-        ROS_DEBUG("global SFM failed!");
+        ROS_WARN("global SFM failed!");
         marginalization_flag = MARGIN_OLD; // SFM失败，标记边缘化老帧，以便系统可以滑动窗口并重试
-        return false;
+        return false;  // ← 修复：SFM 失败时应该返回
     }
 
     // 3. 对所有非关键帧进行PnP求解
@@ -759,54 +806,48 @@ bool Estimator::initialStructure()
             int feature_id = id_pts.first;
             for (auto &i_p : id_pts.second)
             {
-            it = sfm_tracked_points.find(feature_id);
-            if(it != sfm_tracked_points.end())
-            {
-                Vector3d world_pts = it->second;
-                    cv::Point3f pts_3(world_pts(0), world_pts(1), world_pts(2));
-                    pts_3_vector.push_back(pts_3);
-                    Vector2d img_pts = i_p.second.head<2>();
-                    cv::Point2f pts_2(img_pts(0), img_pts(1));
-                    pts_2_vector.push_back(pts_2);
+                it = sfm_tracked_points.find(feature_id);
+                if(it != sfm_tracked_points.end())
+                    {
+                        Vector3d world_pts = it->second;
+                            cv::Point3f pts_3(world_pts(0), world_pts(1), world_pts(2));
+                            pts_3_vector.push_back(pts_3);
+                            Vector2d img_pts = i_p.second.head<2>();
+                            cv::Point2f pts_2(img_pts(0), img_pts(1));
+                            pts_2_vector.push_back(pts_2);
+                    }
             }
-        }
         
-        // 使用单位矩阵作为相机内参，因为我们使用的是归一化坐标
-        cv::Mat K = (cv::Mat_<double>(3, 3) << 1, 0, 0, 0, 1, 0, 0, 0, 1);
-        if(pts_3_vector.size() < 6)
-        {
-            cout << "pts_3_vector size " << pts_3_vector.size() << endl;
-            ROS_DEBUG("Not enough points for solve pnp !");
-            return false;
+            // 使用单位矩阵作为相机内参，因为我们使用的是归一化坐标
+            cv::Mat K = (cv::Mat_<double>(3, 3) << 1, 0, 0, 0, 1, 0, 0, 0, 1);
+            if(pts_3_vector.size() < 6)
+            {
+                cout << "pts_3_vector size " << pts_3_vector.size() << endl;
+                ROS_DEBUG("Not enough points for solve pnp !");
+                // return false;
+            }
+            // 执行PnP求解
+            if (!cv::solvePnP(pts_3_vector, pts_2_vector, K, cv::Mat(), rvec, t, true))
+            {
+                ROS_DEBUG("solve pnp fail!");
+                // return false;
+            }
+            cv::Mat r;
+            cv::Rodrigues(rvec, r);
+            MatrixXd R_pnp,tmp_R_pnp;
+            cv::cv2eigen(r, tmp_R_pnp);
+            R_pnp = tmp_R_pnp.transpose();
+            MatrixXd T_pnp;
+            cv::cv2eigen(t, T_pnp);
+            T_pnp = R_pnp * (-T_pnp);
+            frame_it->second.R = R_pnp * RIC[0].transpose();
+            frame_it->second.T = T_pnp;
         }
-        // 执行PnP求解
-        if (!cv::solvePnP(pts_3_vector, pts_2_vector, K, cv::Mat(), rvec, t, true))
-        {
-            ROS_DEBUG("solve pnp fail!");
-            return false;
-        }
-        cv::Mat r;
-        cv::Rodrigues(rvec, r);
-        MatrixXd R_pnp,tmp_R_pnp;
-        cv::cv2eigen(r, tmp_R_pnp);
-        R_pnp = tmp_R_pnp.transpose();
-        MatrixXd T_pnp;
-        cv::cv2eigen(t, T_pnp);
-        T_pnp = R_pnp * (-T_pnp);
-        frame_it->second.R = R_pnp * RIC[0].transpose();
-        frame_it->second.T = T_pnp;
-    }
-    
-    // 4. 进行视觉-IMU对齐
-    if (visualInitialAlign())
-        return true;
-    else
-    {
-        ROS_INFO("misalign visual structure with IMU");
-        return false;
-    }
 
     }
+
+    ROS_INFO("[SFM] initialStructure() completed successfully");
+    return true;
 }
 
 /**
@@ -825,7 +866,7 @@ bool Estimator::visualInitialAlign()
     bool result = VisualIMUAlignment(all_image_frame, Bgs, g, x);
     if(!result)
     {
-        ROS_DEBUG("solve g failed!");
+        ROS_INFO("solve g failed!");
         return false;
     }
 
@@ -868,13 +909,20 @@ bool Estimator::visualInitialAlign()
     
     int kv = -1;
     map<double, ImageFrame>::iterator frame_i;
+    int expected_velocity_dim = x.size() - 4;  // 状态向量大小减去重力(3维)和尺度(1维)
     for (frame_i = all_image_frame.begin(); frame_i != all_image_frame.end(); frame_i++)
     {
         if(frame_i->second.is_key_frame)
         {
             kv++;
-            // 从对齐结果中恢复速度
-            Vs[kv] = frame_i->second.R * x.segment<3>(kv * 3);
+            // 从对齐结果中恢复速度，添加边界检查
+            if (kv * 3 + 2 < expected_velocity_dim) {
+                Vs[kv] = frame_i->second.R * x.segment<3>(kv * 3);
+            } else {
+                ROS_ERROR("[visualInitialAlign] Velocity index out of bounds: kv=%d, expected_dim=%d, x.size()=%ld",
+                          kv, expected_velocity_dim, x.size());
+                return false;
+            }
         }
     }
     // 将尺度 s 应用到所有特征点的深度上

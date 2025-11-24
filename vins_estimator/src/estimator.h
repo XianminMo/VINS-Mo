@@ -154,6 +154,7 @@ class Estimator
     bool first_imu;
     bool is_valid, is_key;
     bool failure_occur;
+    bool initialization_attempted;  // 标记是否已经尝试过初始化（用于实验评估）
 
     vector<Vector3d> point_cloud;
     vector<Vector3d> margin_cloud;

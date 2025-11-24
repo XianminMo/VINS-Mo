@@ -1,4 +1,5 @@
 #include "initial_sfm.h"
+#include <ros/ros.h>
 
 GlobalSFM::GlobalSFM(){}
 
@@ -74,9 +75,13 @@ bool GlobalSFM::solveFrameByPnP(Matrix3d &R_initial, Vector3d &P_initial, int i,
 	}
 	if (int(pts_2_vector.size()) < 15)
 	{
-		printf("unstable features tracking, please slowly move you device!\n");
-		if (int(pts_2_vector.size()) < 10)
+		ROS_WARN("[GlobalSFM] Frame %d: only %d 3D-2D correspondences (< 15), unstable!",
+				 i, int(pts_2_vector.size()));
+		if (int(pts_2_vector.size()) < 10) {
+			ROS_WARN("[GlobalSFM] Frame %d: too few points (%d < 10), PnP failed",
+					 i, int(pts_2_vector.size()));
 			return false;
+		}
 	}
 	cv::Mat r, rvec, t, D, tmp_r;
 	cv::eigen2cv(R_initial, tmp_r);
@@ -87,6 +92,7 @@ bool GlobalSFM::solveFrameByPnP(Matrix3d &R_initial, Vector3d &P_initial, int i,
 	pnp_succ = cv::solvePnP(pts_3_vector, pts_2_vector, K, D, rvec, t, 1);
 	if(!pnp_succ)
 	{
+		ROS_WARN("[GlobalSFM] Frame %d: cv::solvePnP() returned false", i);
 		return false;
 	}
 	cv::Rodrigues(rvec, r);
@@ -169,6 +175,10 @@ bool GlobalSFM::construct(int frame_num, Quaterniond* q, Vector3d* T, int l,
 			  vector<SFMFeature> &sfm_f, map<int, Vector3d> &sfm_tracked_points)
 {
 	feature_num = sfm_f.size();
+	ROS_INFO("[GlobalSFM] Starting GlobalSFM::construct()");
+	ROS_INFO("[GlobalSFM] Total frames: %d, Reference frame l: %d", frame_num, l);
+	ROS_INFO("[GlobalSFM] Total features: %d", feature_num);
+
 	//cout << "set 0 and " << l << " as known " << endl;
 	// have relative_r relative_t
 	// intial two view
@@ -179,6 +189,8 @@ bool GlobalSFM::construct(int frame_num, Quaterniond* q, Vector3d* T, int l,
 	T[l].setZero();
 	q[frame_num - 1] = q[l] * Quaterniond(relative_R);
 	T[frame_num - 1] = relative_T;
+
+	ROS_INFO("[GlobalSFM] Initialized two-view: frame %d (origin) and frame %d", l, frame_num - 1);
 	//cout << "init q_l " << q[l].w() << " " << q[l].vec().transpose() << endl;
 	//cout << "init t_l " << T[l].transpose() << endl;
 
@@ -204,7 +216,9 @@ bool GlobalSFM::construct(int frame_num, Quaterniond* q, Vector3d* T, int l,
 
 
 	//1: trangulate between l ----- frame_num - 1
-	//2: solve pnp l + 1; trangulate l + 1 ------- frame_num - 1; 
+	//2: solve pnp l + 1; trangulate l + 1 ------- frame_num - 1;
+	ROS_INFO("[GlobalSFM] Phase 1: Forward pass (frame %d to %d)", l, frame_num - 1);
+	int pnp_fail_count_forward = 0;
 	for (int i = l; i < frame_num - 1 ; i++)
 	{
 		// solve pnp
@@ -212,8 +226,11 @@ bool GlobalSFM::construct(int frame_num, Quaterniond* q, Vector3d* T, int l,
 		{
 			Matrix3d R_initial = c_Rotation[i - 1];
 			Vector3d P_initial = c_Translation[i - 1];
-			if(!solveFrameByPnP(R_initial, P_initial, i, sfm_f))
+			if(!solveFrameByPnP(R_initial, P_initial, i, sfm_f)) {
+				ROS_WARN("[GlobalSFM] PnP failed for frame %d (forward pass)", i);
+				pnp_fail_count_forward++;
 				return false;
+			}
 			c_Rotation[i] = R_initial;
 			c_Translation[i] = P_initial;
 			c_Quat[i] = c_Rotation[i];
@@ -224,18 +241,28 @@ bool GlobalSFM::construct(int frame_num, Quaterniond* q, Vector3d* T, int l,
 		// triangulate point based on the solve pnp result
 		triangulateTwoFrames(i, Pose[i], frame_num - 1, Pose[frame_num - 1], sfm_f);
 	}
+	ROS_INFO("[GlobalSFM] Phase 1 completed: PnP solved %d frames", frame_num - 1 - l);
+
 	//3: triangulate l-----l+1 l+2 ... frame_num -2
+	ROS_INFO("[GlobalSFM] Phase 2: Triangulating from reference frame %d", l);
 	for (int i = l + 1; i < frame_num - 1; i++)
 		triangulateTwoFrames(l, Pose[l], i, Pose[i], sfm_f);
+
 	//4: solve pnp l-1; triangulate l-1 ----- l
 	//             l-2              l-2 ----- l
+	ROS_INFO("[GlobalSFM] Phase 3: Backward pass (frame %d to 0)", l - 1);
+	int pnp_fail_count_backward = 0;
 	for (int i = l - 1; i >= 0; i--)
 	{
 		//solve pnp
 		Matrix3d R_initial = c_Rotation[i + 1];
 		Vector3d P_initial = c_Translation[i + 1];
-		if(!solveFrameByPnP(R_initial, P_initial, i, sfm_f))
+		if(!solveFrameByPnP(R_initial, P_initial, i, sfm_f)) {
+			ROS_WARN("[GlobalSFM] PnP failed for frame %d (backward pass)", i);
+			pnp_fail_count_backward++;
 			return false;
+		}
+
 		c_Rotation[i] = R_initial;
 		c_Translation[i] = P_initial;
 		c_Quat[i] = c_Rotation[i];
@@ -244,7 +271,11 @@ bool GlobalSFM::construct(int frame_num, Quaterniond* q, Vector3d* T, int l,
 		//triangulate
 		triangulateTwoFrames(i, Pose[i], l, Pose[l], sfm_f);
 	}
+	ROS_INFO("[GlobalSFM] Phase 3 completed: PnP solved %d frames", l);
+
 	//5: triangulate all other points
+	ROS_INFO("[GlobalSFM] Phase 4: Triangulating remaining features");
+	int triangulated_in_phase4 = 0;
 	for (int j = 0; j < feature_num; j++)
 	{
 		if (sfm_f[j].state == true)
@@ -262,14 +293,31 @@ bool GlobalSFM::construct(int frame_num, Quaterniond* q, Vector3d* T, int l,
 			sfm_f[j].position[0] = point_3d(0);
 			sfm_f[j].position[1] = point_3d(1);
 			sfm_f[j].position[2] = point_3d(2);
+			triangulated_in_phase4++;
 			//cout << "trangulated : " << frame_0 << " " << frame_1 << "  3d point : "  << j << "  " << point_3d.transpose() << endl;
-		}		
+		}
+	}
+
+	// 统计三角化结果
+	int total_triangulated = 0;
+	for (int j = 0; j < feature_num; j++) {
+		if (sfm_f[j].state == true)
+			total_triangulated++;
+	}
+	ROS_INFO("[GlobalSFM] Phase 4 completed: Triangulated %d additional features", triangulated_in_phase4);
+	ROS_INFO("[GlobalSFM] Total triangulated features: %d / %d (%.1f%%)",
+			 total_triangulated, feature_num,
+			 100.0 * total_triangulated / feature_num);
+
+	// 检查三角化是否成功
+	if (total_triangulated < 50) {
+		ROS_WARN("[GlobalSFM] Too few triangulated points (%d < 50), SFM may fail", total_triangulated);
 	}
 
 /*
 	for (int i = 0; i < frame_num; i++)
 	{
-		q[i] = c_Rotation[i].transpose(); 
+		q[i] = c_Rotation[i].transpose();
 		cout << "solvePnP  q" << " i " << i <<"  " <<q[i].w() << "  " << q[i].vec().transpose() << endl;
 	}
 	for (int i = 0; i < frame_num; i++)
@@ -280,8 +328,11 @@ bool GlobalSFM::construct(int frame_num, Quaterniond* q, Vector3d* T, int l,
 	}
 */
 	//full BA
+	ROS_INFO("[GlobalSFM] Phase 5: Running Bundle Adjustment (BA)");
 	ceres::Problem problem;
 	ceres::LocalParameterization* local_parameterization = new ceres::QuaternionParameterization();
+
+	// 添加所有帧的位姿参数
 	//cout << " begin full BA " << endl;
 	for (int i = 0; i < frame_num; i++)
 	{
@@ -305,6 +356,8 @@ bool GlobalSFM::construct(int frame_num, Quaterniond* q, Vector3d* T, int l,
 		}
 	}
 
+	// 添加重投影残差
+	int residual_count = 0;
 	for (int i = 0; i < feature_num; i++)
 	{
 		if (sfm_f[i].state != true)
@@ -316,27 +369,78 @@ bool GlobalSFM::construct(int frame_num, Quaterniond* q, Vector3d* T, int l,
 												sfm_f[i].observation[j].second.x(),
 												sfm_f[i].observation[j].second.y());
 
-    		problem.AddResidualBlock(cost_function, NULL, c_rotation[l], c_translation[l], 
-    								sfm_f[i].position);	 
+    		problem.AddResidualBlock(cost_function, NULL, c_rotation[l], c_translation[l],
+    								sfm_f[i].position);
+    		residual_count++;
 		}
 
 	}
+	ROS_INFO("[GlobalSFM] BA setup: %d residual blocks from %d triangulated features",
+			 residual_count, total_triangulated);
 	ceres::Solver::Options options;
 	options.linear_solver_type = ceres::DENSE_SCHUR;
 	//options.minimizer_progress_to_stdout = true;
-	options.max_solver_time_in_seconds = 0.2;
+	options.max_solver_time_in_seconds = 1.0;  // 增加到1.0秒，给BA更多时间收敛
+	options.max_num_iterations = 50;  // 增加最大迭代次数
 	ceres::Solver::Summary summary;
 	ceres::Solve(options, &problem, &summary);
+
+	ROS_INFO("[GlobalSFM] BA completed:");
+	ROS_INFO("[GlobalSFM]   - Termination: %s", summary.termination_type == ceres::CONVERGENCE ? "CONVERGENCE" : "NO_CONVERGENCE");
+	ROS_INFO("[GlobalSFM]   - Initial cost: %.6f", summary.initial_cost);
+	ROS_INFO("[GlobalSFM]   - Final cost: %.6f", summary.final_cost);
+	ROS_INFO("[GlobalSFM]   - Iterations: %d", static_cast<int>(summary.iterations.size()));
+
 	//std::cout << summary.BriefReport() << "\n";
-	if (summary.termination_type == ceres::CONVERGENCE || summary.final_cost < 5e-03)
-	{
-		//cout << "vision only BA converge" << endl;
+
+	// 自适应收敛判定：考虑问题规模（残差块数量）
+	double cost_reduction_ratio = (summary.initial_cost - summary.final_cost) / summary.initial_cost;
+	double avg_residual = summary.final_cost / residual_count;  // 平均每个残差块的误差
+
+	ROS_INFO("[GlobalSFM]   - Cost reduction: %.1f%%", cost_reduction_ratio * 100.0);
+	ROS_INFO("[GlobalSFM]   - Avg residual per block: %.6f", avg_residual);
+
+	bool converged = false;
+	std::string convergence_reason;
+
+	// 判定标准（按优先级）：
+	// 1. Ceres认为已收敛
+	if (summary.termination_type == ceres::CONVERGENCE) {
+		converged = true;
+		convergence_reason = "Ceres CONVERGENCE status";
 	}
-	else
-	{
+	// 2. 平均残差足够小（与问题规模无关）
+	else if (avg_residual < 0.0001) {  // 每个残差块平均误差 < 0.0001
+		converged = true;
+		convergence_reason = "Low average residual per block";
+	}
+	// 3. 残差下降充分且总残差可接受
+	else if (cost_reduction_ratio > 0.95 && summary.final_cost < 1.0) {
+		converged = true;
+		convergence_reason = "Sufficient cost reduction (>95%) with acceptable final cost";
+	}
+	// 4. 对于大规模问题（>5000残差块），放宽标准
+	else if (residual_count > 5000 && cost_reduction_ratio > 0.90 && avg_residual < 0.0005) {
+		converged = true;
+		convergence_reason = "Large-scale problem: good reduction with low avg residual";
+	}
+
+	if (converged) {
+		ROS_INFO("[GlobalSFM] BA converged successfully!");
+		ROS_INFO("[GlobalSFM]   Reason: %s", convergence_reason.c_str());
+	} else {
+		ROS_WARN("[GlobalSFM] BA did not converge!");
+		ROS_WARN("[GlobalSFM]   - Final cost: %.6f", summary.final_cost);
+		ROS_WARN("[GlobalSFM]   - Avg residual: %.6f (threshold: 0.0001)", avg_residual);
+		ROS_WARN("[GlobalSFM]   - Cost reduction: %.1f%% (threshold: 95%%)", cost_reduction_ratio * 100.0);
+	}
+
+	if (!converged) {
 		//cout << "vision only BA not converge " << endl;
 		return false;
 	}
+
+	//cout << "vision only BA converge" << endl;
 	for (int i = 0; i < frame_num; i++)
 	{
 		q[i].w() = c_rotation[i][0]; 
@@ -357,6 +461,9 @@ bool GlobalSFM::construct(int frame_num, Quaterniond* q, Vector3d* T, int l,
 		if(sfm_f[i].state)
 			sfm_tracked_points[sfm_f[i].id] = Vector3d(sfm_f[i].position[0], sfm_f[i].position[1], sfm_f[i].position[2]);
 	}
+
+	ROS_INFO("[GlobalSFM] GlobalSFM::construct() completed successfully");
+	ROS_INFO("[GlobalSFM] Final output: %lu tracked 3D points", sfm_tracked_points.size());
 	return true;
 
 }

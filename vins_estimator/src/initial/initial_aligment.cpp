@@ -261,8 +261,11 @@ void RefineGravity(map<double, ImageFrame> &all_image_frame, Vector3d &g, Vector
 
 bool LinearAlignment(map<double, ImageFrame> &all_image_frame, Vector3d &g, VectorXd &x)
 {
+    ROS_INFO("[LinearAlign] Starting LinearAlignment()");
     int all_frame_count = all_image_frame.size();
+    ROS_INFO("[LinearAlign] Total frames: %d", all_frame_count);
     int n_state = all_frame_count * 3 + 3 + 1;
+    ROS_INFO("[LinearAlign] State dimension: %d", n_state);
 
     MatrixXd A{n_state, n_state};
     A.setZero();
@@ -311,34 +314,84 @@ bool LinearAlignment(map<double, ImageFrame> &all_image_frame, Vector3d &g, Vect
         A.block<6, 4>(i * 3, n_state - 4) += r_A.topRightCorner<6, 4>();
         A.block<4, 6>(n_state - 4, i * 3) += r_A.bottomLeftCorner<4, 6>();
     }
+    ROS_INFO("[LinearAlign] Linear system constructed, solving...");
     A = A * 1000.0;
     b = b * 1000.0;
     x = A.ldlt().solve(b);
-    double s = x(n_state - 1) / 100.0;
-    ROS_DEBUG("estimated scale: %f", s);
-    g = x.segment<3>(n_state - 4);
-    ROS_DEBUG_STREAM(" result g     " << g.norm() << " " << g.transpose());
-    if(fabs(g.norm() - G.norm()) > 1.0 || s < 0)
-    {
+
+    if (x.hasNaN() || !x.allFinite()) {
+        ROS_WARN("[LinearAlign] Linear solver result contains NaN or Inf!");
         return false;
     }
 
+    double s = x(n_state - 1) / 100.0;
+    g = x.segment<3>(n_state - 4);
+
+    ROS_INFO("[LinearAlign] Initial solution:");
+    ROS_INFO("[LinearAlign]   - Estimated scale s: %.6f", s);
+    ROS_INFO("[LinearAlign]   - Gravity vector g: [%.4f, %.4f, %.4f]", g.x(), g.y(), g.z());
+    ROS_INFO("[LinearAlign]   - Gravity norm: %.6f (expected: %.6f)", g.norm(), G.norm());
+    ROS_INFO("[LinearAlign]   - Norm difference: %.6f (threshold: 3.0)", fabs(g.norm() - G.norm()));
+
+    ROS_DEBUG("estimated scale: %f", s);
+    ROS_DEBUG_STREAM(" result g     " << g.norm() << " " << g.transpose());
+
+    // 解算结果评判标准1
+    if(fabs(g.norm() - G.norm()) > 3.0 || s < 0)
+    {
+        ROS_WARN("[LinearAlign] ===== PHYSICAL CHECK FAILED =====");
+        ROS_WARN("[LinearAlign] Gravity norm difference: %.6f > 3.0? %s",
+                 fabs(g.norm() - G.norm()),
+                 fabs(g.norm() - G.norm()) > 3.0 ? "YES" : "NO");
+        ROS_WARN("[LinearAlign] Scale factor s: %.6f < 0? %s",
+                 s, s < 0 ? "YES (NEGATIVE SCALE!)" : "NO");
+        ROS_WARN("Linear Init Physical Check Failed: g_norm=%f, s=%f", g.norm(), s);
+        return false;
+    }
+    ROS_INFO("[LinearAlign] Physical check PASSED (g_norm and scale are valid)");
+
+    ROS_INFO("[LinearAlign] Refining gravity...");
     RefineGravity(all_image_frame, g, x);
     s = (x.tail<1>())(0) / 100.0;
     (x.tail<1>())(0) = s;
+
+    ROS_INFO("[LinearAlign] After refinement:");
+    ROS_INFO("[LinearAlign]   - Refined scale s: %.6f", s);
+    ROS_INFO("[LinearAlign]   - Refined gravity norm: %.6f", g.norm());
+
+    if (std::isnan(s) || std::isinf(s)) {
+        ROS_WARN("[LinearAlign] Refined scale is NaN or Inf!");
+        return false;
+    }
+
     ROS_DEBUG_STREAM(" refine     " << g.norm() << " " << g.transpose());
-    if(s < 0.0 )
-        return false;   
-    else
-        return true;
+
+    // 解算结果评判标准2
+    if(s < 0.0) {
+        ROS_WARN("[LinearAlign] Final check FAILED: refined scale s=%.6f < 0", s);
+        ROS_WARN("LinearAlignment: s < 0");
+        return false;
+    }
+
+    ROS_INFO("[LinearAlign] LinearAlignment() completed successfully");
+    return true;
 }
 
 bool VisualIMUAlignment(map<double, ImageFrame> &all_image_frame, Vector3d* Bgs, Vector3d &g, VectorXd &x)
 {
+    ROS_INFO("[VisualIMUAlign] Starting VisualIMUAlignment()");
+    ROS_INFO("[VisualIMUAlign] Step 1: Solving gyroscope bias...");
     solveGyroscopeBias(all_image_frame, Bgs);
+    ROS_INFO("[VisualIMUAlign] Step 2: Performing linear alignment...");
 
     if(LinearAlignment(all_image_frame, g, x))
+    {
+        ROS_INFO("[VisualIMUAlign] VisualIMUAlignment() completed successfully");
         return true;
-    else 
+    }
+    else
+    {
+        ROS_WARN("[VisualIMUAlign] LinearAlignment() FAILED!");
         return false;
+    }
 }

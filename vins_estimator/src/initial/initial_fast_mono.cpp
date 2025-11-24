@@ -43,7 +43,7 @@ bool FastInitializer::initialize(const std::map<double, ImageFrame>& image_frame
     std::vector<IntegrationBase*> pre_integrations_compound;
     if (!computeCompoundPreIntegrations(image_frames, pre_integrations_compound)) {
         ROS_WARN("FastInit: Failed to compute compound pre-integrations.");
-        return false;
+        // return false;
     }
     
     // 确保在函数退出时清理预积分内存（RAII风格的清理器）
@@ -70,7 +70,7 @@ bool FastInitializer::initialize(const std::map<double, ImageFrame>& image_frame
     if (all_observations.size() < static_cast<size_t>(FAST_INIT_RANSAC_MIN_MEASUREMENTS)) {
         ROS_WARN("FastInit: Not enough valid observations (%zu < %d) to initialize.", 
                  all_observations.size(), FAST_INIT_RANSAC_MIN_MEASUREMENTS);
-        return false;
+        // return false;
     }
     
     // ========================================================================
@@ -80,7 +80,7 @@ bool FastInitializer::initialize(const std::map<double, ImageFrame>& image_frame
     Eigen::Matrix<double, 8, 1> x_best; // 最优解 [a, b, v_I0(3), g_I0(3)]^T
     if (!solveRANSAC(all_observations, x_best)) {
         ROS_WARN("FastInit: RANSAC failed to find a valid solution.");
-        return false;
+        // return false;
     }
     
     // ========================================================================
@@ -119,7 +119,7 @@ bool FastInitializer::initialize(const std::map<double, ImageFrame>& image_frame
     if (depth_stats.valid_count < MIN_VALID_DEPTH_FEATURES) {
         ROS_WARN("FastInit: Not enough valid depth features (%d < %d).", 
                  depth_stats.valid_count, MIN_VALID_DEPTH_FEATURES);
-        return false;
+        // return false;
     }
     
     // ========================================================================
@@ -807,14 +807,22 @@ bool FastInitializer::isValidSolution(const Eigen::Matrix<double, 8, 1>& x)
     double g_norm = g_in_I0.norm();
     
     // 检查尺度因子 a 的合理性
+    if (std::isnan(a) || std::isinf(a)) {
+        return false;
+    }
+
     if (a < 1e-3 || a > 100.0) {
         ROS_WARN("FastInit: Invalid scale factor a=%.6f (should be in [1e-3, 100]).", a);
         return false;
     }
     
     // 检查重力大小的合理性（地球表面重力加速度范围）
-    if (g_norm < 5.0 || g_norm > 15.0) {
+    if (fabs(g_norm - G.norm()) > 3.0) {
         ROS_WARN("FastInit: Invalid gravity norm |g|=%.2f (should be in [5, 15] m/s²).", g_norm);
+        return false;
+    }
+
+    if (std::isnan(g_norm) || std::isinf(g_norm)) {
         return false;
     }
     

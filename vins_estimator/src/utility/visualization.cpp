@@ -105,6 +105,7 @@ void printStatistics(const Estimator &estimator, double t)
 
 void pubOdometry(const Estimator &estimator, const std_msgs::Header &header)
 {
+    // 增加initial，为了做初始化的实验，评估初始化轨迹
     if (estimator.solver_flag == Estimator::SolverFlag::NON_LINEAR)
     {
         nav_msgs::Odometry odometry;
@@ -423,6 +424,12 @@ void pubKeyframe(const Estimator &estimator)
     // pub camera pose, 2D-3D points of keyframe
     if (estimator.solver_flag == Estimator::SolverFlag::NON_LINEAR && estimator.marginalization_flag == 0)
     {
+        // 确保 WINDOW_SIZE >= 2，否则跳过
+        if (WINDOW_SIZE < 2) {
+            ROS_WARN_THROTTLE(5.0, "WINDOW_SIZE (%d) < 2, skipping pubKeyframe", WINDOW_SIZE);
+            return;
+        }
+
         int i = WINDOW_SIZE - 2;
         //Vector3d P = estimator.Ps[i] + estimator.Rs[i] * estimator.tic[0];
         Vector3d P = estimator.Ps[i];
