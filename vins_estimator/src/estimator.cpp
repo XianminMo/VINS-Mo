@@ -296,6 +296,15 @@ void Estimator::estimateDepthScaleShift()
     int features_checked = 0;
     int features_with_depth = 0;
 
+    // 诊断计数器
+    int features_triangulated = 0;
+    int features_valid_depth_vins = 0;
+    int features_with_observations = 0;
+    int obs_frames_checked = 0;
+    int obs_frames_with_depth_map = 0;
+    int obs_out_of_bounds = 0;
+    int obs_invalid_depth_net = 0;
+
     // 遍历特征管理器中的所有特征点
     for (auto &it_per_id : f_manager.feature)
     {
@@ -305,6 +314,8 @@ void Estimator::estimateDepthScaleShift()
         if (it_per_id.solve_flag != 1)
             continue;
 
+        features_triangulated++;
+
         // 获取VINS三角化的深度（逆深度的倒数）
         double depth_vins = 1.0 / it_per_id.estimated_depth;
 
@@ -312,11 +323,20 @@ void Estimator::estimateDepthScaleShift()
         if (depth_vins < 0.1 || depth_vins > 10.0 || !std::isfinite(depth_vins))
             continue;
 
+        features_valid_depth_vins++;
+
         // 遍历特征点的所有观测帧，查找有深度图的帧
         // 修复：不只检查首次观测帧，而是遍历所有观测帧
         bool found_valid_depth = false;
-        for (int obs_idx = 0; obs_idx < it_per_id.feature_per_frame.size() && !found_valid_depth; obs_idx++)
+        int feature_obs_count = it_per_id.feature_per_frame.size();
+
+        if (feature_obs_count > 0)
+            features_with_observations++;
+
+        for (int obs_idx = 0; obs_idx < feature_obs_count && !found_valid_depth; obs_idx++)
         {
+            obs_frames_checked++;
+
             int frame_id = it_per_id.start_frame + obs_idx;
             if (frame_id < 0 || frame_id >= WINDOW_SIZE + 1)
                 continue;
@@ -338,6 +358,8 @@ void Estimator::estimateDepthScaleShift()
             if (!image_frame.depth_map_computed || image_frame.predicted_depth_map.empty())
                 continue;
 
+            obs_frames_with_depth_map++;
+
             const cv::Mat& depth_map = image_frame.predicted_depth_map;
 
             // 边界检查
@@ -345,14 +367,20 @@ void Estimator::estimateDepthScaleShift()
             int v = static_cast<int>(uv.y() + 0.5);
 
             if (v < 0 || v >= depth_map.rows || u < 0 || u >= depth_map.cols)
+            {
+                obs_out_of_bounds++;
                 continue;
+            }
 
             // 读取网络预测的归一化逆深度
             double depth_net = static_cast<double>(depth_map.at<float>(v, u));
 
             // 检查深度值有效性
             if (!std::isfinite(depth_net) || depth_net < 1e-6 || depth_net > 100.0)
+            {
+                obs_invalid_depth_net++;
                 continue;
+            }
 
             // 找到有效的深度配对，收集数据
             depth_net_vec.push_back(depth_net);
@@ -361,6 +389,18 @@ void Estimator::estimateDepthScaleShift()
             found_valid_depth = true;  // 标记已找到，跳出循环
         }
     }
+
+    // 打印详细的诊断信息
+    ROS_INFO("[Depth Init] Diagnostic info:");
+    ROS_INFO("[Depth Init]   Features checked: %d", features_checked);
+    ROS_INFO("[Depth Init]   Features triangulated (solve_flag==1): %d", features_triangulated);
+    ROS_INFO("[Depth Init]   Features with valid depth_vins: %d", features_valid_depth_vins);
+    ROS_INFO("[Depth Init]   Features with observations: %d", features_with_observations);
+    ROS_INFO("[Depth Init]   Observation frames checked: %d", obs_frames_checked);
+    ROS_INFO("[Depth Init]   Observation frames with depth map: %d", obs_frames_with_depth_map);
+    ROS_INFO("[Depth Init]   Observations out of bounds: %d", obs_out_of_bounds);
+    ROS_INFO("[Depth Init]   Observations with invalid depth_net: %d", obs_invalid_depth_net);
+    ROS_INFO("[Depth Init]   Final valid pairing points: %d", features_with_depth);
 
     // 检查数据点数量是否足够
     const int min_points = 20;
