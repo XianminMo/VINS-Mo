@@ -173,6 +173,188 @@ void Estimator::clearState()
 }
 
 /**
+ * @brief 在线估计深度尺度偏移参数（初始化完成后调用）
+ *
+ * 通过线性回归对齐VINS三角化深度和网络预测深度：
+ * depth_vins = a * depth_net + b
+ *
+ * 算法流程：
+ * 1. 遍历滑动窗口中所有已成功三角化的特征点
+ * 2. 对每个特征点，找到对应帧的网络预测深度值
+ * 3. 构建线性最小二乘系统并求解
+ * 4. 更新全局参数 para_DepthScaleShift 和随机游走历史值
+ */
+void Estimator::estimateDepthScaleShift()
+{
+    if (!ESTIMATE_DEPTH_SCALE_SHIFT)
+    {
+        ROS_WARN("[Depth Init] Depth constraint is disabled, skipping online alignment.");
+        return;
+    }
+
+    // 数据收集：配对 (depth_net, depth_vins)
+    std::vector<double> depth_net_vec;
+    std::vector<double> depth_vins_vec;
+
+    int features_checked = 0;
+    int features_with_depth = 0;
+
+    // 遍历特征管理器中的所有特征点
+    for (auto &it_per_id : f_manager.feature)
+    {
+        features_checked++;
+
+        // 只使用已成功三角化的特征点
+        if (it_per_id.solve_flag != 1)
+            continue;
+
+        // 获取VINS三角化的深度（逆深度的倒数）
+        double depth_vins = 1.0 / it_per_id.estimated_depth;
+
+        // 过滤不合理的深度值
+        if (depth_vins < 0.1 || depth_vins > 10.0 || !std::isfinite(depth_vins))
+            continue;
+
+        // 获取特征点首次观测帧的信息
+        int first_frame_id = it_per_id.start_frame;
+        if (first_frame_id < 0 || first_frame_id >= WINDOW_SIZE + 1)
+            continue;
+
+        // 获取特征点在首次观测帧中的像素坐标
+        const auto& feature_per_frame = it_per_id.feature_per_frame[0];
+        Eigen::Vector2d uv = feature_per_frame.uv;
+
+        // 找到对应的ImageFrame
+        double timestamp = Headers[first_frame_id].stamp.toSec();
+        auto frame_it = all_image_frame.find(timestamp);
+
+        if (frame_it == all_image_frame.end())
+            continue;
+
+        const auto& image_frame = frame_it->second;
+
+        // 检查该帧是否有深度图
+        if (!image_frame.depth_map_computed || image_frame.predicted_depth_map.empty())
+            continue;
+
+        const cv::Mat& depth_map = image_frame.predicted_depth_map;
+
+        // 边界检查
+        int u = static_cast<int>(uv.x() + 0.5);
+        int v = static_cast<int>(uv.y() + 0.5);
+
+        if (v < 0 || v >= depth_map.rows || u < 0 || u >= depth_map.cols)
+            continue;
+
+        // 读取网络预测的归一化逆深度
+        double depth_net = static_cast<double>(depth_map.at<float>(v, u));
+
+        // 检查深度值有效性
+        if (!std::isfinite(depth_net) || depth_net < 1e-6 || depth_net > 100.0)
+            continue;
+
+        // 收集有效的配对数据
+        depth_net_vec.push_back(depth_net);
+        depth_vins_vec.push_back(depth_vins);
+        features_with_depth++;
+    }
+
+    // 检查数据点数量是否足够
+    const int min_points = 20;
+    if (features_with_depth < min_points)
+    {
+        ROS_WARN("[Depth Init] Alignment failed: only %d valid points (need >= %d). Using config values.",
+                 features_with_depth, min_points);
+        return;
+    }
+
+    // 构建线性最小二乘系统：
+    // min Σ ||depth_vins - (a * depth_net + b)||²
+    //
+    // 正规方程：
+    // [Σ(d_net²)   Σ(d_net)] [a]   [Σ(d_net * d_vins)]
+    // [Σ(d_net)    N       ] [b] = [Σ(d_vins)        ]
+
+    double sum_dn_dn = 0.0;  // Σ(depth_net²)
+    double sum_dn = 0.0;     // Σ(depth_net)
+    double sum_dn_dv = 0.0;  // Σ(depth_net * depth_vins)
+    double sum_dv = 0.0;     // Σ(depth_vins)
+    double N = static_cast<double>(features_with_depth);
+
+    for (size_t i = 0; i < depth_net_vec.size(); ++i)
+    {
+        double dn = depth_net_vec[i];
+        double dv = depth_vins_vec[i];
+
+        sum_dn_dn += dn * dn;
+        sum_dn += dn;
+        sum_dn_dv += dn * dv;
+        sum_dv += dv;
+    }
+
+    // 构建 2x2 矩阵
+    Eigen::Matrix2d A;
+    A(0, 0) = sum_dn_dn;
+    A(0, 1) = sum_dn;
+    A(1, 0) = sum_dn;
+    A(1, 1) = N;
+
+    Eigen::Vector2d b;
+    b(0) = sum_dn_dv;
+    b(1) = sum_dv;
+
+    // 求解线性系统
+    Eigen::Vector2d x = A.ldlt().solve(b);
+
+    double estimated_a = x(0);
+    double estimated_b = x(1);
+
+    // 合理性检查
+    const double a_min = 1e-3;
+    const double a_max = 10.0;
+    const double b_min = -5.0;
+    const double b_max = 5.0;
+
+    if (estimated_a < a_min || estimated_a > a_max ||
+        estimated_b < b_min || estimated_b > b_max ||
+        !std::isfinite(estimated_a) || !std::isfinite(estimated_b))
+    {
+        ROS_WARN("[Depth Init] Alignment failed: unreasonable values (a=%.6f, b=%.6f). Using config values.",
+                 estimated_a, estimated_b);
+        return;
+    }
+
+    // 计算残差（用于评估拟合质量）
+    double residual_sum = 0.0;
+    for (size_t i = 0; i < depth_net_vec.size(); ++i)
+    {
+        double predicted = estimated_a * depth_net_vec[i] + estimated_b;
+        double error = depth_vins_vec[i] - predicted;
+        residual_sum += error * error;
+    }
+    double rmse = std::sqrt(residual_sum / N);
+
+    // 更新全局参数
+    para_DepthScaleShift[0][0] = estimated_a;
+    para_DepthScaleShift[0][1] = estimated_b;
+
+    // 同时更新全局配置（供输出日志使用）
+    DEPTH_SCALE_A = estimated_a;
+    DEPTH_SHIFT_B = estimated_b;
+
+    // 更新随机游走模型的历史值
+    last_depth_a = estimated_a;
+    last_depth_b = estimated_b;
+    has_last_depth_params = true;
+
+    // 输出对齐结果
+    ROS_INFO("[Depth Init] ✓ Online alignment successful:");
+    ROS_INFO("[Depth Init]   Valid points: %d / %d checked", features_with_depth, features_checked);
+    ROS_INFO("[Depth Init]   Estimated: a = %.6f, b = %.6f", estimated_a, estimated_b);
+    ROS_INFO("[Depth Init]   RMSE: %.4f m", rmse);
+}
+
+/**
  * @brief 处理收到的IMU数据
  * 
  * @param dt 时间间隔
@@ -369,6 +551,11 @@ void Estimator::processImage(const map<int, vector<pair<int, Eigen::Matrix<doubl
                 // 打印初始化刚完成时对应图像时间戳（用于对齐真值）
                 double init_ts = header.stamp.toSec();
                 ROS_INFO("Init completed at stamp: %.9f s", init_ts);
+
+                // *** 在线估计深度尺度偏移参数 ***
+                // 无论使用快速初始化还是标准SFM初始化，都执行这个对齐过程
+                // 这为后端优化提供更准确的初始值，避免硬编码参数导致的尺度漂移
+                estimateDepthScaleShift();
 
                 solver_flag = NON_LINEAR; // 切换到非线性优化模式
                 solveOdometry();          // 立即进行一次后端优化

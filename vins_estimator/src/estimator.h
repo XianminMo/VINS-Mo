@@ -62,6 +62,17 @@ class Estimator
         return mp_depth_estimator && mp_depth_estimator->isReady();
     }
 
+    /**
+     * @brief 在线估计深度尺度偏移参数（初始化完成后调用）
+     *
+     * 使用当前滑动窗口中的特征点，通过线性回归计算最优的 a, b 参数。
+     * 对齐公式：depth_vins = a * depth_net + b
+     *
+     * 这个函数会在VIO初始化成功后被调用，为后端优化提供更好的初始值。
+     * 无论使用快速初始化还是标准SFM初始化，都会执行这个对齐过程。
+     */
+    void estimateDepthScaleShift();
+
     // Fast initialization helper methods
     /**
      * @brief 尝试计算窗口第一帧的深度图
