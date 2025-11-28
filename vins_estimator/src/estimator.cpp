@@ -810,7 +810,12 @@ void Estimator::processImage(const map<int, vector<pair<int, Eigen::Matrix<doubl
      std::lock_guard<std::mutex> lock(m_depth_mutex);
      m_first_frame_depth_map = depth_map;
      m_first_frame_depth_computed = true;
-     
+
+     // *** FIX: 同时更新 ImageFrame 的深度图数据 ***
+     // 这样 ensureDepthMapForAlignment() 才能检测到深度图已存在，避免重复推理
+     first_frame_it->second.predicted_depth_map = depth_map;
+     first_frame_it->second.depth_map_computed = true;
+
      // 查找对应的 frame_id 并记录
      for (int i = 0; i <= WINDOW_SIZE; i++) {
          if (std::abs(Headers[i].stamp.toSec() - first_frame_stamp) < 1e-6) {
