@@ -34,6 +34,8 @@ double DEPTH_SCALE_A;
 double DEPTH_SHIFT_B;
 double DEPTH_FACTOR_WEIGHT;
 double DEPTH_FACTOR_HUBER_THRESHOLD;
+double DEPTH_A_RANDOM_WALK;
+double DEPTH_B_RANDOM_WALK;
 
 // Fast Init parameters (defaults will be overridden by YAML if provided)
 int FAST_INIT_MIN_FEATURES;
@@ -231,16 +233,20 @@ void readParameters(ros::NodeHandle &n)
 
     // --- 读取深度传感器因子约束参数 (Backend Depth Constraint) ---
     ESTIMATE_DEPTH_SCALE_SHIFT = readOr("depth_constraint.estimate_scale_shift", 0);
-    DEPTH_SCALE_A = readOr("depth_constraint.initial_scale_a", 1.0);
-    DEPTH_SHIFT_B = readOr("depth_constraint.initial_shift_b", 0.0);
+    DEPTH_SCALE_A = readOr("depth_constraint.initial_scale_a", 0.08);  // 使用实验得到的最佳初值
+    DEPTH_SHIFT_B = readOr("depth_constraint.initial_shift_b", 0.21);  // 使用实验得到的最佳初值
     DEPTH_FACTOR_WEIGHT = readOr("depth_constraint.weight", 1.0);
     DEPTH_FACTOR_HUBER_THRESHOLD = readOr("depth_constraint.huber_threshold", 1.0);
+    DEPTH_A_RANDOM_WALK = readOr("depth_constraint.random_walk_a", 5e-4);  // 随机游走噪声
+    DEPTH_B_RANDOM_WALK = readOr("depth_constraint.random_walk_b", 5e-4);  // 随机游走噪声
 
     if (ESTIMATE_DEPTH_SCALE_SHIFT)
     {
         ROS_INFO("Backend Depth Constraint ENABLED:");
         ROS_INFO("  Initial Scale (a): %.4f", DEPTH_SCALE_A);
         ROS_INFO("  Initial Shift (b): %.4f", DEPTH_SHIFT_B);
+        ROS_INFO("  Random Walk Noise (a): %.6f", DEPTH_A_RANDOM_WALK);
+        ROS_INFO("  Random Walk Noise (b): %.6f", DEPTH_B_RANDOM_WALK);
         ROS_INFO("  Factor Weight: %.4f", DEPTH_FACTOR_WEIGHT);
         ROS_INFO("  Huber Threshold: %.4f", DEPTH_FACTOR_HUBER_THRESHOLD);
     }

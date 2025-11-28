@@ -18,6 +18,7 @@
 #include "factor/projection_td_factor.h"
 #include "factor/marginalization_factor.h"
 #include "factor/depth_factor.h"  // 深度传感器因子
+#include "factor/depth_scale_shift_random_walk_factor.h"  // 深度参数随机游走因子
 
 #include <unordered_map>
 #include <queue>
@@ -176,6 +177,10 @@ class Estimator
     // d_nn: MiDaS预测的归一化逆深度
     // d_metric: 真实的度量深度
     double para_DepthScaleShift[1][2];
+    // 存储上一次优化后的深度参数（用于随机游走先验）
+    double last_depth_a;
+    double last_depth_b;
+    bool has_last_depth_params;  // 标记是否有上一次的参数值
 
     int loop_window_index;
 

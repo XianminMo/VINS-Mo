@@ -151,6 +151,11 @@ void Estimator::clearState()
     para_DepthScaleShift[0][0] = DEPTH_SCALE_A;  // 尺度因子 a
     para_DepthScaleShift[0][1] = DEPTH_SHIFT_B;  // 偏移因子 b
 
+    // 初始化随机游走相关变量
+    last_depth_a = DEPTH_SCALE_A;
+    last_depth_b = DEPTH_SHIFT_B;
+    has_last_depth_params = false;  // 系统刚启动，没有"上一次"的值
+
     // 添加对我们新成员变量的重置
     {
         // 使用互斥锁保护深度图相关成员变量的访问，确保线程安全
@@ -424,8 +429,8 @@ void Estimator::processImage(const map<int, vector<pair<int, Eigen::Matrix<doubl
 
             if (depth_computed_count > 0)
             {
-                ROS_INFO("[Backend] Computed depth maps for %d frames (%.1f ms)",
-                         depth_computed_count, t_depth_backend.toc());
+                // ROS_INFO("[Backend] Computed depth maps for %d frames (%.1f ms)",
+                //          depth_computed_count, t_depth_backend.toc());
             }
         }
 
@@ -1184,14 +1189,18 @@ void Estimator::double2vector()
         double delta_a = DEPTH_SCALE_A - old_a;
         double delta_b = DEPTH_SHIFT_B - old_b;
 
-        // 打印优化结果（定期输出或参数变化显著时输出）
-        ROS_DEBUG("Depth Scale/Shift updated: a=%.6f, b=%.6f", DEPTH_SCALE_A, DEPTH_SHIFT_B);
+        // 更新随机游走模型的"上一次"值
+        last_depth_a = DEPTH_SCALE_A;
+        last_depth_b = DEPTH_SHIFT_B;
+        has_last_depth_params = true;
 
-        if (std::abs(delta_a) > 1e-4 || std::abs(delta_b) > 1e-4)
-        {
-            ROS_INFO_THROTTLE(3.0, "[Backend] Depth params optimized: a=%.4f (delta%.4f), b=%.4f (delta%.4f)",
-                             DEPTH_SCALE_A, delta_a, DEPTH_SHIFT_B, delta_b);
-        }
+        // 定期打印深度参数的变化轨迹（用于验证随机游走效果）
+        static int frame_counter = 0;
+        frame_counter++;
+
+        // 降低打印频率，每帧都打印
+        ROS_INFO("[DepthParams] Frame %d: a=%.6f (delta %.6f), b=%.6f (delta %.6f)",
+                 frame_counter, DEPTH_SCALE_A, delta_a, DEPTH_SHIFT_B, delta_b);
     }
 
     // 如果有重定位信息，计算漂移修正
@@ -1436,6 +1445,8 @@ void Estimator::optimization()
 
         TicToc t_depth_factor;
         int depth_factor_cnt = 0;
+        int features_checked = 0;
+        int frames_with_depth = 0;
 
         // 创建鲁棒核函数（用于处理深度估计的异常值）
         ceres::LossFunction *depth_loss_function = new ceres::CauchyLoss(DEPTH_FACTOR_HUBER_THRESHOLD);
@@ -1449,6 +1460,7 @@ void Estimator::optimization()
                 continue;
 
             ++feature_index;
+            features_checked++;
 
             int first_obs_frame_id = it_per_id.start_frame;
             Vector3d pts_i = it_per_id.feature_per_frame[0].point;  // 特征在首次观测帧的归一化坐标
@@ -1470,6 +1482,7 @@ void Estimator::optimization()
                 if (frame_it == all_image_frame.end() || !frame_it->second.depth_map_computed)
                     continue;  // 没有可用的深度图
 
+                frames_with_depth++;
                 auto& frame = frame_it->second;
                 const cv::Mat& depth_map = frame.predicted_depth_map;
 
@@ -1488,7 +1501,7 @@ void Estimator::optimization()
 
                 // 检查测量值有效性
                 const double min_valid_inv_depth = 1e-6;
-                const double max_valid_inv_depth = 10.0;
+                const double max_valid_inv_depth = 100.0;
                 if (d_nn <= min_valid_inv_depth || d_nn > max_valid_inv_depth)
                     continue;  // 无效测量
 
@@ -1509,22 +1522,53 @@ void Estimator::optimization()
 
         ROS_DEBUG("depth factor count: %d, time: %.2f ms", depth_factor_cnt, t_depth_factor.toc());
 
-        // 输出深度约束信息
+        // 输出深度约束信息（添加更多诊断信息）
         if (depth_factor_cnt > 0)
         {
-            ROS_INFO_THROTTLE(5.0, "[Backend] Depth factors: %d (Scale a=%.4f, Shift b=%.4f)",
-                             depth_factor_cnt, DEPTH_SCALE_A, DEPTH_SHIFT_B);
+            ROS_INFO("[Backend] Depth factors: %d (checked %d features, %d frames with depth) | a=%.6f, b=%.6f",
+                     depth_factor_cnt, features_checked, frames_with_depth, DEPTH_SCALE_A, DEPTH_SHIFT_B);
         }
         else
         {
-            ROS_WARN_THROTTLE(10.0, "[Backend] No depth factors added (depth maps may not be computed yet)");
+            static int no_depth_count = 0;
+            no_depth_count++;
+            if (no_depth_count % 5 == 1)  // 每5帧打印一次
+            {
+                ROS_WARN("[Backend] No depth factors! (checked %d features, %d frames with depth maps)",
+                         features_checked, frames_with_depth);
+            }
         }
 
-        // 如果没有添加任何深度因子，则将参数块设为常量（避免欠约束）
-        if (depth_factor_cnt == 0)
+        // --- 添加随机游走先验因子 (Random Walk Prior) ---
+        // 如果有上一次的参数值，添加随机游走先验约束参数变化不要太大
+        // 即使没有深度因子，这个先验也能提供约束，避免参数发散
+        if (has_last_depth_params && solver_flag == NON_LINEAR)
         {
-            ROS_DEBUG("No depth factors added, fixing para_DepthScaleShift");
-            problem.SetParameterBlockConstant(para_DepthScaleShift[0]);
+            // 创建随机游走先验因子
+            DepthScaleShiftRandomWalkFactor* random_walk_factor =
+                new DepthScaleShiftRandomWalkFactor(
+                    last_depth_a, last_depth_b,
+                    DEPTH_A_RANDOM_WALK, DEPTH_B_RANDOM_WALK);
+
+            // 添加残差块（不使用鲁棒核函数，因为这是一个软约束）
+            problem.AddResidualBlock(random_walk_factor, nullptr, para_DepthScaleShift[0]);
+
+            ROS_DEBUG("[Backend] Added random walk prior: last_a=%.6f, last_b=%.6f, sigma_a=%.6f, sigma_b=%.6f",
+                     last_depth_a, last_depth_b, DEPTH_A_RANDOM_WALK, DEPTH_B_RANDOM_WALK);
+        }
+        else if (solver_flag == NON_LINEAR)
+        {
+            // 第一次优化，没有先验，但如果有深度因子就不需要固定参数
+            if (depth_factor_cnt == 0)
+            {
+                // 没有深度因子也没有先验，必须固定参数避免欠约束
+                ROS_DEBUG("No depth factors and no prior, fixing para_DepthScaleShift");
+                problem.SetParameterBlockConstant(para_DepthScaleShift[0]);
+            }
+            else
+            {
+                ROS_INFO_THROTTLE(5.0, "[Backend] First optimization with depth factors, no random walk prior yet");
+            }
         }
     }
 
