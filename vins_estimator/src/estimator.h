@@ -73,6 +73,16 @@ class Estimator
      */
     void estimateDepthScaleShift();
 
+    /**
+     * @brief 确保至少有一帧深度图可用于参数对齐
+     * @return true 如果成功计算或已存在深度图
+     *
+     * 这个函数在初始化完成后调用，确保有足够的深度图数据用于估计a,b参数。
+     * 对于快速初始化，第一帧深度图已存在，直接返回true。
+     * 对于传统SFM初始化，需要计算一帧深度图（选择特征最多的帧）。
+     */
+    bool ensureDepthMapForAlignment();
+
     // Fast initialization helper methods
     /**
      * @brief 尝试计算窗口第一帧的深度图

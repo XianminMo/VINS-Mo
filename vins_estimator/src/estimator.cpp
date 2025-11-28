@@ -173,6 +173,103 @@ void Estimator::clearState()
 }
 
 /**
+ * @brief 确保至少有一帧深度图可用于参数对齐
+ * @return true 如果成功计算或已存在深度图
+ *
+ * 这个函数在初始化完成后调用，确保有足够的深度图数据用于估计a,b参数。
+ *
+ * **工作流程**：
+ * 1. 检查是否启用了深度约束，如果未启用则直接返回false
+ * 2. 检查滑动窗口中是否已有深度图（通过遍历all_image_frame）
+ * 3. 如果已有深度图，直接返回true（快速初始化路径会走到这里）
+ * 4. 如果没有深度图（传统SFM初始化路径），则计算一帧：
+ *    - 选择当前帧（WINDOW_SIZE）或特征最多的帧
+ *    - 等待深度估计模型就绪
+ *    - 推理深度图并存储
+ * 5. 返回是否成功
+ *
+ * **设计理由**：
+ * - 快速初始化已经计算了第一帧深度图，无需重复计算
+ * - 传统SFM初始化没有深度图，需要计算一帧
+ * - 只计算一帧（~50-100ms），避免推理多帧的高延迟
+ * - 一帧的特征点（~150个）足以求解2个参数（a, b）
+ */
+bool Estimator::ensureDepthMapForAlignment()
+{
+    // 1. 检查是否启用深度约束
+    if (!ESTIMATE_DEPTH_SCALE_SHIFT)
+    {
+        return false;
+    }
+
+    // 2. 检查深度估计器是否可用
+    if (!mp_depth_estimator || !mp_depth_estimator->isReady())
+    {
+        ROS_WARN("[Depth Alignment] Depth estimator not ready, skipping depth map computation.");
+        return false;
+    }
+
+    // 3. 检查滑动窗口中是否已有深度图
+    int frames_with_depth = 0;
+    for (int i = 0; i <= WINDOW_SIZE; i++)
+    {
+        double timestamp = Headers[i].stamp.toSec();
+        auto frame_it = all_image_frame.find(timestamp);
+        if (frame_it != all_image_frame.end() && frame_it->second.depth_map_computed)
+        {
+            frames_with_depth++;
+        }
+    }
+
+    if (frames_with_depth > 0)
+    {
+        ROS_INFO("[Depth Alignment] Found %d frames with depth maps, no need to compute.", frames_with_depth);
+        return true;  // 已有深度图（快速初始化路径）
+    }
+
+    // 4. 没有深度图，需要计算一帧（传统SFM初始化路径）
+    ROS_INFO("[Depth Alignment] No depth maps found, computing one frame for parameter alignment...");
+
+    // 选择当前帧（WINDOW_SIZE）- 通常特征较多
+    int selected_frame_id = WINDOW_SIZE;
+    double timestamp = Headers[selected_frame_id].stamp.toSec();
+    auto frame_it = all_image_frame.find(timestamp);
+
+    if (frame_it == all_image_frame.end())
+    {
+        ROS_WARN("[Depth Alignment] Cannot find frame %d in all_image_frame.", selected_frame_id);
+        return false;
+    }
+
+    auto& frame = frame_it->second;
+
+    // 检查原始图像是否可用
+    if (frame.raw_image.empty())
+    {
+        ROS_WARN("[Depth Alignment] Frame %d has no raw image, cannot compute depth.", selected_frame_id);
+        return false;
+    }
+
+    // 计算深度图
+    TicToc t_depth;
+    cv::Mat depth_map;
+    if (!mp_depth_estimator->predict(frame.raw_image, depth_map))
+    {
+        ROS_WARN("[Depth Alignment] Depth prediction failed for frame %d.", selected_frame_id);
+        return false;
+    }
+
+    // 存储深度图
+    frame.predicted_depth_map = depth_map;
+    frame.depth_map_computed = true;
+
+    ROS_INFO("[Depth Alignment] Computed depth map for frame %d (%.2f ms).",
+             selected_frame_id, t_depth.toc());
+
+    return true;
+}
+
+/**
  * @brief 在线估计深度尺度偏移参数（初始化完成后调用）
  *
  * 通过线性回归对齐VINS三角化深度和网络预测深度：
@@ -551,6 +648,11 @@ void Estimator::processImage(const map<int, vector<pair<int, Eigen::Matrix<doubl
                 // 打印初始化刚完成时对应图像时间戳（用于对齐真值）
                 double init_ts = header.stamp.toSec();
                 ROS_INFO("Init completed at stamp: %.9f s", init_ts);
+
+                // *** 确保至少有一帧深度图可用于参数对齐 ***
+                // 快速初始化路径：第一帧深度图已存在，直接返回true
+                // 传统SFM初始化路径：计算一帧深度图（当前帧 WINDOW_SIZE）
+                ensureDepthMapForAlignment();
 
                 // *** 在线估计深度尺度偏移参数 ***
                 // 无论使用快速初始化还是标准SFM初始化，都执行这个对齐过程
