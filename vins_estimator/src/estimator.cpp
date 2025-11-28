@@ -312,48 +312,54 @@ void Estimator::estimateDepthScaleShift()
         if (depth_vins < 0.1 || depth_vins > 10.0 || !std::isfinite(depth_vins))
             continue;
 
-        // 获取特征点首次观测帧的信息
-        int first_frame_id = it_per_id.start_frame;
-        if (first_frame_id < 0 || first_frame_id >= WINDOW_SIZE + 1)
-            continue;
+        // 遍历特征点的所有观测帧，查找有深度图的帧
+        // 修复：不只检查首次观测帧，而是遍历所有观测帧
+        bool found_valid_depth = false;
+        for (int obs_idx = 0; obs_idx < it_per_id.feature_per_frame.size() && !found_valid_depth; obs_idx++)
+        {
+            int frame_id = it_per_id.start_frame + obs_idx;
+            if (frame_id < 0 || frame_id >= WINDOW_SIZE + 1)
+                continue;
 
-        // 获取特征点在首次观测帧中的像素坐标
-        const auto& feature_per_frame = it_per_id.feature_per_frame[0];
-        Eigen::Vector2d uv = feature_per_frame.uv;
+            // 获取特征点在该观测帧中的像素坐标
+            const auto& feature_per_frame = it_per_id.feature_per_frame[obs_idx];
+            Eigen::Vector2d uv = feature_per_frame.uv;
 
-        // 找到对应的ImageFrame
-        double timestamp = Headers[first_frame_id].stamp.toSec();
-        auto frame_it = all_image_frame.find(timestamp);
+            // 找到对应的ImageFrame
+            double timestamp = Headers[frame_id].stamp.toSec();
+            auto frame_it = all_image_frame.find(timestamp);
 
-        if (frame_it == all_image_frame.end())
-            continue;
+            if (frame_it == all_image_frame.end())
+                continue;
 
-        const auto& image_frame = frame_it->second;
+            const auto& image_frame = frame_it->second;
 
-        // 检查该帧是否有深度图
-        if (!image_frame.depth_map_computed || image_frame.predicted_depth_map.empty())
-            continue;
+            // 检查该帧是否有深度图
+            if (!image_frame.depth_map_computed || image_frame.predicted_depth_map.empty())
+                continue;
 
-        const cv::Mat& depth_map = image_frame.predicted_depth_map;
+            const cv::Mat& depth_map = image_frame.predicted_depth_map;
 
-        // 边界检查
-        int u = static_cast<int>(uv.x() + 0.5);
-        int v = static_cast<int>(uv.y() + 0.5);
+            // 边界检查
+            int u = static_cast<int>(uv.x() + 0.5);
+            int v = static_cast<int>(uv.y() + 0.5);
 
-        if (v < 0 || v >= depth_map.rows || u < 0 || u >= depth_map.cols)
-            continue;
+            if (v < 0 || v >= depth_map.rows || u < 0 || u >= depth_map.cols)
+                continue;
 
-        // 读取网络预测的归一化逆深度
-        double depth_net = static_cast<double>(depth_map.at<float>(v, u));
+            // 读取网络预测的归一化逆深度
+            double depth_net = static_cast<double>(depth_map.at<float>(v, u));
 
-        // 检查深度值有效性
-        if (!std::isfinite(depth_net) || depth_net < 1e-6 || depth_net > 100.0)
-            continue;
+            // 检查深度值有效性
+            if (!std::isfinite(depth_net) || depth_net < 1e-6 || depth_net > 100.0)
+                continue;
 
-        // 收集有效的配对数据
-        depth_net_vec.push_back(depth_net);
-        depth_vins_vec.push_back(depth_vins);
-        features_with_depth++;
+            // 找到有效的深度配对，收集数据
+            depth_net_vec.push_back(depth_net);
+            depth_vins_vec.push_back(depth_vins);
+            features_with_depth++;
+            found_valid_depth = true;  // 标记已找到，跳出循环
+        }
     }
 
     // 检查数据点数量是否足够
