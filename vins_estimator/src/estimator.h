@@ -128,6 +128,15 @@ class Estimator
                                           const std::map<int, Eigen::Vector3d>& Vs_init,
                                           const std::map<int, Eigen::Quaterniond>& Rs_init);
 
+     /**
+      * @brief 从快速初始化结果为特征点分配estimated_depth
+      *
+      * 快速初始化内部计算了参数将网络逆深度转为正深度，这里利用这些参数
+      * 和第一帧深度图为滑动窗口中的特征点设置estimated_depth，使得后续的
+      * 在线参数估计能够工作。
+      */
+     void assignEstimatedDepthFromFastInit();
+
     enum SolverFlag
     {
         INITIAL,
@@ -167,7 +176,8 @@ class Estimator
     vector<Vector3d> linear_acceleration_buf[(WINDOW_SIZE + 1)];
     vector<Vector3d> angular_velocity_buf[(WINDOW_SIZE + 1)];
 
-    int frame_count;
+    int frame_count;  // 滑动窗口内的帧计数（初始化后固定为 WINDOW_SIZE）
+    int global_frame_count;  // 全局帧计数器（用于预热策略等，持续增长）
     int sum_of_outlier, sum_of_back, sum_of_front, sum_of_invalid;
 
     FeatureManager f_manager;
@@ -202,6 +212,7 @@ class Estimator
     double last_depth_a;
     double last_depth_b;
     bool has_last_depth_params;  // 标记是否有上一次的参数值
+    bool is_first_depth_optimization;  // 标记是否是第一次深度优化（用于放松随机游走约束）
 
     int loop_window_index;
 

@@ -34,6 +34,7 @@ double DEPTH_SCALE_A;
 double DEPTH_SHIFT_B;
 double DEPTH_FACTOR_WEIGHT;
 double DEPTH_FACTOR_HUBER_THRESHOLD;
+int DEPTH_FUSION_WARMUP_FRAMES;
 double DEPTH_A_RANDOM_WALK;
 double DEPTH_B_RANDOM_WALK;
 
@@ -237,6 +238,7 @@ void readParameters(ros::NodeHandle &n)
     DEPTH_SHIFT_B = readOr("depth_constraint.initial_shift_b", 0.21);  // 使用实验得到的最佳初值
     DEPTH_FACTOR_WEIGHT = readOr("depth_constraint.weight", 1.0);
     DEPTH_FACTOR_HUBER_THRESHOLD = readOr("depth_constraint.huber_threshold", 1.0);
+    DEPTH_FUSION_WARMUP_FRAMES = readOr("depth_constraint.warmup_frames", 50);  // 预热帧数
     DEPTH_A_RANDOM_WALK = readOr("depth_constraint.random_walk_a", 5e-4);  // 随机游走噪声
     DEPTH_B_RANDOM_WALK = readOr("depth_constraint.random_walk_b", 5e-4);  // 随机游走噪声
 
@@ -249,6 +251,7 @@ void readParameters(ros::NodeHandle &n)
         ROS_INFO("  Random Walk Noise (b): %.6f", DEPTH_B_RANDOM_WALK);
         ROS_INFO("  Factor Weight: %.4f", DEPTH_FACTOR_WEIGHT);
         ROS_INFO("  Huber Threshold: %.4f", DEPTH_FACTOR_HUBER_THRESHOLD);
+        ROS_INFO("  Warmup Frames: %d", DEPTH_FUSION_WARMUP_FRAMES);
     }
     else
     {

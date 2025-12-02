@@ -4,7 +4,7 @@
 imu_topic: "/imu0"
 image_topic: "/cam0/image_raw"
 
-output_path: "/home/linux/mxm/output/experiment_backend/V203_test/1128/o-d"
+output_path: "/home/linux/mxm/output/experiment_backend/MH05_test/1202/o-d"
 
 # depth_model_path: "/home/linux/mxm/proj/VINS-Mo/src/VINS-Mo/vins_estimator/models/Midas-V2.onnx" # path to depth estimation model
 depth_model_path: "/home/linux/mxm/proj/VINS-Mo/src/VINS-Mo/vins_estimator/models/depth_anything_v2_vits.onnx" # path to depth estimation model
@@ -37,10 +37,10 @@ fast_init.reg.lambda_v: 1.0e-3            # 正则：初始速度v的权重
 depth_constraint.estimate_scale_shift: 1
 # 深度仿射变换尺度因子 a 的初始值 (1/d_metric = a * d_nn + b)
 # 使用实验得到的最佳初值 a=0.08
-depth_constraint.initial_scale_a: 0.08
+depth_constraint.initial_scale_a: 0.05
 # 深度仿射变换偏移因子 b 的初始值
 # 使用实验得到的最佳初值 b=0.21
-depth_constraint.initial_shift_b: 0.21
+depth_constraint.initial_shift_b: 0.05
 # 深度参数随机游走过程噪声（Random Walk Process Noise）
 # 控制参数在相邻帧之间允许的最大变化量
 # 值越大，参数变化越自由，但可能震荡；值越小，参数变化越保守
@@ -49,10 +49,14 @@ depth_constraint.random_walk_a: 1.0e-3
 depth_constraint.random_walk_b: 1.0e-3
 # 深度因子的权重（控制深度约束对优化的影响强度）
 # 值越大，深度约束越强；建议从 0.1 到 10.0 范围内调整
-depth_constraint.weight: 10
+depth_constraint.weight: 2.5
 # 深度因子的Huber鲁棒核阈值（用于抑制深度估计的异常值）
 # 值越大，对异常值越宽容；建议从 0.5 到 5.0 范围内调整
 depth_constraint.huber_threshold: 1.0
+# 深度融合预热帧数（Warm-up frames）
+# 在前N帧使用L2损失以快速收敛，N帧后切换到Huber损失抑制异常值
+# 建议范围：30-100帧（约1-5秒）
+depth_constraint.warmup_frames: 50
 
 #camera calibration 
 model_type: PINHOLE

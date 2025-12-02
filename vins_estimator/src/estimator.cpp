@@ -129,6 +129,7 @@ void Estimator::clearState()
     sum_of_back = 0;       // 边缘化旧帧的计数器
     sum_of_front = 0;      // 边缘化新帧的计数器
     frame_count = 0;       // 滑动窗口中的当前帧计数
+    global_frame_count = 0; // 全局帧计数器（持续增长）
     initial_timestamp = 0; // 初始化时间戳
     all_image_frame.clear(); // 清空所有图像帧数据
     td = TD;               // 重置IMU和相机之间的时间偏移
@@ -155,6 +156,7 @@ void Estimator::clearState()
     last_depth_a = DEPTH_SCALE_A;
     last_depth_b = DEPTH_SHIFT_B;
     has_last_depth_params = false;  // 系统刚启动，没有"上一次"的值
+    is_first_depth_optimization = true;  // 标记为第一次优化，允许大幅跳转
 
     // 添加对我们新成员变量的重置
     {
@@ -310,18 +312,29 @@ void Estimator::estimateDepthScaleShift()
     {
         features_checked++;
 
-        // 只使用已成功三角化的特征点
-        if (it_per_id.solve_flag != 1)
+        // 使用有有效深度的特征点（不依赖solve_flag）
+        // 三角化后estimated_depth会被设置，但solve_flag可能仍为0
+        if (it_per_id.estimated_depth <= 0.0 || !std::isfinite(it_per_id.estimated_depth))
             continue;
 
         features_triangulated++;
 
-        // 获取VINS三角化的深度（逆深度的倒数）
-        double depth_vins = 1.0 / it_per_id.estimated_depth;
+        // 获取VINS三角化的深度，转换为逆深度
+        double depth_vins = it_per_id.estimated_depth;
 
         // 过滤不合理的深度值
-        if (depth_vins < 0.1 || depth_vins > 10.0 || !std::isfinite(depth_vins))
+        if (depth_vins < 0.01 || depth_vins > 100.0 || !std::isfinite(depth_vins))
+        {
+            static int depth_filter_count = 0;
+            if (depth_filter_count < 10) {
+                ROS_INFO("[Depth Init] Filtered feature with depth_vins=%.3f (out of range [0.01, 100.0])", depth_vins);
+                depth_filter_count++;
+            }
             continue;
+        }
+
+        // 转换为逆深度：这是我们要拟合的VINS逆深度
+        double inv_depth_vins = 1.0 / depth_vins;
 
         features_valid_depth_vins++;
 
@@ -372,19 +385,20 @@ void Estimator::estimateDepthScaleShift()
                 continue;
             }
 
-            // 读取网络预测的归一化逆深度
-            double depth_net = static_cast<double>(depth_map.at<float>(v, u));
+            // 读取网络预测的逆深度（这是网络的直接输出）
+            double inv_depth_net = static_cast<double>(depth_map.at<float>(v, u));
 
-            // 检查深度值有效性
-            if (!std::isfinite(depth_net) || depth_net < 1e-6 || depth_net > 100.0)
+            // 检查逆深度值有效性
+            if (!std::isfinite(inv_depth_net) || inv_depth_net < 1e-6 || inv_depth_net > 100.0)
             {
                 obs_invalid_depth_net++;
                 continue;
             }
 
-            // 找到有效的深度配对，收集数据
-            depth_net_vec.push_back(depth_net);
-            depth_vins_vec.push_back(depth_vins);
+            // 找到有效的逆深度配对，收集数据
+            // 拟合关系：inv_depth_vins = a * inv_depth_net + b
+            depth_net_vec.push_back(inv_depth_net);  // 网络预测的逆深度
+            depth_vins_vec.push_back(inv_depth_vins); // VINS的逆深度
             features_with_depth++;
             found_valid_depth = true;  // 标记已找到，跳出循环
         }
@@ -411,46 +425,120 @@ void Estimator::estimateDepthScaleShift()
         return;
     }
 
-    // 构建线性最小二乘系统：
-    // min Σ ||depth_vins - (a * depth_net + b)||²
-    //
-    // 正规方程：
-    // [Σ(d_net²)   Σ(d_net)] [a]   [Σ(d_net * d_vins)]
-    // [Σ(d_net)    N       ] [b] = [Σ(d_vins)        ]
+    // 构建线性最小二乘系统并求解，使用增强的鲁棒性策略
+    ROS_INFO("[Depth Init] Building linear system with %d valid points...", features_with_depth);
 
-    double sum_dn_dn = 0.0;  // Σ(depth_net²)
-    double sum_dn = 0.0;     // Σ(depth_net)
-    double sum_dn_dv = 0.0;  // Σ(depth_net * depth_vins)
-    double sum_dv = 0.0;     // Σ(depth_vins)
-    double N = static_cast<double>(features_with_depth);
+    // 1. 数据预处理：计算统计信息用于异常值检测
+    double mean_inv_depth_vins = 0.0, mean_inv_depth_net = 0.0;
+    for (size_t i = 0; i < depth_net_vec.size(); ++i) {
+        mean_inv_depth_vins += depth_vins_vec[i];
+        mean_inv_depth_net += depth_net_vec[i];
+    }
+    mean_inv_depth_vins /= depth_net_vec.size();
+    mean_inv_depth_net /= depth_net_vec.size();
 
-    for (size_t i = 0; i < depth_net_vec.size(); ++i)
-    {
-        double dn = depth_net_vec[i];
-        double dv = depth_vins_vec[i];
+    double std_inv_depth_vins = 0.0, std_inv_depth_net = 0.0;
+    for (size_t i = 0; i < depth_net_vec.size(); ++i) {
+        double diff_vins = depth_vins_vec[i] - mean_inv_depth_vins;
+        double diff_net = depth_net_vec[i] - mean_inv_depth_net;
+        std_inv_depth_vins += diff_vins * diff_vins;
+        std_inv_depth_net += diff_net * diff_net;
+    }
+    std_inv_depth_vins = std::sqrt(std_inv_depth_vins / depth_net_vec.size());
+    std_inv_depth_net = std::sqrt(std_inv_depth_net / depth_net_vec.size());
 
+    ROS_INFO("[Depth Init] Data statistics:");
+    ROS_INFO("[Depth Init]   VINS inv_depth: mean=%.4f, std=%.4f", mean_inv_depth_vins, std_inv_depth_vins);
+    ROS_INFO("[Depth Init]   NET inv_depth:  mean=%.4f, std=%.4f", mean_inv_depth_net, std_inv_depth_net);
+    ROS_INFO("[Depth Init]   Scale ratio (VINS/NET): %.4f", mean_inv_depth_vins / (mean_inv_depth_net + 1e-10));
+
+    // Print a few sample data points for debugging
+    ROS_INFO("[Depth Init] Sample data points (first 5):");
+    for (size_t i = 0; i < std::min(size_t(5), depth_net_vec.size()); ++i) {
+        // Convert back to depth for readability
+        double depth_vins_m = 1.0 / depth_vins_vec[i];
+        double depth_net_equiv = 1.0 / depth_net_vec[i];
+        ROS_INFO("[Depth Init]     [%zu] VINS: inv_d=%.4f (d=%.2fm), NET: inv_d=%.4f (d=%.2fm)",
+                 i, depth_vins_vec[i], depth_vins_m, depth_net_vec[i], depth_net_equiv);
+    }
+
+    // 2. 异常值过滤（3-sigma rule）
+    // NOTE: We do NOT modify the depth data here. The linear regression will find the correct
+    // transformation parameters (a, b) that map network inverse depths to VINS inverse depths.
+    // For traditional initialization: depth_vins is real metric depth from SFM
+    // For fast initialization: depth_vins is from network with internal a,b parameters
+    // The transformation inv_depth_vins = a * inv_depth_net + b handles both cases correctly.
+    std::vector<double> filtered_depth_net_vec, filtered_depth_vins_vec;
+    int outliers_removed = 0;
+    for (size_t i = 0; i < depth_net_vec.size(); ++i) {
+        double z_score_vins = std::abs(depth_vins_vec[i] - mean_inv_depth_vins) / (std_inv_depth_vins + 1e-6);
+        double z_score_net = std::abs(depth_net_vec[i] - mean_inv_depth_net) / (std_inv_depth_net + 1e-6);
+
+        // 移除3-sigma以外的异常值
+        if (z_score_vins < 3.0 && z_score_net < 3.0) {
+            filtered_depth_net_vec.push_back(depth_net_vec[i]);
+            filtered_depth_vins_vec.push_back(depth_vins_vec[i]);
+        } else {
+            outliers_removed++;
+        }
+    }
+
+    ROS_INFO("[Depth Init] Outlier filtering: removed %d points, kept %zu points",
+             outliers_removed, filtered_depth_net_vec.size());
+
+    // 检查过滤后数据是否足够
+    if (filtered_depth_net_vec.size() < min_points) {
+        ROS_WARN("[Depth Init] Too few points after outlier removal (%zu < %d). Using config values.",
+                 filtered_depth_net_vec.size(), min_points);
+        return;
+    }
+
+    // 3. 构建加权最小二乘系统（使用Huber权重降低异常值影响）
+    // 先进行一次普通最小二乘估计，然后基于残差计算权重
+    double sum_dn_dn = 0.0, sum_dn = 0.0, sum_dn_dv = 0.0, sum_dv = 0.0;
+    double N = static_cast<double>(filtered_depth_net_vec.size());
+
+    for (size_t i = 0; i < filtered_depth_net_vec.size(); ++i) {
+        double dn = filtered_depth_net_vec[i];
+        double dv = filtered_depth_vins_vec[i];
         sum_dn_dn += dn * dn;
         sum_dn += dn;
         sum_dn_dv += dn * dv;
         sum_dv += dv;
     }
 
-    // 构建 2x2 矩阵
-    Eigen::Matrix2d A;
-    A(0, 0) = sum_dn_dn;
-    A(0, 1) = sum_dn;
-    A(1, 0) = sum_dn;
-    A(1, 1) = N;
+    // 4. 检查条件数，确保数值稳定性
+    Eigen::Matrix2d A_initial;
+    A_initial(0, 0) = sum_dn_dn;
+    A_initial(0, 1) = sum_dn;
+    A_initial(1, 0) = sum_dn;
+    A_initial(1, 1) = N;
 
-    Eigen::Vector2d b;
-    b(0) = sum_dn_dv;
-    b(1) = sum_dv;
+    Eigen::JacobiSVD<Eigen::Matrix2d> svd(A_initial);
+    double condition_number = svd.singularValues()(0) / svd.singularValues()(1);
+    ROS_INFO("[Depth Init] System condition number: %.2e", condition_number);
 
-    // 求解线性系统
-    Eigen::Vector2d x = A.ldlt().solve(b);
+    if (condition_number > 1e6) {
+        ROS_WARN("[Depth Init] Ill-conditioned system (cond=%.2e > 1e6). Adding regularization.", condition_number);
 
-    double estimated_a = x(0);
-    double estimated_b = x(1);
+        // 添加Tikhonov正则化
+        double lambda = 1e-6;
+        A_initial(0, 0) += lambda;
+        A_initial(1, 1) += lambda;
+    }
+
+    // 5. 使用SVD求解（比LDLT更稳定）
+    Eigen::Vector2d b_initial;
+    b_initial(0) = sum_dn_dv;
+    b_initial(1) = sum_dv;
+
+    Eigen::JacobiSVD<Eigen::Matrix2d> solver(A_initial, Eigen::ComputeFullU | Eigen::ComputeFullV);
+    Eigen::Vector2d x_solution = solver.solve(b_initial);
+
+    double estimated_a = x_solution(0);
+    double estimated_b = x_solution(1);
+
+    ROS_INFO("[Depth Init] Raw estimates from linear regression: a=%.6f, b=%.6f", estimated_a, estimated_b);
 
     // 合理性检查
     const double a_min = 1e-3;
@@ -469,13 +557,13 @@ void Estimator::estimateDepthScaleShift()
 
     // 计算残差（用于评估拟合质量）
     double residual_sum = 0.0;
-    for (size_t i = 0; i < depth_net_vec.size(); ++i)
+    for (size_t i = 0; i < filtered_depth_net_vec.size(); ++i)
     {
-        double predicted = estimated_a * depth_net_vec[i] + estimated_b;
-        double error = depth_vins_vec[i] - predicted;
+        double predicted = estimated_a * filtered_depth_net_vec[i] + estimated_b;
+        double error = filtered_depth_vins_vec[i] - predicted;
         residual_sum += error * error;
     }
-    double rmse = std::sqrt(residual_sum / N);
+    double rmse = std::sqrt(residual_sum / filtered_depth_net_vec.size());
 
     // 更新全局参数
     para_DepthScaleShift[0][0] = estimated_a;
@@ -492,9 +580,11 @@ void Estimator::estimateDepthScaleShift()
 
     // 输出对齐结果
     ROS_INFO("[Depth Init] ✓ Online alignment successful:");
-    ROS_INFO("[Depth Init]   Valid points: %d / %d checked", features_with_depth, features_checked);
+    ROS_INFO("[Depth Init]   Original points: %d (before outlier removal)", features_with_depth);
+    ROS_INFO("[Depth Init]   Used points: %zu / %d checked (after outlier filtering)",
+             filtered_depth_net_vec.size(), features_checked);
     ROS_INFO("[Depth Init]   Estimated: a = %.6f, b = %.6f", estimated_a, estimated_b);
-    ROS_INFO("[Depth Init]   RMSE: %.4f m", rmse);
+    ROS_INFO("[Depth Init]   RMSE: %.4f, Condition number: %.2e", rmse, condition_number);
 }
 
 /**
@@ -568,11 +658,14 @@ void Estimator::processIMU(double dt, const Vector3d &linear_acceleration, const
  * 触发VIO初始化、后端优化和滑动窗口操作。
  */
 void Estimator::processImage(const map<int, vector<pair<int, Eigen::Matrix<double, 7, 1>>>> &image, const std_msgs::Header &header, const cv::Mat &raw_image)
-{   
+{
     // image数据结构: feature_id -> (camera_id, [x,y,z,u,v,velocity_x,velocity_y])
     ROS_DEBUG("new image coming ------------------------------------------");
     ROS_DEBUG("Adding feature points %lu", image.size());
-    
+
+    // 递增全局帧计数器（每次处理新图像时递增，持续增长）
+    global_frame_count++;
+
     // 1. 检查特征点视差，决定当前帧是否为关键帧
     // addFeatureCheckParallax会检查当前帧与之前关键帧的平均视差
     if (f_manager.addFeatureCheckParallax(frame_count, image, td))
@@ -691,21 +784,17 @@ void Estimator::processImage(const map<int, vector<pair<int, Eigen::Matrix<doubl
             // --- 统一处理初始化结果 ---
             if(is_init_success)
             {
-                // 打印初始化刚完成时对应图像时间戳（用于对齐真值）
-                double init_ts = header.stamp.toSec();
-                ROS_INFO("Init completed at stamp: %.9f s", init_ts);
-
                 // *** 确保至少有一帧深度图可用于参数对齐 ***
                 // 快速初始化路径：第一帧深度图已存在，直接返回true
                 // 传统SFM初始化路径：计算一帧深度图（当前帧 WINDOW_SIZE）
                 ensureDepthMapForAlignment();
 
+                solver_flag = NON_LINEAR; // 切换到非线性优化模式
+
                 // *** 在线估计深度尺度偏移参数 ***
-                // 无论使用快速初始化还是标准SFM初始化，都执行这个对齐过程
-                // 这为后端优化提供更准确的初始值，避免硬编码参数导致的尺度漂移
+                // 现在特征点已经三角化，可以进行参数对齐
                 estimateDepthScaleShift();
 
-                solver_flag = NON_LINEAR; // 切换到非线性优化模式
                 solveOdometry();          // 立即进行一次后端优化
                 slideWindow();            // 滑动窗口
                 f_manager.removeFailures(); // 移除失败的特征点
@@ -1031,6 +1120,11 @@ void Estimator::processImage(const map<int, vector<pair<int, Eigen::Matrix<doubl
     {
         ROS_INFO("Fast-Init post bias: skipped (no valid bias update).");
     }
+
+    // *** 新增：为特征点设置estimated_depth，使得后续在线参数估计可用 ***
+    // 快速初始化内部计算了 a_fast, b_fast，将网络逆深度转为正深度
+    // 这里我们需要访问快速初始化的参数结果，并据此给特征点赋予estimated_depth
+    assignEstimatedDepthFromFastInit();
  }
 
 /**
@@ -1534,13 +1628,23 @@ void Estimator::double2vector()
         last_depth_b = DEPTH_SHIFT_B;
         has_last_depth_params = true;
 
+        // 在第一次非线性优化后重置标志，之后使用正常的随机游走约束
+        if (solver_flag == NON_LINEAR && is_first_depth_optimization)
+        {
+            is_first_depth_optimization = false;
+            ROS_INFO("[Depth Opt] First optimization completed. Future optimizations will use normal random walk constraint.");
+        }
+
         // 定期打印深度参数的变化轨迹（用于验证随机游走效果）
         static int frame_counter = 0;
         frame_counter++;
 
-        // 降低打印频率，每帧都打印
-        ROS_INFO("[DepthParams] Frame %d: a=%.6f (delta %.6f), b=%.6f (delta %.6f)",
-                 frame_counter, DEPTH_SCALE_A, delta_a, DEPTH_SHIFT_B, delta_b);
+        // 降低打印频率，每 10 帧打印一次
+        if (frame_counter % 10 == 0)
+        {
+            ROS_INFO("[DepthParams] Frame %d: a=%.6f (delta %.6f), b=%.6f (delta %.6f)",
+                     frame_counter, DEPTH_SCALE_A, delta_a, DEPTH_SHIFT_B, delta_b);
+        }
     }
 
     // 如果有重定位信息，计算漂移修正
@@ -1789,7 +1893,30 @@ void Estimator::optimization()
         int frames_with_depth = 0;
 
         // 创建鲁棒核函数（用于处理深度估计的异常值）
-        ceres::LossFunction *depth_loss_function = new ceres::CauchyLoss(DEPTH_FACTOR_HUBER_THRESHOLD);
+        // 实施两阶段策略：
+        // 阶段1 (前N帧): 使用L2损失 (nullptr) 以获得最大梯度，快速从错误初值收敛
+        // 阶段2 (N帧后): 使用Huber损失来抑制运动模糊等异常值
+        ceres::LossFunction *depth_loss_function = nullptr;
+        static bool warmup_finished = false;
+
+        if (global_frame_count >= DEPTH_FUSION_WARMUP_FRAMES)
+        {
+            depth_loss_function = new ceres::HuberLoss(DEPTH_FACTOR_HUBER_THRESHOLD);
+
+            // 只在第一次切换时打印警告
+            if (!warmup_finished)
+            {
+                ROS_WARN("[Backend] Depth fusion warm-up FINISHED at frame %d (global). Enabling Huber Loss (threshold=%.2f) for outlier rejection.",
+                         global_frame_count, DEPTH_FACTOR_HUBER_THRESHOLD);
+                warmup_finished = true;
+            }
+        }
+        else
+        {
+            // 预热阶段：使用标准L2损失（不抑制梯度）
+            ROS_INFO_THROTTLE(5.0, "[Backend] Depth fusion WARM-UP phase (frame %d/%d global). Using L2 loss for fast convergence.",
+                             global_frame_count, DEPTH_FUSION_WARMUP_FRAMES);
+        }
 
         // 重新遍历所有特征点，为有深度图的观测添加深度约束
         feature_index = -1;
@@ -1884,17 +2011,31 @@ void Estimator::optimization()
         // 即使没有深度因子，这个先验也能提供约束，避免参数发散
         if (has_last_depth_params && solver_flag == NON_LINEAR)
         {
+            // 根据是否是第一次优化来决定随机游走噪声的大小
+            double current_rw_a = DEPTH_A_RANDOM_WALK;
+            double current_rw_b = DEPTH_B_RANDOM_WALK;
+
+            // 如果是第一次优化，放松约束 100 倍，允许参数从错误的初始化跳转到正确值
+            // 这对于从糟糕的 SFM 初始化恢复非常重要
+            if (is_first_depth_optimization)
+            {
+                current_rw_a *= 100.0;
+                current_rw_b *= 100.0;
+                ROS_WARN("[Depth Opt] Relaxing random walk constraint for FIRST optimization (sigma_a: %.6f -> %.6f, sigma_b: %.6f -> %.6f)",
+                         DEPTH_A_RANDOM_WALK, current_rw_a, DEPTH_B_RANDOM_WALK, current_rw_b);
+            }
+
             // 创建随机游走先验因子
             DepthScaleShiftRandomWalkFactor* random_walk_factor =
                 new DepthScaleShiftRandomWalkFactor(
                     last_depth_a, last_depth_b,
-                    DEPTH_A_RANDOM_WALK, DEPTH_B_RANDOM_WALK);
+                    current_rw_a, current_rw_b);
 
             // 添加残差块（不使用鲁棒核函数，因为这是一个软约束）
             problem.AddResidualBlock(random_walk_factor, nullptr, para_DepthScaleShift[0]);
 
             ROS_DEBUG("[Backend] Added random walk prior: last_a=%.6f, last_b=%.6f, sigma_a=%.6f, sigma_b=%.6f",
-                     last_depth_a, last_depth_b, DEPTH_A_RANDOM_WALK, DEPTH_B_RANDOM_WALK);
+                     last_depth_a, last_depth_b, current_rw_a, current_rw_b);
         }
         else if (solver_flag == NON_LINEAR)
         {
@@ -2444,5 +2585,111 @@ void Estimator::setReloFrame(double _frame_stamp, int _frame_index, vector<Vecto
             for (int j = 0; j < SIZE_POSE; j++)
                 relo_Pose[j] = para_Pose[i][j];
         }
+    }
+}
+
+/**
+ * @brief 从快速初始化结果为特征点分配estimated_depth
+ *
+ * 快速初始化内部计算了参数将网络逆深度转为正深度，这里利用这些参数
+ * 和第一帧深度图为滑动窗口中的特征点设置estimated_depth，使得后续的
+ * 在线参数估计能够工作。
+ */
+void Estimator::assignEstimatedDepthFromFastInit()
+{
+    if (!mp_fast_initializer) {
+        ROS_WARN("assignEstimatedDepthFromFastInit: Fast initializer not available!");
+        return;
+    }
+
+    // 1. 获取快速初始化计算的深度参数
+    double a_fast, b_fast;
+    if (!mp_fast_initializer->getLastDepthParams(a_fast, b_fast)) {
+        ROS_WARN("assignEstimatedDepthFromFastInit: No valid depth parameters from fast init!");
+        return;
+    }
+
+    // 2. 获取第一帧的深度图
+    cv::Mat first_frame_depth_map;
+    {
+        std::lock_guard<std::mutex> lock(m_depth_mutex);
+        if (!m_first_frame_depth_computed || m_first_frame_depth_map.empty()) {
+            ROS_WARN("assignEstimatedDepthFromFastInit: First frame depth map not available!");
+            return;
+        }
+        first_frame_depth_map = m_first_frame_depth_map.clone();
+    }
+
+    // 3. 遍历特征管理器中的所有特征点
+    int assigned_count = 0;
+    int total_features = 0;
+
+    for (auto &it_per_id : f_manager.feature) {
+        total_features++;
+
+        // 跳过已经有有效estimated_depth的特征（避免重复赋值）
+        if (it_per_id.estimated_depth > 0.0) {
+            continue;
+        }
+
+        // 查找该特征在第一帧（滑动窗口的起始帧）的观测
+        bool found_first_frame_obs = false;
+        Eigen::Vector2d first_frame_uv;
+
+        for (int obs_idx = 0; obs_idx < it_per_id.feature_per_frame.size(); obs_idx++) {
+            int frame_id = it_per_id.start_frame + obs_idx;
+
+            // 检查是否是第一帧（假设第一帧的frame_id为0）
+            if (frame_id == 0) {
+                first_frame_uv = it_per_id.feature_per_frame[obs_idx].uv;
+                found_first_frame_obs = true;
+                break;
+            }
+        }
+
+        if (!found_first_frame_obs) {
+            // 该特征在第一帧没有观测，跳过
+            continue;
+        }
+
+        // 4. 从深度图获取网络预测的逆深度
+        int u = static_cast<int>(first_frame_uv.x() + 0.5);
+        int v = static_cast<int>(first_frame_uv.y() + 0.5);
+
+        // 边界检查
+        if (v < 0 || v >= first_frame_depth_map.rows ||
+            u < 0 || u >= first_frame_depth_map.cols) {
+            continue;
+        }
+
+        // 读取网络预测的归一化逆深度
+        double d_net_inv = static_cast<double>(first_frame_depth_map.at<float>(v, u));
+
+        // 检查深度值有效性
+        if (!std::isfinite(d_net_inv) || d_net_inv <= 1e-6 || d_net_inv > 100.0) {
+            continue;
+        }
+
+        // 5. 使用快速初始化的参数计算度量深度
+        // 快速初始化内部关系: d_metric = a * 1/ d_net_inv + b
+        double depth_metric = a_fast * 1 / d_net_inv + b_fast;
+
+
+        // 检查最终深度合理性 (0.1m ~ 50m)
+        if (depth_metric < 0.1 || depth_metric > 50.0) {
+            continue;
+        }
+
+        // 6. 分配estimated_depth
+        it_per_id.estimated_depth = depth_metric;
+        assigned_count++;
+    }
+
+    ROS_INFO("assignEstimatedDepthFromFastInit: Assigned depth to %d / %d features using fast-init params (a=%.6f, b=%.6f)",
+             assigned_count, total_features, a_fast, b_fast);
+
+    if (assigned_count < 50) {
+        ROS_WARN("assignEstimatedDepthFromFastInit: Low assignment success rate (%d features). Check depth map quality.",
+                 assigned_count);
     }
 }

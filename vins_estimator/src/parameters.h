@@ -55,6 +55,8 @@ extern double DEPTH_SHIFT_B;
 extern double DEPTH_FACTOR_WEIGHT;
 // 深度因子的Huber鲁棒核阈值 (用于抑制异常值)
 extern double DEPTH_FACTOR_HUBER_THRESHOLD;
+// 深度融合预热帧数 (Warm-up frames for depth fusion)
+extern int DEPTH_FUSION_WARMUP_FRAMES;
 // 深度参数随机游走过程噪声 (Random Walk Process Noise)
 extern double DEPTH_A_RANDOM_WALK;
 extern double DEPTH_B_RANDOM_WALK;
