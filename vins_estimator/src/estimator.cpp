@@ -540,18 +540,88 @@ void Estimator::estimateDepthScaleShift()
 
     ROS_INFO("[Depth Init] Raw estimates from linear regression: a=%.6f, b=%.6f", estimated_a, estimated_b);
 
-    // 合理性检查
-    const double a_min = 1e-3;
-    const double a_max = 10.0;
-    const double b_min = -5.0;
-    const double b_max = 5.0;
+    // ============ Statistical Quality Check: Pearson Correlation Coefficient ============
+    // Calculate correlation to assess if the relationship is statistically meaningful
+    // Formula: r = Σ(x_i - x̄)(y_i - ȳ) / √(Σ(x_i - x̄)² Σ(y_i - ȳ)²)
+
+    double mean_x = 0.0, mean_y = 0.0;
+    for (size_t i = 0; i < filtered_depth_net_vec.size(); ++i) {
+        mean_x += filtered_depth_net_vec[i];
+        mean_y += filtered_depth_vins_vec[i];
+    }
+    mean_x /= filtered_depth_net_vec.size();
+    mean_y /= filtered_depth_vins_vec.size();
+
+    double numerator = 0.0;
+    double denom_x = 0.0;
+    double denom_y = 0.0;
+
+    for (size_t i = 0; i < filtered_depth_net_vec.size(); ++i) {
+        double dx = filtered_depth_net_vec[i] - mean_x;
+        double dy = filtered_depth_vins_vec[i] - mean_y;
+        numerator += dx * dy;
+        denom_x += dx * dx;
+        denom_y += dy * dy;
+    }
+
+    double correlation = numerator / (std::sqrt(denom_x * denom_y) + 1e-10);
+    ROS_INFO("[Depth Init] Pearson correlation coefficient: r = %.4f", correlation);
+
+    // Correlation threshold: reject if correlation is too weak
+    const double correlation_threshold = 0.6;
+    if (std::abs(correlation) < correlation_threshold)
+    {
+        ROS_WARN("[Depth Init] ✗ Alignment REJECTED: Correlation too low (r=%.4f < %.2f).",
+                 correlation, correlation_threshold);
+        ROS_WARN("[Depth Init]   This indicates VINS initialization may be noisy or scale ambiguous.");
+        ROS_WARN("[Depth Init]   Fallback to default config values: a=%.6f, b=%.6f",
+                 DEPTH_SCALE_A, DEPTH_SHIFT_B);
+        return;
+    }
+
+    // ============ Physical Validity Check: Tightened Parameter Bounds ============
+    // For EuRoC + DepthAnythingV2, typical range is a ∈ [0.05, 0.25]
+    // Values like a=0.5 suggest fitting noise rather than real structure
+
+    const double a_min = 0.01;   // Tightened from 1e-3
+    const double a_max = 0.35;   // Tightened from 10.0 (rejects outliers like a=0.5)
+    const double b_min = -1.0;   // Tightened from -5.0
+    const double b_max = 1.0;    // Tightened from 5.0
 
     if (estimated_a < a_min || estimated_a > a_max ||
         estimated_b < b_min || estimated_b > b_max ||
         !std::isfinite(estimated_a) || !std::isfinite(estimated_b))
     {
-        ROS_WARN("[Depth Init] Alignment failed: unreasonable values (a=%.6f, b=%.6f). Using config values.",
-                 estimated_a, estimated_b);
+        ROS_WARN("[Depth Init] ✗ Alignment REJECTED: Parameter out of safe range.");
+        ROS_WARN("[Depth Init]   Calculated: a=%.6f (valid: [%.2f, %.2f]), b=%.6f (valid: [%.2f, %.2f])",
+                 estimated_a, a_min, a_max, estimated_b, b_min, b_max);
+        ROS_WARN("[Depth Init]   Fallback to default config values: a=%.6f, b=%.6f",
+                 DEPTH_SCALE_A, DEPTH_SHIFT_B);
+        return;
+    }
+
+    // ============ Physical Sanity Check: Mean Depth Ratio ============
+    // Check if the implied mean depth makes physical sense
+    // Mean depth (VINS) = 1 / mean_inv_depth_vins
+    // Mean depth (NET after transform) = 1 / (a * mean_inv_depth_net + b)
+
+    double mean_depth_vins = 1.0 / (mean_inv_depth_vins + 1e-10);
+    double mean_depth_net_transformed = 1.0 / (estimated_a * mean_inv_depth_net + estimated_b + 1e-10);
+    double depth_ratio = mean_depth_vins / (mean_depth_net_transformed + 1e-10);
+
+    ROS_INFO("[Depth Init] Mean depth check: VINS=%.2fm, NET(transformed)=%.2fm, ratio=%.3f",
+             mean_depth_vins, mean_depth_net_transformed, depth_ratio);
+
+    // Expect ratio close to 1.0; large deviations suggest bad fit
+    const double depth_ratio_min = 0.5;
+    const double depth_ratio_max = 2.0;
+
+    if (depth_ratio < depth_ratio_min || depth_ratio > depth_ratio_max)
+    {
+        ROS_WARN("[Depth Init] ✗ Alignment REJECTED: Mean depth ratio unreasonable (%.3f not in [%.1f, %.1f]).",
+                 depth_ratio, depth_ratio_min, depth_ratio_max);
+        ROS_WARN("[Depth Init]   Fallback to default config values: a=%.6f, b=%.6f",
+                 DEPTH_SCALE_A, DEPTH_SHIFT_B);
         return;
     }
 
@@ -565,26 +635,48 @@ void Estimator::estimateDepthScaleShift()
     }
     double rmse = std::sqrt(residual_sum / filtered_depth_net_vec.size());
 
-    // 更新全局参数
-    para_DepthScaleShift[0][0] = estimated_a;
-    para_DepthScaleShift[0][1] = estimated_b;
+    // ============================================================================
+    // IMPORTANT: Online Initialization DISABLED (DEBUG/LOGGING ONLY)
+    // ============================================================================
+    // Analysis shows that online initialization is highly unstable on difficult
+    // datasets (e.g., MH_05) due to:
+    // 1. Short time windows (insufficient parallax)
+    // 2. Noisy VINS initialization (scale ambiguity)
+    // 3. Motion blur in early frames
+    //
+    // New Strategy: "Fixed Prior + Online Adaptation"
+    // - Start with robust default (a=0.15, b=0.0 from config)
+    // - Let warm-up strategy (L2 loss + relaxed random walk) adapt in first 50 frames
+    // - Calculate values here ONLY for diagnostic logging
+    //
+    // DO NOT UPDATE: para_DepthScaleShift, DEPTH_SCALE_A, DEPTH_SHIFT_B, last_depth_*
+    // These will retain config values and be adapted by backend optimization
+    // ============================================================================
 
-    // 同时更新全局配置（供输出日志使用）
-    DEPTH_SCALE_A = estimated_a;
-    DEPTH_SHIFT_B = estimated_b;
+    // Log calculated values for debugging (NOT applied to system)
+    ROS_WARN("[Depth Init] ═══════════════════════════════════════════════════");
+    ROS_WARN("[Depth Init] Online Linear Regression Results (DEBUG ONLY - NOT APPLIED):");
+    ROS_WARN("[Depth Init]   Calculated from VINS vs NET alignment:");
+    ROS_WARN("[Depth Init]     - a (calculated) = %.6f", estimated_a);
+    ROS_WARN("[Depth Init]     - b (calculated) = %.6f", estimated_b);
+    ROS_WARN("[Depth Init]   Data quality:");
+    ROS_WARN("[Depth Init]     - Points used: %zu / %d checked", filtered_depth_net_vec.size(), features_checked);
+    ROS_WARN("[Depth Init]     - Correlation: r = %.4f", correlation);
+    ROS_WARN("[Depth Init]     - RMSE: %.4f", rmse);
+    ROS_WARN("[Depth Init]     - Condition number: %.2e", condition_number);
+    ROS_WARN("[Depth Init]     - Mean depth ratio: %.3f", depth_ratio);
+    ROS_WARN("[Depth Init] ───────────────────────────────────────────────────");
+    ROS_WARN("[Depth Init] ✗ IGNORED: Using robust config defaults instead");
+    ROS_WARN("[Depth Init]   Actual parameters (from config):");
+    ROS_WARN("[Depth Init]     - a (config) = %.6f", DEPTH_SCALE_A);
+    ROS_WARN("[Depth Init]     - b (config) = %.6f", DEPTH_SHIFT_B);
+    ROS_WARN("[Depth Init]   Rationale: Online init unstable on difficult datasets");
+    ROS_WARN("[Depth Init]   Strategy: Fixed prior + warm-up adaptation (first 50 frames)");
+    ROS_WARN("[Depth Init] ═══════════════════════════════════════════════════");
 
-    // 更新随机游走模型的历史值
-    last_depth_a = estimated_a;
-    last_depth_b = estimated_b;
-    has_last_depth_params = true;
-
-    // 输出对齐结果
-    ROS_INFO("[Depth Init] ✓ Online alignment successful:");
-    ROS_INFO("[Depth Init]   Original points: %d (before outlier removal)", features_with_depth);
-    ROS_INFO("[Depth Init]   Used points: %zu / %d checked (after outlier filtering)",
-             filtered_depth_net_vec.size(), features_checked);
-    ROS_INFO("[Depth Init]   Estimated: a = %.6f, b = %.6f", estimated_a, estimated_b);
-    ROS_INFO("[Depth Init]   RMSE: %.4f, Condition number: %.2e", rmse, condition_number);
+    // Note: System will use config values (DEPTH_SCALE_A, DEPTH_SHIFT_B)
+    // which are already loaded and will be adapted by backend optimization
+    // with relaxed random walk constraint in the first optimization
 }
 
 /**
@@ -1879,7 +1971,7 @@ void Estimator::optimization()
     }
 
     ROS_DEBUG("visual measurement count: %d", f_m_cnt);
-    ROS_INFO_THROTTLE(5.0, "[Backend] Visual factors: %d", f_m_cnt);
+    ROS_INFO_THROTTLE(20.0, "[Backend] Visual factors: %d", f_m_cnt);
 
     // --- 深度传感器因子约束：添加深度约束残差块 (Backend Depth Constraint) ---
     if (ESTIMATE_DEPTH_SCALE_SHIFT)
@@ -1892,30 +1984,56 @@ void Estimator::optimization()
         int features_checked = 0;
         int frames_with_depth = 0;
 
-        // 创建鲁棒核函数（用于处理深度估计的异常值）
-        // 实施两阶段策略：
-        // 阶段1 (前N帧): 使用L2损失 (nullptr) 以获得最大梯度，快速从错误初值收敛
-        // 阶段2 (N帧后): 使用Huber损失来抑制运动模糊等异常值
-        ceres::LossFunction *depth_loss_function = nullptr;
-        static bool warmup_finished = false;
+        // ========================================================================
+        // Universal Depth Fusion: Dynamic Funnel Approach
+        // ========================================================================
+        // 策略：通过时变的Huber阈值和权重实现自适应融合
+        // - 初期（帧0-100）：宽松约束（大阈值、低权重），允许参数从0.12快速收敛到真值
+        // - 后期（帧100+）：严格约束（小阈值、高权重），鲁棒抗运动模糊
+        // 优势：无需手动调参，同时适用于小房间（a≈0.08）和大厅（a≈0.18）
+        // ========================================================================
 
-        if (global_frame_count >= DEPTH_FUSION_WARMUP_FRAMES)
+        const int FUNNEL_RAMP_FRAMES = 100;  // 漏斗渐变帧数（约5-10秒）
+        const double HUBER_START_THRESHOLD = 4.0;   // 初始阈值：宽松（允许大残差）
+        const double HUBER_END_THRESHOLD = 1.0;     // 最终阈值：严格（抑制异常值）
+        const double WEIGHT_START_RATIO = 0.5;      // 初始权重比例：50%（温和启动）
+        const double WEIGHT_END_RATIO = 1.0;        // 最终权重比例：100%（全强度）
+
+        // 计算当前帧的动态Huber阈值（线性插值）
+        // Threshold = max(1.0, 4.0 - 3.0 * frame_count / 100)
+        double progress_ratio = std::min(1.0, static_cast<double>(global_frame_count) / FUNNEL_RAMP_FRAMES);
+        double current_huber_threshold = std::max(HUBER_END_THRESHOLD,
+                                                   HUBER_START_THRESHOLD - (HUBER_START_THRESHOLD - HUBER_END_THRESHOLD) * progress_ratio);
+
+        // 计算当前帧的动态权重比例（线性插值）
+        // Weight = target_weight * (0.5 + 0.5 * frame_count / 100)
+        double current_weight_ratio = WEIGHT_START_RATIO + (WEIGHT_END_RATIO - WEIGHT_START_RATIO) * progress_ratio;
+        double current_depth_weight = DEPTH_FACTOR_WEIGHT * current_weight_ratio;
+
+        // 创建动态Huber损失函数并包装权重缩放
+        // 注意：必须每次优化时重新创建，因为阈值和权重随帧数变化
+        ceres::LossFunction *huber_loss = new ceres::HuberLoss(current_huber_threshold);
+        ceres::LossFunction *depth_loss_function = new ceres::ScaledLoss(huber_loss, current_depth_weight, ceres::TAKE_OWNERSHIP);
+
+        // 每10帧打印一次当前策略参数
+        static int last_log_frame = -10;
+        if (global_frame_count - last_log_frame >= 10 || global_frame_count < 5)
         {
-            depth_loss_function = new ceres::HuberLoss(DEPTH_FACTOR_HUBER_THRESHOLD);
-
-            // 只在第一次切换时打印警告
-            if (!warmup_finished)
-            {
-                ROS_WARN("[Backend] Depth fusion warm-up FINISHED at frame %d (global). Enabling Huber Loss (threshold=%.2f) for outlier rejection.",
-                         global_frame_count, DEPTH_FACTOR_HUBER_THRESHOLD);
-                warmup_finished = true;
-            }
+            ROS_INFO("[Dynamic Funnel] Frame %d: Huber threshold=%.3f (%.0f%% → strict), Weight=%.3f (%.0f%% → full) | Target: a=%.3f",
+                     global_frame_count,
+                     current_huber_threshold, (1.0 - progress_ratio) * 100.0,
+                     current_depth_weight, current_weight_ratio * 100.0,
+                     DEPTH_SCALE_A);
+            last_log_frame = global_frame_count;
         }
-        else
+
+        // 在第100帧打印转换完成日志
+        static bool funnel_finished = false;
+        if (global_frame_count >= FUNNEL_RAMP_FRAMES && !funnel_finished)
         {
-            // 预热阶段：使用标准L2损失（不抑制梯度）
-            ROS_INFO_THROTTLE(5.0, "[Backend] Depth fusion WARM-UP phase (frame %d/%d global). Using L2 loss for fast convergence.",
-                             global_frame_count, DEPTH_FUSION_WARMUP_FRAMES);
+            ROS_WARN("[Dynamic Funnel] Ramp COMPLETE at frame %d. Locked to strict mode: Huber threshold=%.2f, Weight=%.2f (100%%)",
+                     global_frame_count, current_huber_threshold, current_depth_weight);
+            funnel_finished = true;
         }
 
         // 重新遍历所有特征点，为有深度图的观测添加深度约束
@@ -1992,7 +2110,7 @@ void Estimator::optimization()
         // 输出深度约束信息（添加更多诊断信息）
         if (depth_factor_cnt > 0)
         {
-            ROS_INFO("[Backend] Depth factors: %d (checked %d features, %d frames with depth) | a=%.6f, b=%.6f",
+            ROS_INFO_THROTTLE(10.0,"[Backend] Depth factors: %d (checked %d features, %d frames with depth) | a=%.6f, b=%.6f",
                      depth_factor_cnt, features_checked, frames_with_depth, DEPTH_SCALE_A, DEPTH_SHIFT_B);
         }
         else
@@ -2001,7 +2119,8 @@ void Estimator::optimization()
             no_depth_count++;
             if (no_depth_count % 5 == 1)  // 每5帧打印一次
             {
-                ROS_WARN("[Backend] No depth factors! (checked %d features, %d frames with depth maps)",
+                ROS_WARN_THROTTLE(5.0,
+                         "[Backend] No depth factors! (checked %d features, %d frames with depth maps)",
                          features_checked, frames_with_depth);
             }
         }

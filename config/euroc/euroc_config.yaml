@@ -36,11 +36,16 @@ fast_init.reg.lambda_v: 1.0e-3            # 正则：初始速度v的权重
 # 是否在后端优化中启用深度约束因子 (0: 关闭, 1: 开启)
 depth_constraint.estimate_scale_shift: 1
 # 深度仿射变换尺度因子 a 的初始值 (1/d_metric = a * d_nn + b)
-# 使用实验得到的最佳初值 a=0.08
-depth_constraint.initial_scale_a: 0.05
-# 深度仿射变换偏移因子 b 的初始值
-# 使用实验得到的最佳初值 b=0.21
-depth_constraint.initial_shift_b: 0.05
+# 策略: "Universal Depth Fusion" (Dynamic Funnel Approach)
+# - 使用中间值 a=0.12 作为鲁棒默认值（适用于小房间 0.08 和大厅 0.18 的中间值）
+# - 动态Huber阈值: 4.0→1.0 (宽松→严格，允许参数收敛后抗运动模糊)
+# - 动态权重渐变: 50%→100% (温和启动，逐步增强深度约束)
+# - 在线初始化已禁用，依赖动态漏斗机制自适应各种场景
+depth_constraint.initial_scale_a: 0.12
+# 深度偏移因子 b 的初始值
+# - 设为 0.0（零偏移先验）
+# - 后端优化会根据实际场景自适应调整
+depth_constraint.initial_shift_b: 0.0
 # 深度参数随机游走过程噪声（Random Walk Process Noise）
 # 控制参数在相邻帧之间允许的最大变化量
 # 值越大，参数变化越自由，但可能震荡；值越小，参数变化越保守
@@ -49,14 +54,14 @@ depth_constraint.random_walk_a: 1.0e-3
 depth_constraint.random_walk_b: 1.0e-3
 # 深度因子的权重（控制深度约束对优化的影响强度）
 # 值越大，深度约束越强；建议从 0.1 到 10.0 范围内调整
-depth_constraint.weight: 2.5
+depth_constraint.weight: 0.5
 # 深度因子的Huber鲁棒核阈值（用于抑制深度估计的异常值）
 # 值越大，对异常值越宽容；建议从 0.5 到 5.0 范围内调整
-depth_constraint.huber_threshold: 1.0
+depth_constraint.huber_threshold: 5.0
 # 深度融合预热帧数（Warm-up frames）
 # 在前N帧使用L2损失以快速收敛，N帧后切换到Huber损失抑制异常值
 # 建议范围：30-100帧（约1-5秒）
-depth_constraint.warmup_frames: 50
+depth_constraint.warmup_frames: 30
 
 #camera calibration 
 model_type: PINHOLE
