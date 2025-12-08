@@ -10,7 +10,10 @@ DepthEstimator::DepthEstimator()
       m_output_name_ptr(nullptr, Ort::detail::AllocatedFree(nullptr)),
 
       m_input_name{nullptr},
-      m_output_name{nullptr}
+      m_output_name{nullptr},
+      m_model_type(DepthModelType::MIDAS_V2),  // 默认值，会在 init 中根据模型路径自动检测
+      m_model_input_width(256),
+      m_model_input_height(256)
 {}
 
 // 析构函数 (默认即可，std::unique_ptr 会自动管理 m_session)
@@ -21,8 +24,71 @@ DepthEstimator::~DepthEstimator()
     }
 }
 
+// 模型类型自动检测函数
+DepthModelType DepthEstimator::detectModelType(const std::string& model_path) const
+{
+    // 根据模型文件名自动检测模型类型
+    if (model_path.find("depth_anything") != std::string::npos ||
+        model_path.find("DepthAnything") != std::string::npos) {
+        return DepthModelType::DEPTH_ANYTHING_V2;
+    } else if (model_path.find("midas") != std::string::npos ||
+               model_path.find("Midas") != std::string::npos ||
+               model_path.find("MiDaS") != std::string::npos) {
+        return DepthModelType::MIDAS_V2;
+    } else {
+        // 默认为 MiDaS V2
+        ROS_WARN("Cannot auto-detect model type from path: %s. Defaulting to MiDaS V2.", model_path.c_str());
+        return DepthModelType::MIDAS_V2;
+    }
+}
+
+// 图像预处理增强（直方图均衡化等）
+void DepthEstimator::enhanceImage(const cv::Mat& image, cv::Mat& enhanced_image) const
+{
+    // 如果是灰度图，直接进行CLAHE
+    if (image.channels() == 1) {
+        cv::Ptr<cv::CLAHE> clahe = cv::createCLAHE(2.0, cv::Size(8, 8));
+        clahe->apply(image, enhanced_image);
+    }
+    // 如果是彩色图，转换到LAB空间，对L通道进行CLAHE
+    else if (image.channels() == 3) {
+        cv::Mat lab_image;
+        cv::cvtColor(image, lab_image, cv::COLOR_BGR2Lab);
+
+        // 分离LAB通道
+        std::vector<cv::Mat> lab_channels;
+        cv::split(lab_image, lab_channels);
+
+        // 对L通道进行CLAHE
+        cv::Ptr<cv::CLAHE> clahe = cv::createCLAHE(2.0, cv::Size(8, 8));
+        clahe->apply(lab_channels[0], lab_channels[0]);
+
+        // 合并通道
+        cv::merge(lab_channels, lab_image);
+
+        // 转换回BGR
+        cv::cvtColor(lab_image, enhanced_image, cv::COLOR_Lab2BGR);
+    } else {
+        // 其他情况直接复制
+        enhanced_image = image.clone();
+    }
+}
+
 bool DepthEstimator::init(const std::string& model_path)
 {
+    // --- 0. 自动检测模型类型并配置参数 ---
+    m_model_type = detectModelType(model_path);
+
+    if (m_model_type == DepthModelType::DEPTH_ANYTHING_V2) {
+        m_model_input_width = 518;
+        m_model_input_height = 518;
+        ROS_INFO("Detected model type: Depth Anything V2 (input: 518x518, output: raw inverse depth values)");
+    } else {
+        m_model_input_width = 256;
+        m_model_input_height = 256;
+        ROS_INFO("Detected model type: MiDaS V2 (input: 256x256, normalization: Quantile-clipped [1%%-99%%] -> [1,2])");
+    }
+
     // --- 1. 设置会话选项 (来自 Demo) ---
     m_session_options.SetIntraOpNumThreads(1);
     m_session_options.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
@@ -175,21 +241,24 @@ void DepthEstimator::preprocess(const cv::Mat& image, std::vector<float>& input_
 {
     static bool first_preprocess = true;
     if (first_preprocess && save_debug_images) {
-        // 注释掉详细的输入信息，只在出错时才需要
-        // ROS_INFO("DepthEstimator::preprocess(): Input image - channels: %d, type: %d, size: %dx%d",
-        //          image.channels(), image.type(), image.cols, image.rows);
+        ROS_INFO("DepthEstimator::preprocess(): Input image - channels: %d, type: %d, size: %dx%d",
+                 image.channels(), image.type(), image.cols, image.rows);
         first_preprocess = false;
     }
 
+    // 0) 图像增强：使用CLAHE提升暗部细节
+    cv::Mat enhanced_image;
+    enhanceImage(image, enhanced_image);
+
     // 1) 灰度→BGR；BGR→RGB，确保模型看到的是 RGB 顺序
     cv::Mat img_bgr;
-    if (image.channels() == 1)
+    if (enhanced_image.channels() == 1)
     {
-        cv::cvtColor(image, img_bgr, cv::COLOR_GRAY2BGR);
+        cv::cvtColor(enhanced_image, img_bgr, cv::COLOR_GRAY2BGR);
     }
-    else if (image.channels() == 3)
+    else if (enhanced_image.channels() == 3)
     {
-        img_bgr = image;
+        img_bgr = enhanced_image;
 
         // 仅在启用调试时检查伪彩色（只检查一次，避免重复警告）
         if (save_debug_images) {
@@ -205,9 +274,8 @@ void DepthEstimator::preprocess(const cv::Mat& image, std::vector<float>& input_
                 cv::minMaxLoc(diff2, nullptr, &max_diff2);
 
                 if (max_diff1 < 5.0 && max_diff2 < 5.0) {
-                    // 注释掉警告，这对灰度图像来说是正常的
-                    // ROS_WARN("DepthEstimator: Input appears to be pseudo-color (grayscale converted to BGR). "
-                    //          "All channels are nearly identical. MiDaS depth estimation may fail!");
+                    ROS_WARN("DepthEstimator: Input appears to be pseudo-color (grayscale converted to BGR). "
+                             "All channels are nearly identical. Depth estimation may be affected!");
                 }
                 checked_pseudo_color = true;
             }
@@ -219,7 +287,7 @@ void DepthEstimator::preprocess(const cv::Mat& image, std::vector<float>& input_
 
     // 2) 缩放到模型输入尺寸，浮点化并归一化到 [0,1]
     cv::Mat resized_image;
-    cv::resize(img_rgb, resized_image, cv::Size(m_model_input_width, m_model_input_height), 0, 0, cv::INTER_CUBIC);
+    cv::resize(img_rgb, resized_image, cv::Size(m_model_input_width, m_model_input_height), 0, 0, cv::INTER_LINEAR);
     resized_image.convertTo(resized_image, CV_32F, 1.0 / 255.0);
 
     // 3) 按 NCHW 填充，并用 ImageNet 均值方差做标准化（RGB 顺序）
@@ -254,22 +322,21 @@ bool DepthEstimator::predict(const cv::Mat& image, cv::Mat& norm_inv_depth_map)
         ROS_ERROR("DepthEstimator::predict() failed: model is not ready yet.");
         return false;
     }
-    
+
     // 调用内部实现
-    return predictInternal(image, norm_inv_depth_map);
+    return predictInternal(image, norm_inv_depth_map, true);
 }
 
 // 预测内部实现
 bool DepthEstimator::predictInternal(const cv::Mat& image, cv::Mat& norm_inv_depth_map, bool save_debug_images, bool quiet)
 {
     TicToc t_infer;
-    // 注释掉保存调试图像，仅在需要调试时手动启用
-    // static bool saved_input = false;
-    // if (!saved_input && save_debug_images) {
-    //     cv::imwrite("/tmp/first_frame_input_image.png", image);
-    //     if (!quiet) ROS_INFO("Saved input image to /tmp/first_frame_input_image.png (channels: %d)", image.channels());
-    //     saved_input = true;
-    // }
+    static bool saved_input = false;
+    if (!saved_input && save_debug_images) {
+        cv::imwrite("/tmp/first_frame_input_image.png", image);
+        if (!quiet) ROS_INFO("Saved input image to /tmp/first_frame_input_image.png (channels: %d)", image.channels());
+        saved_input = true;
+    }
 
     if (!m_session)
     {
@@ -306,45 +373,55 @@ bool DepthEstimator::predictInternal(const cv::Mat& image, cv::Mat& norm_inv_dep
         double raw_min = 0.0, raw_max = 0.0;
         cv::minMaxLoc(raw_inv_depth, &raw_min, &raw_max);
         cv::Scalar raw_mean = cv::mean(raw_inv_depth);
-        if (!quiet) ROS_DEBUG("MiDaS raw_inv_depth: min=%.6f max=%.6f mean=%.6f", raw_min, raw_max, raw_mean[0]);
+        if (!quiet) ROS_DEBUG("Raw inv_depth: min=%.6f max=%.6f mean=%.6f", raw_min, raw_max, raw_mean[0]);
 
-        // 4.3 归一化到 [1, 2]：使用分位数裁剪增强鲁棒性（1%~99%）
+        // 4.3 根据模型类型选择归一化策略
         cv::Mat normalized_float_map;
         {
-            // 提取有效像素到向量
-            std::vector<float> vals;
-            vals.reserve(static_cast<size_t>(raw_inv_depth.total()));
-            for (int r = 0; r < raw_inv_depth.rows; ++r) {
-                const float* ptr = raw_inv_depth.ptr<float>(r);
-                for (int c = 0; c < raw_inv_depth.cols; ++c) {
-                    float v = ptr[c];
-                    if (std::isfinite(v)) vals.push_back(v);
-                }
-            }
-            if (!vals.empty()) {
-                size_t n = vals.size();
-                size_t i1 = static_cast<size_t>(std::max<size_t>(0, static_cast<size_t>(0.01 * n) - 1));
-                size_t i99 = static_cast<size_t>(std::min<size_t>(n - 1, static_cast<size_t>(0.99 * n)));
-                std::nth_element(vals.begin(), vals.begin() + i1, vals.end());
-                float p1 = vals[i1];
-                std::nth_element(vals.begin(), vals.begin() + i99, vals.end());
-                float p99 = vals[i99];
-                if (p99 <= p1) { p99 = p1 + 1e-6f; }
+            if (m_model_type == DepthModelType::DEPTH_ANYTHING_V2) {
+                // Depth Anything V2: 直接使用原始值，不做分位数裁剪和归一化
+                // 这样可以保留模型的原始输出用于后续优化
+                normalized_float_map = raw_inv_depth.clone();
 
-                normalized_float_map.create(raw_inv_depth.size(), CV_32F);
+                if (!quiet) ROS_DEBUG("Depth Anything V2: Using raw values (no clipping, no normalization)");
+            } else {
+                // MiDaS V2: 使用分位数裁剪增强鲁棒性（1%~99%），然后归一化到 [1, 2]
+                std::vector<float> vals;
+                vals.reserve(static_cast<size_t>(raw_inv_depth.total()));
                 for (int r = 0; r < raw_inv_depth.rows; ++r) {
-                    const float* src = raw_inv_depth.ptr<float>(r);
-                    float* dst = normalized_float_map.ptr<float>(r);
+                    const float* ptr = raw_inv_depth.ptr<float>(r);
                     for (int c = 0; c < raw_inv_depth.cols; ++c) {
-                        float v = src[c];
-                        if (!std::isfinite(v)) { v = p1; }
-                        v = std::min(std::max(v, p1), p99);
-                        // 线性映射到 [1, 2]
-                        dst[c] = 1.0f + (v - p1) * (1.0f / (p99 - p1));
+                        float v = ptr[c];
+                        if (std::isfinite(v)) vals.push_back(v);
                     }
                 }
-            } else {
-                cv::normalize(raw_inv_depth, normalized_float_map, 1.0, 2.0, cv::NORM_MINMAX, CV_32F);
+                if (!vals.empty()) {
+                    size_t n = vals.size();
+                    size_t i1 = static_cast<size_t>(std::max<size_t>(0, static_cast<size_t>(0.01 * n) - 1));
+                    size_t i99 = static_cast<size_t>(std::min<size_t>(n - 1, static_cast<size_t>(0.99 * n)));
+                    std::nth_element(vals.begin(), vals.begin() + i1, vals.end());
+                    float p1 = vals[i1];
+                    std::nth_element(vals.begin(), vals.begin() + i99, vals.end());
+                    float p99 = vals[i99];
+                    if (p99 <= p1) { p99 = p1 + 1e-6f; }
+
+                    normalized_float_map.create(raw_inv_depth.size(), CV_32F);
+                    for (int r = 0; r < raw_inv_depth.rows; ++r) {
+                        const float* src = raw_inv_depth.ptr<float>(r);
+                        float* dst = normalized_float_map.ptr<float>(r);
+                        for (int c = 0; c < raw_inv_depth.cols; ++c) {
+                            float v = src[c];
+                            if (!std::isfinite(v)) { v = p1; }
+                            v = std::min(std::max(v, p1), p99);
+                            // 线性映射到 [1, 2]
+                            dst[c] = 1.0f + (v - p1) * (1.0f / (p99 - p1));
+                        }
+                    }
+
+                    if (!quiet) ROS_DEBUG("MiDaS V2: Quantile-clipped normalization to [1, 2] (p1%%=%.6f, p99%%=%.6f)", p1, p99);
+                } else {
+                    cv::normalize(raw_inv_depth, normalized_float_map, 1.0, 2.0, cv::NORM_MINMAX, CV_32F);
+                }
             }
         }
 
@@ -352,7 +429,13 @@ bool DepthEstimator::predictInternal(const cv::Mat& image, cv::Mat& norm_inv_dep
         double n_min = 0.0, n_max = 0.0;
         cv::minMaxLoc(normalized_float_map, &n_min, &n_max);
         cv::Scalar n_mean = cv::mean(normalized_float_map);
-        if (!quiet) ROS_DEBUG("MiDaS norm_inv_depth: min=%.6f max=%.6f mean=%.6f", n_min, n_max, n_mean[0]);
+        if (!quiet) {
+            if (m_model_type == DepthModelType::DEPTH_ANYTHING_V2) {
+                ROS_DEBUG("Depth Anything V2 output: min=%.6f max=%.6f mean=%.6f", n_min, n_max, n_mean[0]);
+            } else {
+                ROS_DEBUG("MiDaS V2 norm_inv_depth: min=%.6f max=%.6f mean=%.6f", n_min, n_max, n_mean[0]);
+            }
+        }
 
         // 4.5 缩放回原图尺寸
         cv::resize(normalized_float_map, norm_inv_depth_map, image.size(), 0, 0, cv::INTER_LINEAR);

@@ -11,6 +11,12 @@
 #include "onnxruntime_cxx_api.h"
 #include <ros/ros.h>
 
+// 深度模型类型枚举
+enum class DepthModelType {
+    MIDAS_V2,           // MiDaS V2: 256×256, 分位数裁剪归一化
+    DEPTH_ANYTHING_V2   // Depth Anything V2: 518×518, 原始逆深度值
+};
+
 class DepthEstimator
 {
 public:
@@ -56,9 +62,23 @@ private:
      */
     bool predictInternal(const cv::Mat& image, cv::Mat& norm_inv_depth_map,
                          bool save_debug_images = true, bool quiet = false);
-    
+
     // 异步初始化的工作函数
     void initWorker(const std::string& model_path);
+
+    /**
+     * @brief 从模型文件路径自动检测模型类型
+     * @param model_path 模型文件路径
+     * @return 检测到的模型类型
+     */
+    DepthModelType detectModelType(const std::string& model_path) const;
+
+    /**
+     * @brief 图像预处理增强（直方图均衡化等）
+     * @param image 输入图像
+     * @param enhanced_image 增强后的图像
+     */
+    void enhanceImage(const cv::Mat& image, cv::Mat& enhanced_image) const;
 
     // --- ONNX Runtime 核心成员 ---
     Ort::Env m_env;
@@ -81,8 +101,12 @@ private:
     std::vector<int64_t> m_input_shape;
     std::vector<float> m_input_tensor_values;
 
-    const int m_model_input_width = 256;
-    const int m_model_input_height = 256;
+    // --- 模型类型与配置参数 ---
+    DepthModelType m_model_type;
+    int m_model_input_width;
+    int m_model_input_height;
+
+    // ImageNet 归一化参数（两个模型都相同）
     const std::vector<double> m_norm_mean = {0.485, 0.456, 0.406};
     const std::vector<double> m_norm_std = {0.229, 0.224, 0.225};
 };

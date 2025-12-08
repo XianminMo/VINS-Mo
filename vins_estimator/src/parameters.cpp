@@ -38,6 +38,14 @@ int DEPTH_FUSION_WARMUP_FRAMES;
 double DEPTH_A_RANDOM_WALK;
 double DEPTH_B_RANDOM_WALK;
 
+// Physics-Aware Adaptive Depth Fusion Parameters (Multi-Factor Version)
+double DEPTH_WEIGHT_STATIC;
+double DEPTH_WEIGHT_DYNAMIC;
+double PHYSICAL_ERROR_THRESHOLD;
+double INSTABILITY_THRESHOLD_LOW;
+double INSTABILITY_THRESHOLD_HIGH;
+double ACC_DISTURBANCE_WEIGHT;
+
 // Fast Init parameters (defaults will be overridden by YAML if provided)
 int FAST_INIT_MIN_FEATURES;
 double FAST_INIT_MIN_ACC_VAR;
@@ -234,13 +242,21 @@ void readParameters(ros::NodeHandle &n)
 
     // --- 读取深度传感器因子约束参数 (Backend Depth Constraint) ---
     ESTIMATE_DEPTH_SCALE_SHIFT = readOr("depth_constraint.estimate_scale_shift", 0);
-    DEPTH_SCALE_A = readOr("depth_constraint.initial_scale_a", 0.08);  // 使用实验得到的最佳初值
+    DEPTH_SCALE_A = readOr("depth_constraint.initial_scale_a", 0.15);  // 通用默认值（在线初始化失败时的安全回退值）
     DEPTH_SHIFT_B = readOr("depth_constraint.initial_shift_b", 0.21);  // 使用实验得到的最佳初值
     DEPTH_FACTOR_WEIGHT = readOr("depth_constraint.weight", 1.0);
     DEPTH_FACTOR_HUBER_THRESHOLD = readOr("depth_constraint.huber_threshold", 1.0);
     DEPTH_FUSION_WARMUP_FRAMES = readOr("depth_constraint.warmup_frames", 50);  // 预热帧数
     DEPTH_A_RANDOM_WALK = readOr("depth_constraint.random_walk_a", 5e-4);  // 随机游走噪声
     DEPTH_B_RANDOM_WALK = readOr("depth_constraint.random_walk_b", 5e-4);  // 随机游走噪声
+
+    // Physics-Aware Adaptive Parameters (Multi-Factor: 陀螺仪 + 加速度计)
+    DEPTH_WEIGHT_STATIC = readOr("depth_constraint.adaptive.weight_static", 3.0);     // 静止时最大权重 (降低至3.0以增强鲁棒性)
+    DEPTH_WEIGHT_DYNAMIC = readOr("depth_constraint.adaptive.weight_dynamic", 1.0);   // 动态时最小权重
+    PHYSICAL_ERROR_THRESHOLD = readOr("depth_constraint.adaptive.physical_error_threshold", 0.25);  // 物理误差下限 (1/m)
+    INSTABILITY_THRESHOLD_LOW = readOr("depth_constraint.adaptive.instability_threshold_low", 0.3);   // 稳定阈值
+    INSTABILITY_THRESHOLD_HIGH = readOr("depth_constraint.adaptive.instability_threshold_high", 1.5); // 不稳定阈值
+    ACC_DISTURBANCE_WEIGHT = readOr("depth_constraint.adaptive.acc_disturbance_weight", 0.5);        // 加速度扰动权重因子
 
     if (ESTIMATE_DEPTH_SCALE_SHIFT)
     {
@@ -252,6 +268,11 @@ void readParameters(ros::NodeHandle &n)
         ROS_INFO("  Factor Weight: %.4f", DEPTH_FACTOR_WEIGHT);
         ROS_INFO("  Huber Threshold: %.4f", DEPTH_FACTOR_HUBER_THRESHOLD);
         ROS_INFO("  Warmup Frames: %d", DEPTH_FUSION_WARMUP_FRAMES);
+        ROS_INFO("  Physics-Aware Adaptive Mode (Multi-Factor: Gyro + Acceleration):");
+        ROS_INFO("    Weight Range: [%.2f (dynamic) → %.2f (static)]", DEPTH_WEIGHT_DYNAMIC, DEPTH_WEIGHT_STATIC);
+        ROS_INFO("    Physical Error Threshold: %.3f (1/m)", PHYSICAL_ERROR_THRESHOLD);
+        ROS_INFO("    Instability Thresholds: [%.2f → %.2f] (combined score)", INSTABILITY_THRESHOLD_LOW, INSTABILITY_THRESHOLD_HIGH);
+        ROS_INFO("    Acceleration Disturbance Weight: %.2f", ACC_DISTURBANCE_WEIGHT);
     }
     else
     {

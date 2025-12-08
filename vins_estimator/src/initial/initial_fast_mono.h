@@ -49,6 +49,17 @@ public:
                     std::map<int, Eigen::Vector3d>& Vs_out,
                     std::map<int, Eigen::Quaterniond>& Rs_out);
 
+    /**
+     * @brief 获取最近一次快速初始化计算的深度参数
+     * @param a_out [out] 深度尺度参数 a
+     * @param b_out [out] 深度偏移参数 b
+     * @return true 如果有有效的深度参数，false 如果没有
+     *
+     * 该函数用于在快速初始化成功后，提取内部计算的深度参数供后端使用。
+     * 关系: d_metric = 1 / (a * d_net_inv + b)
+     * 其中 d_net_inv 是网络输出的归一化逆深度
+     */
+    bool getLastDepthParams(double& a_out, double& b_out) const;
 
 private:
     // 计算滑窗起始帧ID：返回当前窗口内所有特征 start_frame 的最小值（若为空返回0）
@@ -232,9 +243,14 @@ private:
         std::map<int, Eigen::Vector3d>& Vs_out,
         std::map<int, Eigen::Quaterniond>& Rs_out);
     
-    
-    
-    // 成员变量 
+
+
+    // 成员变量
     FeatureManager* m_feature_manager; ///< 指向 Estimator 中 FeatureManager 的指针，用于访问特征信息
     std::mt19937 m_random_generator;   ///< 用于 RANSAC 的随机数生成器
+
+    // 深度模型参数（在初始化成功后可被访问）
+    double m_last_computed_a = -1.0;   ///< 最近一次计算的深度尺度参数 a (若无效则为-1)
+    double m_last_computed_b = 0.0;    ///< 最近一次计算的深度偏移参数 b
+    bool m_has_valid_depth_params = false; ///< 标记是否有有效的深度参数
 };

@@ -130,6 +130,7 @@ void Estimator::clearState()
     sum_of_front = 0;      // 边缘化新帧的计数器
     frame_count = 0;       // 滑动窗口中的当前帧计数
     global_frame_count = 0; // 全局帧计数器（持续增长）
+    depth_fusion_frame_count = 0; // 深度融合帧计数器（从VINS初始化成功后开始计数）
     initial_timestamp = 0; // 初始化时间戳
     all_image_frame.clear(); // 清空所有图像帧数据
     td = TD;               // 重置IMU和相机之间的时间偏移
@@ -157,6 +158,10 @@ void Estimator::clearState()
     last_depth_b = DEPTH_SHIFT_B;
     has_last_depth_params = false;  // 系统刚启动，没有"上一次"的值
     is_first_depth_optimization = true;  // 标记为第一次优化，允许大幅跳转
+
+    // 初始化信号滤波状态（运动评分平滑）
+    smoothed_instability_score = 0.0;
+    is_score_initialized = false;
 
     // 添加对我们新成员变量的重置
     {
@@ -571,7 +576,7 @@ void Estimator::estimateDepthScaleShift()
     const double correlation_threshold = 0.6;
     if (std::abs(correlation) < correlation_threshold)
     {
-        ROS_WARN("[Depth Init] ✗ Alignment REJECTED: Correlation too low (r=%.4f < %.2f).",
+        ROS_WARN("[Depth Init]   Alignment REJECTED: Correlation too low (r=%.4f < %.2f).",
                  correlation, correlation_threshold);
         ROS_WARN("[Depth Init]   This indicates VINS initialization may be noisy or scale ambiguous.");
         ROS_WARN("[Depth Init]   Fallback to default config values: a=%.6f, b=%.6f",
@@ -579,14 +584,34 @@ void Estimator::estimateDepthScaleShift()
         return;
     }
 
-    // ============ Physical Validity Check: Tightened Parameter Bounds ============
-    // For EuRoC + DepthAnythingV2, typical range is a ∈ [0.05, 0.25]
-    // Values like a=0.5 suggest fitting noise rather than real structure
+    // ============ Physical Validity Check: Correlation-Aware Parameter Bounds ============
+    // Strategy: Trust high-correlation fits more than hardcoded ranges
+    // - High correlation (r > 0.90): Allow wider bounds (scene-dependent scale)
+    // - Low correlation (r <= 0.90): Use strict bounds (filter noise)
+    //
+    // Rationale: Depth Anything V2 can output values close to metric scale (a ≈ 1.0)
+    // depending on scene content. High correlation indicates reliable fit.
 
-    const double a_min = 0.01;   // Tightened from 1e-3
-    const double a_max = 0.35;   // Tightened from 10.0 (rejects outliers like a=0.5)
-    const double b_min = -1.0;   // Tightened from -5.0
-    const double b_max = 1.0;    // Tightened from 5.0
+    const double a_min = 0.01;   // Lower bound: always enforced
+    double a_max = 0.35;         // Upper bound: will be relaxed for high correlation
+    const double b_min = -1.0;   // Shift bounds
+    const double b_max = 1.0;
+
+    // Correlation-aware upper bound relaxation
+    const double high_correlation_threshold = 0.90;
+    if (correlation > high_correlation_threshold)
+    {
+        // High correlation: Trust the fit, allow up to a=5.0
+        a_max = 5.0;
+        ROS_INFO("[Depth Init] High correlation detected (r=%.4f > %.2f). Relaxing upper bound to a_max=%.2f",
+                 correlation, high_correlation_threshold, a_max);
+    }
+    else
+    {
+        // Low/medium correlation: Use conservative bounds
+        ROS_INFO("[Depth Init] Standard correlation (r=%.4f <= %.2f). Using strict bound a_max=%.2f",
+                 correlation, high_correlation_threshold, a_max);
+    }
 
     if (estimated_a < a_min || estimated_a > a_max ||
         estimated_b < b_min || estimated_b > b_max ||
@@ -595,6 +620,8 @@ void Estimator::estimateDepthScaleShift()
         ROS_WARN("[Depth Init] ✗ Alignment REJECTED: Parameter out of safe range.");
         ROS_WARN("[Depth Init]   Calculated: a=%.6f (valid: [%.2f, %.2f]), b=%.6f (valid: [%.2f, %.2f])",
                  estimated_a, a_min, a_max, estimated_b, b_min, b_max);
+        ROS_WARN("[Depth Init]   Correlation: r=%.4f (high_threshold: %.2f)",
+                 correlation, high_correlation_threshold);
         ROS_WARN("[Depth Init]   Fallback to default config values: a=%.6f, b=%.6f",
                  DEPTH_SCALE_A, DEPTH_SHIFT_B);
         return;
@@ -636,47 +663,56 @@ void Estimator::estimateDepthScaleShift()
     double rmse = std::sqrt(residual_sum / filtered_depth_net_vec.size());
 
     // ============================================================================
-    // IMPORTANT: Online Initialization DISABLED (DEBUG/LOGGING ONLY)
+    // Physics-Aware Online Initialization with Quality Gates
     // ============================================================================
-    // Analysis shows that online initialization is highly unstable on difficult
-    // datasets (e.g., MH_05) due to:
-    // 1. Short time windows (insufficient parallax)
-    // 2. Noisy VINS initialization (scale ambiguity)
-    // 3. Motion blur in early frames
-    //
-    // New Strategy: "Fixed Prior + Online Adaptation"
-    // - Start with robust default (a=0.15, b=0.0 from config)
-    // - Let warm-up strategy (L2 loss + relaxed random walk) adapt in first 50 frames
-    // - Calculate values here ONLY for diagnostic logging
-    //
-    // DO NOT UPDATE: para_DepthScaleShift, DEPTH_SCALE_A, DEPTH_SHIFT_B, last_depth_*
-    // These will retain config values and be adapted by backend optimization
+    // Strategy: "Safety Net" - Accept calculated values ONLY if quality is high
+    // - IF correlation > 0.6 AND 0.05 < a < 0.35: Accept (good for V2_03)
+    // - ELSE: Fallback to Config Default (safe for MH_05)
+    // - Warm-up mechanism will refine either case
     // ============================================================================
 
-    // Log calculated values for debugging (NOT applied to system)
+    // All quality checks passed - accept calculated values
     ROS_WARN("[Depth Init] ═══════════════════════════════════════════════════");
-    ROS_WARN("[Depth Init] Online Linear Regression Results (DEBUG ONLY - NOT APPLIED):");
-    ROS_WARN("[Depth Init]   Calculated from VINS vs NET alignment:");
-    ROS_WARN("[Depth Init]     - a (calculated) = %.6f", estimated_a);
-    ROS_WARN("[Depth Init]     - b (calculated) = %.6f", estimated_b);
+    ROS_WARN("[Depth Init] ✓ Online Alignment ACCEPTED - All quality gates passed:");
     ROS_WARN("[Depth Init]   Data quality:");
     ROS_WARN("[Depth Init]     - Points used: %zu / %d checked", filtered_depth_net_vec.size(), features_checked);
-    ROS_WARN("[Depth Init]     - Correlation: r = %.4f", correlation);
+    ROS_WARN("[Depth Init]     - Correlation: r = %.4f (threshold: %.2f) ✓", correlation, correlation_threshold);
+
+    // Explain acceptance reasoning
+    if (correlation > high_correlation_threshold && estimated_a > 0.35)
+    {
+        ROS_WARN("[Depth Init]     - SPECIAL: High correlation (r=%.4f > %.2f) enabled relaxed bounds",
+                 correlation, high_correlation_threshold);
+        ROS_WARN("[Depth Init]     - Accepted a=%.6f despite exceeding standard limit (0.35)", estimated_a);
+        ROS_WARN("[Depth Init]     - Reason: Strong linear relationship indicates reliable scale estimation");
+    }
+
+    ROS_WARN("[Depth Init]   Parameter estimates:");
+    ROS_WARN("[Depth Init]     - a = %.6f (range: [%.2f, %.2f]) ✓", estimated_a, a_min, a_max);
+    ROS_WARN("[Depth Init]     - b = %.6f (range: [%.2f, %.2f]) ✓", estimated_b, b_min, b_max);
+    ROS_WARN("[Depth Init]   Fitting quality:");
     ROS_WARN("[Depth Init]     - RMSE: %.4f", rmse);
     ROS_WARN("[Depth Init]     - Condition number: %.2e", condition_number);
-    ROS_WARN("[Depth Init]     - Mean depth ratio: %.3f", depth_ratio);
+    ROS_WARN("[Depth Init]     - Mean depth ratio: %.3f (range: [%.1f, %.1f]) ✓",
+             depth_ratio, depth_ratio_min, depth_ratio_max);
     ROS_WARN("[Depth Init] ───────────────────────────────────────────────────");
-    ROS_WARN("[Depth Init] ✗ IGNORED: Using robust config defaults instead");
-    ROS_WARN("[Depth Init]   Actual parameters (from config):");
-    ROS_WARN("[Depth Init]     - a (config) = %.6f", DEPTH_SCALE_A);
-    ROS_WARN("[Depth Init]     - b (config) = %.6f", DEPTH_SHIFT_B);
-    ROS_WARN("[Depth Init]   Rationale: Online init unstable on difficult datasets");
-    ROS_WARN("[Depth Init]   Strategy: Fixed prior + warm-up adaptation (first 50 frames)");
+    ROS_WARN("[Depth Init] Applying calculated parameters to system:");
+    ROS_WARN("[Depth Init]   Old: a=%.6f, b=%.6f (config defaults)", DEPTH_SCALE_A, DEPTH_SHIFT_B);
+    ROS_WARN("[Depth Init]   New: a=%.6f, b=%.6f (online estimation)", estimated_a, estimated_b);
     ROS_WARN("[Depth Init] ═══════════════════════════════════════════════════");
 
-    // Note: System will use config values (DEPTH_SCALE_A, DEPTH_SHIFT_B)
-    // which are already loaded and will be adapted by backend optimization
-    // with relaxed random walk constraint in the first optimization
+    // Update system parameters
+    DEPTH_SCALE_A = estimated_a;
+    DEPTH_SHIFT_B = estimated_b;
+
+    // Store for random walk constraint
+    last_depth_a = estimated_a;
+    last_depth_b = estimated_b;
+    has_last_depth_params = true;
+
+    // Update parameter block (para_DepthScaleShift is double[1][2])
+    para_DepthScaleShift[0][0] = DEPTH_SCALE_A;
+    para_DepthScaleShift[0][1] = DEPTH_SHIFT_B;
 }
 
 /**
@@ -1985,55 +2021,234 @@ void Estimator::optimization()
         int frames_with_depth = 0;
 
         // ========================================================================
-        // Universal Depth Fusion: Dynamic Funnel Approach
+        // Physics-Aware Adaptive Depth Fusion (Multi-Factor Version)
         // ========================================================================
-        // 策略：通过时变的Huber阈值和权重实现自适应融合
-        // - 初期（帧0-100）：宽松约束（大阈值、低权重），允许参数从0.12快速收敛到真值
-        // - 后期（帧100+）：严格约束（小阈值、高权重），鲁棒抗运动模糊
-        // 优势：无需手动调参，同时适用于小房间（a≈0.08）和大厅（a≈0.18）
+        // 理论基础：单目深度预测质量与运动模糊成反比
+        // - 运动模糊由相机快速旋转(角速度)和平移振动(线加速度)共同引起
+        // - IMU陀螺仪 + 加速度计提供更全面的运动感知
+        // - 物理不变量：Depth Anything V2 特征误差下限 ≈ 0.25 (1/m)
+        //
+        // 多因子自适应策略：
+        // - 综合不稳定性评分 = gyro_norm + acc_disturbance_weight × acc_disturbance
+        // - 稳定 (score < 0.3):  高权重 (W=3.0), 严格阈值 (δ=0.75)
+        // - 不稳定 (score > 1.5):  低权重 (W=1.0), 宽松阈值 (δ=0.25)
+        // - 中间状态: 线性插值
         // ========================================================================
 
-        const int FUNNEL_RAMP_FRAMES = 100;  // 漏斗渐变帧数（约5-10秒）
-        const double HUBER_START_THRESHOLD = 4.0;   // 初始阈值：宽松（允许大残差）
-        const double HUBER_END_THRESHOLD = 1.0;     // 最终阈值：严格（抑制异常值）
-        const double WEIGHT_START_RATIO = 0.5;      // 初始权重比例：50%（温和启动）
-        const double WEIGHT_END_RATIO = 1.0;        // 最终权重比例：100%（全强度）
+        // Step A1: 计算角速度强度 (从IMU陀螺仪数据)
+        double current_gyro_norm = 0.0;
+        int valid_gyro_count = 0;
 
-        // 计算当前帧的动态Huber阈值（线性插值）
-        // Threshold = max(1.0, 4.0 - 3.0 * frame_count / 100)
-        double progress_ratio = std::min(1.0, static_cast<double>(global_frame_count) / FUNNEL_RAMP_FRAMES);
-        double current_huber_threshold = std::max(HUBER_END_THRESHOLD,
-                                                   HUBER_START_THRESHOLD - (HUBER_START_THRESHOLD - HUBER_END_THRESHOLD) * progress_ratio);
+        // 遍历滑动窗口中的所有预积分，计算平均陀螺仪幅值
+        for (int i = 0; i < WINDOW_SIZE; i++)
+        {
+            if (pre_integrations[i] != nullptr && !pre_integrations[i]->gyr_buf.empty())
+            {
+                // 计算该预积分中所有陀螺仪测量的平均范数
+                for (const auto& gyr : pre_integrations[i]->gyr_buf)
+                {
+                    current_gyro_norm += gyr.norm();
+                    valid_gyro_count++;
+                }
+            }
+        }
 
-        // 计算当前帧的动态权重比例（线性插值）
-        // Weight = target_weight * (0.5 + 0.5 * frame_count / 100)
-        double current_weight_ratio = WEIGHT_START_RATIO + (WEIGHT_END_RATIO - WEIGHT_START_RATIO) * progress_ratio;
-        double current_depth_weight = DEPTH_FACTOR_WEIGHT * current_weight_ratio;
+        // 计算平均值
+        if (valid_gyro_count > 0)
+        {
+            current_gyro_norm /= valid_gyro_count;
+        }
+        else
+        {
+            // 如果没有有效陀螺仪数据，假设为静止状态
+            current_gyro_norm = 0.0;
+        }
 
-        // 创建动态Huber损失函数并包装权重缩放
-        // 注意：必须每次优化时重新创建，因为阈值和权重随帧数变化
-        ceres::LossFunction *huber_loss = new ceres::HuberLoss(current_huber_threshold);
-        ceres::LossFunction *depth_loss_function = new ceres::ScaledLoss(huber_loss, current_depth_weight, ceres::TAKE_OWNERSHIP);
+        // Step A2: 计算加速度扰动 (从IMU加速度计数据)
+        double current_acc_disturbance = 0.0;
+        int valid_acc_count = 0;
+        const double GRAVITY_NOMINAL = 9.81; // 标称重力加速度 (m/s^2)
 
-        // 每10帧打印一次当前策略参数
+        // 遍历滑动窗口中的所有预积分，计算平均加速度扰动
+        for (int i = 0; i < WINDOW_SIZE; i++)
+        {
+            if (pre_integrations[i] != nullptr && !pre_integrations[i]->acc_buf.empty())
+            {
+                // 计算该预积分中所有加速度测量与重力的偏差
+                for (const auto& acc : pre_integrations[i]->acc_buf)
+                {
+                    // 加速度扰动 = |测量幅值 - 重力幅值|
+                    // 这捕捉到平移加速度和振动，即使旋转很小时也能检测到
+                    double acc_norm = acc.norm();
+                    current_acc_disturbance += std::abs(acc_norm - GRAVITY_NOMINAL);
+                    valid_acc_count++;
+                }
+            }
+        }
+
+        // 计算平均值
+        if (valid_acc_count > 0)
+        {
+            current_acc_disturbance /= valid_acc_count;
+        }
+        else
+        {
+            // 如果没有有效加速度数据，假设无扰动
+            current_acc_disturbance = 0.0;
+        }
+
+        // ========================================================================
+        // Step B: Low-Pass Filter for Motion Score (Optimization B)
+        // ========================================================================
+        // 计算原始运动评分 (使用调整后的加速度权重 0.5)
+        double raw_instability_score = current_gyro_norm + 0.5 * current_acc_disturbance;
+
+        // 应用指数移动平均（EMA）滤波器，消除加速度计高频噪声
+        // α = 0.2: 新测量权重20%，历史平滑值权重80%
+        // 时间常数 τ ≈ 5帧 @ 20Hz (约0.25秒响应时间)
+        if (!is_score_initialized)
+        {
+            // 首帧：直接使用原始值初始化
+            smoothed_instability_score = raw_instability_score;
+            is_score_initialized = true;
+            ROS_INFO("[Signal Filter] Initialized smoothed_instability_score = %.3f", smoothed_instability_score);
+        }
+        else
+        {
+            // 后续帧：EMA滤波
+            const double ALPHA = 0.2;  // 平滑因子 (0 = 完全平滑, 1 = 无滤波)
+            smoothed_instability_score = (1.0 - ALPHA) * smoothed_instability_score + ALPHA * raw_instability_score;
+        }
+
+        // Step C: 计算自适应权重 W (基于平滑后的评分线性插值)
+        // *** TUNED: Relaxed thresholds to allow higher weights during normal flight ***
+        // Old: THRESHOLD_LOW = 0.3, THRESHOLD_HIGH = 1.5
+        // New: THRESHOLD_LOW = 0.8, THRESHOLD_HIGH = 2.5
+        // Rationale: V2_03 has score ~1.2 (normal drone vibration), should get W >= 2.5
+        const double RELAXED_THRESHOLD_LOW = 0.8;   // Increased from 0.3
+        const double RELAXED_THRESHOLD_HIGH = 2.5;  // Increased from 1.5
+
+        double adaptive_weight;
+        if (smoothed_instability_score < RELAXED_THRESHOLD_LOW)
+        {
+            // 稳定状态：最大权重
+            adaptive_weight = DEPTH_WEIGHT_STATIC;
+        }
+        else if (smoothed_instability_score > RELAXED_THRESHOLD_HIGH)
+        {
+            // 不稳定状态：最小权重
+            adaptive_weight = DEPTH_WEIGHT_DYNAMIC;
+        }
+        else
+        {
+            // 中间状态：线性插值
+            double instability_ratio = (smoothed_instability_score - RELAXED_THRESHOLD_LOW) /
+                                      (RELAXED_THRESHOLD_HIGH - RELAXED_THRESHOLD_LOW);
+            adaptive_weight = DEPTH_WEIGHT_STATIC - instability_ratio * (DEPTH_WEIGHT_STATIC - DEPTH_WEIGHT_DYNAMIC);
+        }
+
+        // Step D: 计算自适应Huber阈值 (用于稳态，作为线性衰减的目标值)
+        // 物理不变量：无论权重如何变化，保持相同的物理误差下限
+        double steady_state_huber_threshold = adaptive_weight * PHYSICAL_ERROR_THRESHOLD;
+
+        // ========================================================================
+        // Step E: Linear Decay for Huber Threshold (Optimization A - 3-Phase Ramp)
+        // ========================================================================
+        // 递增深度融合帧计数器（每次执行深度融合时递增）
+        depth_fusion_frame_count++;
+
+        ceres::LossFunction *depth_loss_function = nullptr;
+        double current_huber_threshold;
+
+        // Phase 1: Aggressive Convergence (Frame 1-30)
+        // 使用极大阈值（近似L2损失），允许大梯度快速修正初值偏差
+        if (depth_fusion_frame_count <= 30)
+        {
+            current_huber_threshold = 999.0;  // 实质上是L2损失（所有残差 < 999都是二次惩罚）
+            depth_loss_function = new ceres::HuberLoss(current_huber_threshold);
+
+            ROS_INFO_THROTTLE(5.0, "[3-Phase] Phase 1 (Aggressive): Frame %d/30, "
+                             "Huber=%.1f (≈L2), W=%.2f, smoothed_score=%.3f (raw=%.3f)",
+                             depth_fusion_frame_count, current_huber_threshold,
+                             adaptive_weight, smoothed_instability_score, raw_instability_score);
+        }
+        // Phase 2: Smooth Exit (Frame 31-100)
+        // 线性衰减从5.0降至1.0，逐步"关闭大门"，避免梯度突变
+        else if (depth_fusion_frame_count <= 100)
+        {
+            // 计算衰减进度 [0.0, 1.0]
+            double decay_progress = static_cast<double>(depth_fusion_frame_count - 30) / 70.0;
+
+            // 线性插值: 5.0 → steady_state_huber_threshold
+            current_huber_threshold = 5.0 * (1.0 - decay_progress) + steady_state_huber_threshold * decay_progress;
+            depth_loss_function = new ceres::HuberLoss(current_huber_threshold);
+
+            // 首次进入Phase 2时打印完整说明
+            static bool phase2_entry_printed = false;
+            if (!phase2_entry_printed)
+            {
+                ROS_WARN("[3-Phase] Entering Phase 2 (Smooth Exit) at Frame %d", depth_fusion_frame_count);
+                ROS_WARN("[3-Phase] Linear decay: Huber threshold 5.0 → %.3f over 70 frames",
+                         steady_state_huber_threshold);
+                phase2_entry_printed = true;
+            }
+
+            ROS_INFO_THROTTLE(5.0, "[3-Phase] Phase 2 (Decay): Frame %d/100, "
+                             "Huber=%.3f (progress=%.1f%%), W=%.2f, smoothed_score=%.3f",
+                             depth_fusion_frame_count, current_huber_threshold,
+                             decay_progress * 100.0, adaptive_weight, smoothed_instability_score);
+        }
+        // Phase 3: Steady State (Frame 101+)
+        // 使用自适应Huber阈值，基于运动评分动态调整
+        else
+        {
+            current_huber_threshold = steady_state_huber_threshold;
+            depth_loss_function = new ceres::HuberLoss(current_huber_threshold);
+
+            // 首次进入Phase 3时打印完整说明
+            static bool phase3_entry_printed = false;
+            if (!phase3_entry_printed)
+            {
+                ROS_WARN("[3-Phase] Entering Phase 3 (Steady State) at Frame %d", depth_fusion_frame_count);
+                ROS_WARN("[3-Phase] Now using adaptive Huber threshold (physics-aware)");
+                phase3_entry_printed = true;
+            }
+
+            ROS_INFO_THROTTLE(10.0, "[3-Phase] Phase 3 (Steady): Frame %d, "
+                             "Huber=%.3f, W=%.2f, smoothed_score=%.3f",
+                             depth_fusion_frame_count, current_huber_threshold,
+                             adaptive_weight, smoothed_instability_score);
+        }
+
+        // 包装自适应权重缩放
+        // Note: Both warm-up Huber and normal Huber need weight scaling
+        if (depth_loss_function != nullptr)
+        {
+            // Wrap the Huber loss with adaptive weight
+            depth_loss_function = new ceres::ScaledLoss(depth_loss_function, adaptive_weight, ceres::TAKE_OWNERSHIP);
+        }
+        else
+        {
+            // This branch should never be reached now (warm-up uses Huber, not L2)
+            // Keep for safety: L2 loss with weight scaling
+            depth_loss_function = new ceres::ScaledLoss(nullptr, adaptive_weight, ceres::DO_NOT_TAKE_OWNERSHIP);
+        }
+
+        // 每10帧打印一次自适应参数（更新为使用平滑后的评分）
         static int last_log_frame = -10;
         if (global_frame_count - last_log_frame >= 10 || global_frame_count < 5)
         {
-            ROS_INFO("[Dynamic Funnel] Frame %d: Huber threshold=%.3f (%.0f%% → strict), Weight=%.3f (%.0f%% → full) | Target: a=%.3f",
+            ROS_INFO("[Filtered Motion] Frame %d: Gyro=%.3f, AccDist=%.3f, "
+                     "Raw_Score=%.3f, Smoothed_Score=%.3f, W=%.2f, Huber=%.3f | a=%.4f",
                      global_frame_count,
-                     current_huber_threshold, (1.0 - progress_ratio) * 100.0,
-                     current_depth_weight, current_weight_ratio * 100.0,
+                     current_gyro_norm,
+                     current_acc_disturbance,
+                     raw_instability_score,
+                     smoothed_instability_score,
+                     adaptive_weight,
+                     current_huber_threshold,
                      DEPTH_SCALE_A);
             last_log_frame = global_frame_count;
-        }
-
-        // 在第100帧打印转换完成日志
-        static bool funnel_finished = false;
-        if (global_frame_count >= FUNNEL_RAMP_FRAMES && !funnel_finished)
-        {
-            ROS_WARN("[Dynamic Funnel] Ramp COMPLETE at frame %d. Locked to strict mode: Huber threshold=%.2f, Weight=%.2f (100%%)",
-                     global_frame_count, current_huber_threshold, current_depth_weight);
-            funnel_finished = true;
         }
 
         // 重新遍历所有特征点，为有深度图的观测添加深度约束

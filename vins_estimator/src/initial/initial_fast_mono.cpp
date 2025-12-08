@@ -144,7 +144,14 @@ bool FastInitializer::initialize(const std::map<double, ImageFrame>& image_frame
     }
     
     // ========================================================================
-    // 步骤 7: 输出成功信息
+    // 步骤 7: 保存深度参数供后续使用
+    // ========================================================================
+    m_last_computed_a = a;
+    m_last_computed_b = b;
+    m_has_valid_depth_params = true;
+
+    // ========================================================================
+    // 步骤 8: 输出成功信息
     // ========================================================================
     ROS_INFO("FastInit: Initialization successful!");
     ROS_INFO("  Depth model: a=%.3f, b=%.3f", a, b);
@@ -990,6 +997,18 @@ bool FastInitializer::propagateStatesToAllFrames(
         }
         k_index++;
     }
-    
+
+    return true;
+}
+
+// 获取最近一次快速初始化计算的深度参数
+bool FastInitializer::getLastDepthParams(double& a_out, double& b_out) const
+{
+    if (!m_has_valid_depth_params) {
+        return false;
+    }
+
+    a_out = m_last_computed_a;
+    b_out = m_last_computed_b;
     return true;
 }

@@ -61,6 +61,20 @@ extern int DEPTH_FUSION_WARMUP_FRAMES;
 extern double DEPTH_A_RANDOM_WALK;
 extern double DEPTH_B_RANDOM_WALK;
 
+// ========================================================================
+// Physics-Aware Adaptive Depth Fusion Parameters (Multi-Factor Version)
+// ========================================================================
+// 基于IMU陀螺仪和加速度计的多因子运动感知自适应权重
+extern double DEPTH_WEIGHT_STATIC;      // 静止/慢速运动时的最大权重 (高置信度)
+extern double DEPTH_WEIGHT_DYNAMIC;     // 快速运动时的最小权重 (低置信度)
+// 物理不变量：Depth Anything V2 网络的特征误差下限 (逆深度单位: 1/m)
+extern double PHYSICAL_ERROR_THRESHOLD;
+// 综合不稳定性评分阈值 (combined_score = gyro_norm + acc_disturbance)
+extern double INSTABILITY_THRESHOLD_LOW;   // 低于此值视为"稳定"
+extern double INSTABILITY_THRESHOLD_HIGH;  // 高于此值视为"不稳定"
+// 加速度扰动权重因子 (用于平衡陀螺仪和加速度的贡献)
+extern double ACC_DISTURBANCE_WEIGHT;
+
 // Fast Init configurable parameters (read from YAML with defaults)
 extern int FAST_INIT_MIN_FEATURES;
 extern double FAST_INIT_MIN_ACC_VAR;

@@ -178,6 +178,7 @@ class Estimator
 
     int frame_count;  // 滑动窗口内的帧计数（初始化后固定为 WINDOW_SIZE）
     int global_frame_count;  // 全局帧计数器（用于预热策略等，持续增长）
+    int depth_fusion_frame_count;  // 深度融合专用帧计数器（从VINS初始化成功后开始计数）
     int sum_of_outlier, sum_of_back, sum_of_front, sum_of_invalid;
 
     FeatureManager f_manager;
@@ -213,6 +214,11 @@ class Estimator
     double last_depth_b;
     bool has_last_depth_params;  // 标记是否有上一次的参数值
     bool is_first_depth_optimization;  // 标记是否是第一次深度优化（用于放松随机游走约束）
+
+    // --- Signal Filtering for Depth Fusion Stability ---
+    // 存储平滑后的运动不稳定性评分（低通滤波后）
+    double smoothed_instability_score;  // EMA-filtered motion score (gyro + acc)
+    bool is_score_initialized;          // 标记评分是否已初始化（首帧处理）
 
     int loop_window_index;
 
