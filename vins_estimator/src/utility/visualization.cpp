@@ -508,6 +508,7 @@ void pubDepthMap(const cv::Mat &depth_map, const std_msgs::Header &header)
 
     // 深度图已经是原图尺寸（在 DepthEstimator::predict 中已经 resize 到原图尺寸）
     // 将归一化逆深度图转换为可视化图像（伪彩色）
+    // 注意: 存储的是逆深度，所以红色=近距离，蓝色=远距离
     cv::Mat depth_vis;
 
     // 找到有效深度值的范围（排除 NaN 和 Inf）
@@ -548,7 +549,8 @@ void pubDepthMap(const cv::Mat &depth_map, const std_msgs::Header &header)
         }
     }
 
-    // 应用 COLORMAP_JET 伪彩色（蓝色=近，红色=远）
+    // 应用 COLORMAP_JET 伪彩色
+    // 因为是归一化逆深度: 逆深度大(近) → 红色, 逆深度小(远) → 蓝色
     cv::applyColorMap(depth_normalized, depth_vis, cv::COLORMAP_JET);
 
     // 转换为 ROS 消息并发布
