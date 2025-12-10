@@ -4,7 +4,7 @@
 imu_topic: "/imu0"
 image_topic: "/cam0/image_raw"
 
-output_path: "/home/linux/mxm/output/experiment_backend/V203_test/1204/o-d"
+output_path: "/home/linux/mxm/output/experiment_backend/V203_test/1210/o-d/"
 
 # depth_model_path: "/home/linux/mxm/proj/VINS-Mo/src/VINS-Mo/vins_estimator/models/Midas-V2.onnx" # path to depth estimation model
 depth_model_path: "/home/linux/mxm/proj/VINS-Mo/src/VINS-Mo/vins_estimator/models/depth_anything_v2_vits.onnx" # path to depth estimation model
@@ -53,15 +53,42 @@ depth_constraint.initial_shift_b: 0.0
 # 推荐范围：1e-4 到 1e-3
 depth_constraint.random_walk_a: 1.0e-3
 depth_constraint.random_walk_b: 1.0e-3
-# 深度因子的权重（控制深度约束对优化的影响强度）
-# 值越大，深度约束越强；建议从 0.1 到 10.0 范围内调整
-depth_constraint.weight: 10
-# 深度因子的Huber鲁棒核阈值（用于抑制深度估计的异常值）
+
+# ========================================================================
+# 权重模式选择 (Weight Mode Selection)
+# ========================================================================
+# depth_constraint.weight_mode: 权重模式开关
+#   0 = 固定权重模式 (Fixed Weight Mode)
+#       - 使用 depth_constraint.weight 作为恒定权重
+#       - Huber阈值使用 depth_constraint.huber_threshold
+#       - 适用于: 实验对比、消融研究、已知稳定环境
+#       - 优点: 行为可预测，易于调试
+#       - 缺点: 无法适应运动变化，可能在动态场景中性能下降
+#
+#   1 = 自适应权重模式 (Adaptive Weight Mode) [推荐]
+#       - 根据IMU运动状态动态调整权重 (weight_static ↔ weight_dynamic)
+#       - 自适应Huber阈值: δ = W × 0.25 (物理不变量)
+#       - 适用于: 真实飞行、动态环境、通用场景
+#       - 优点: 自动平衡深度约束强度，提高鲁棒性
+#       - 缺点: 行为更复杂，调试难度稍高
+depth_constraint.weight_mode: 1
+
+# ========================================================================
+# 固定权重模式参数 (仅在 weight_mode=0 时生效)
+# ========================================================================
+# 深度因子的固定权重（控制深度约束对优化的影响强度）
+# 值越大，深度约束越强；建议从 1.0 到 5.0 范围内调整
+# 注意: 在 weight_mode=1 时，此参数被忽略，权重由自适应系统控制
+depth_constraint.weight: 2.5
+# 深度因子的固定Huber鲁棒核阈值（用于抑制深度估计的异常值）
 # 值越大，对异常值越宽容；建议从 0.5 到 5.0 范围内调整
+# 注意: 在 weight_mode=1 时，此参数被忽略，阈值自适应计算
 depth_constraint.huber_threshold: 0.5
+
 # 深度融合预热帧数（Warm-up frames）
 # 在前N帧使用L2损失以快速收敛，N帧后切换到Huber损失抑制异常值
 # 建议范围：30-100帧（约1-5秒）
+# 注意: 此参数在两种模式下都生效
 depth_constraint.warmup_frames: 30
 
 # ========================================================================

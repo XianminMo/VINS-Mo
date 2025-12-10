@@ -2021,21 +2021,45 @@ void Estimator::optimization()
         int frames_with_depth = 0;
 
         // ========================================================================
-        // Physics-Aware Adaptive Depth Fusion (Multi-Factor Version)
+        // Depth Fusion Weight and Huber Threshold Calculation
         // ========================================================================
-        // 理论基础：单目深度预测质量与运动模糊成反比
-        // - 运动模糊由相机快速旋转(角速度)和平移振动(线加速度)共同引起
-        // - IMU陀螺仪 + 加速度计提供更全面的运动感知
-        // - 物理不变量：Depth Anything V2 特征误差下限 ≈ 0.25 (1/m)
-        //
-        // 多因子自适应策略：
-        // - 综合不稳定性评分 = gyro_norm + acc_disturbance_weight × acc_disturbance
-        // - 稳定 (score < 0.3):  高权重 (W=3.0), 严格阈值 (δ=0.75)
-        // - 不稳定 (score > 1.5):  低权重 (W=1.0), 宽松阈值 (δ=0.25)
-        // - 中间状态: 线性插值
+        // 支持两种模式：
+        // - Mode 0 (Fixed): 使用固定权重和Huber阈值
+        // - Mode 1 (Adaptive): 基于IMU运动状态动态调整权重和阈值
         // ========================================================================
 
-        // Step A1: 计算角速度强度 (从IMU陀螺仪数据)
+        double final_weight;
+        double final_huber_threshold;
+
+        if (DEPTH_WEIGHT_MODE == 0)
+        {
+            // ========================================================================
+            // Fixed Weight Mode (weight_mode = 0)
+            // ========================================================================
+            final_weight = DEPTH_FACTOR_WEIGHT;
+            final_huber_threshold = DEPTH_FACTOR_HUBER_THRESHOLD;
+
+            ROS_INFO_THROTTLE(10.0, "[Fixed Weight] Frame %d: W=%.2f, Huber=%.3f | a=%.4f",
+                             global_frame_count, final_weight, final_huber_threshold, DEPTH_SCALE_A);
+        }
+        else
+        {
+            // ========================================================================
+            // Physics-Aware Adaptive Depth Fusion (Multi-Factor Version)
+            // ========================================================================
+            // 理论基础：单目深度预测质量与运动模糊成反比
+            // - 运动模糊由相机快速旋转(角速度)和平移振动(线加速度)共同引起
+            // - IMU陀螺仪 + 加速度计提供更全面的运动感知
+            // - 物理不变量：Depth Anything V2 特征误差下限 ≈ 0.25 (1/m)
+            //
+            // 多因子自适应策略：
+            // - 综合不稳定性评分 = gyro_norm + acc_disturbance_weight × acc_disturbance
+            // - 稳定 (score < 0.3):  高权重 (W=3.0), 严格阈值 (δ=0.75)
+            // - 不稳定 (score > 1.5):  低权重 (W=1.0), 宽松阈值 (δ=0.25)
+            // - 中间状态: 线性插值
+            // ========================================================================
+
+            // Step A1: 计算角速度强度 (从IMU陀螺仪数据)
         double current_gyro_norm = 0.0;
         int valid_gyro_count = 0;
 
@@ -2151,105 +2175,122 @@ void Estimator::optimization()
         // 物理不变量：无论权重如何变化，保持相同的物理误差下限
         double steady_state_huber_threshold = adaptive_weight * PHYSICAL_ERROR_THRESHOLD;
 
-        // ========================================================================
-        // Step E: Linear Decay for Huber Threshold (Optimization A - 3-Phase Ramp)
-        // ========================================================================
-        // 递增深度融合帧计数器（每次执行深度融合时递增）
-        depth_fusion_frame_count++;
+            // ========================================================================
+            // Step E: Linear Decay for Huber Threshold (Optimization A - 3-Phase Ramp)
+            // ========================================================================
+            // 递增深度融合帧计数器（每次执行深度融合时递增）
+            depth_fusion_frame_count++;
 
+            ceres::LossFunction *depth_loss_function = nullptr;
+            double current_huber_threshold;
+
+            // Phase 1: Aggressive Convergence (Frame 1-30)
+            // 使用极大阈值（近似L2损失），允许大梯度快速修正初值偏差
+            if (depth_fusion_frame_count <= 30)
+            {
+                current_huber_threshold = 999.0;  // 实质上是L2损失（所有残差 < 999都是二次惩罚）
+                depth_loss_function = new ceres::HuberLoss(current_huber_threshold);
+
+                ROS_INFO_THROTTLE(5.0, "[3-Phase] Phase 1 (Aggressive): Frame %d/30, "
+                                 "Huber=%.1f (≈L2), W=%.2f, smoothed_score=%.3f (raw=%.3f)",
+                                 depth_fusion_frame_count, current_huber_threshold,
+                                 adaptive_weight, smoothed_instability_score, raw_instability_score);
+            }
+            // Phase 2: Smooth Exit (Frame 31-100)
+            // 线性衰减从5.0降至1.0，逐步"关闭大门"，避免梯度突变
+            else if (depth_fusion_frame_count <= 100)
+            {
+                // 计算衰减进度 [0.0, 1.0]
+                double decay_progress = static_cast<double>(depth_fusion_frame_count - 30) / 70.0;
+
+                // 线性插值: 5.0 → steady_state_huber_threshold
+                current_huber_threshold = 5.0 * (1.0 - decay_progress) + steady_state_huber_threshold * decay_progress;
+                depth_loss_function = new ceres::HuberLoss(current_huber_threshold);
+
+                // 首次进入Phase 2时打印完整说明
+                static bool phase2_entry_printed = false;
+                if (!phase2_entry_printed)
+                {
+                    ROS_WARN("[3-Phase] Entering Phase 2 (Smooth Exit) at Frame %d", depth_fusion_frame_count);
+                    ROS_WARN("[3-Phase] Linear decay: Huber threshold 5.0 → %.3f over 70 frames",
+                             steady_state_huber_threshold);
+                    phase2_entry_printed = true;
+                }
+
+                ROS_INFO_THROTTLE(5.0, "[3-Phase] Phase 2 (Decay): Frame %d/100, "
+                                 "Huber=%.3f (progress=%.1f%%), W=%.2f, smoothed_score=%.3f",
+                                 depth_fusion_frame_count, current_huber_threshold,
+                                 decay_progress * 100.0, adaptive_weight, smoothed_instability_score);
+            }
+            // Phase 3: Steady State (Frame 101+)
+            // 使用自适应Huber阈值，基于运动评分动态调整
+            else
+            {
+                current_huber_threshold = steady_state_huber_threshold;
+                depth_loss_function = new ceres::HuberLoss(current_huber_threshold);
+
+                // 首次进入Phase 3时打印完整说明
+                static bool phase3_entry_printed = false;
+                if (!phase3_entry_printed)
+                {
+                    ROS_WARN("[3-Phase] Entering Phase 3 (Steady State) at Frame %d", depth_fusion_frame_count);
+                    ROS_WARN("[3-Phase] Now using adaptive Huber threshold (physics-aware)");
+                    phase3_entry_printed = true;
+                }
+
+                ROS_INFO_THROTTLE(10.0, "[3-Phase] Phase 3 (Steady): Frame %d, "
+                                 "Huber=%.3f, W=%.2f, smoothed_score=%.3f",
+                                 depth_fusion_frame_count, current_huber_threshold,
+                                 adaptive_weight, smoothed_instability_score);
+            }
+
+            // 包装自适应权重缩放
+            // Note: Both warm-up Huber and normal Huber need weight scaling
+            if (depth_loss_function != nullptr)
+            {
+                // Wrap the Huber loss with adaptive weight
+                depth_loss_function = new ceres::ScaledLoss(depth_loss_function, adaptive_weight, ceres::TAKE_OWNERSHIP);
+            }
+            else
+            {
+                // This branch should never be reached now (warm-up uses Huber, not L2)
+                // Keep for safety: L2 loss with weight scaling
+                depth_loss_function = new ceres::ScaledLoss(nullptr, adaptive_weight, ceres::DO_NOT_TAKE_OWNERSHIP);
+            }
+
+            // 每10帧打印一次自适应参数（更新为使用平滑后的评分）
+            static int last_log_frame = -10;
+            if (global_frame_count - last_log_frame >= 10 || global_frame_count < 5)
+            {
+                ROS_INFO("[Filtered Motion] Frame %d: Gyro=%.3f, AccDist=%.3f, "
+                         "Raw_Score=%.3f, Smoothed_Score=%.3f, W=%.2f, Huber=%.3f | a=%.4f",
+                         global_frame_count,
+                         current_gyro_norm,
+                         current_acc_disturbance,
+                         raw_instability_score,
+                         smoothed_instability_score,
+                         adaptive_weight,
+                         current_huber_threshold,
+                         DEPTH_SCALE_A);
+                last_log_frame = global_frame_count;
+            }
+
+            // 将自适应模式计算的结果赋值给最终变量
+            final_weight = adaptive_weight;
+            final_huber_threshold = current_huber_threshold;
+        } // end of adaptive mode
+
+        // ========================================================================
+        // Create Loss Function for Fixed Mode
+        // ========================================================================
         ceres::LossFunction *depth_loss_function = nullptr;
-        double current_huber_threshold;
-
-        // Phase 1: Aggressive Convergence (Frame 1-30)
-        // 使用极大阈值（近似L2损失），允许大梯度快速修正初值偏差
-        if (depth_fusion_frame_count <= 30)
+        if (DEPTH_WEIGHT_MODE == 0)
         {
-            current_huber_threshold = 999.0;  // 实质上是L2损失（所有残差 < 999都是二次惩罚）
-            depth_loss_function = new ceres::HuberLoss(current_huber_threshold);
-
-            ROS_INFO_THROTTLE(5.0, "[3-Phase] Phase 1 (Aggressive): Frame %d/30, "
-                             "Huber=%.1f (≈L2), W=%.2f, smoothed_score=%.3f (raw=%.3f)",
-                             depth_fusion_frame_count, current_huber_threshold,
-                             adaptive_weight, smoothed_instability_score, raw_instability_score);
+            // Fixed mode: simple Huber loss with fixed threshold
+            depth_loss_function = new ceres::HuberLoss(final_huber_threshold);
+            depth_loss_function = new ceres::ScaledLoss(depth_loss_function, final_weight, ceres::TAKE_OWNERSHIP);
         }
-        // Phase 2: Smooth Exit (Frame 31-100)
-        // 线性衰减从5.0降至1.0，逐步"关闭大门"，避免梯度突变
-        else if (depth_fusion_frame_count <= 100)
-        {
-            // 计算衰减进度 [0.0, 1.0]
-            double decay_progress = static_cast<double>(depth_fusion_frame_count - 30) / 70.0;
-
-            // 线性插值: 5.0 → steady_state_huber_threshold
-            current_huber_threshold = 5.0 * (1.0 - decay_progress) + steady_state_huber_threshold * decay_progress;
-            depth_loss_function = new ceres::HuberLoss(current_huber_threshold);
-
-            // 首次进入Phase 2时打印完整说明
-            static bool phase2_entry_printed = false;
-            if (!phase2_entry_printed)
-            {
-                ROS_WARN("[3-Phase] Entering Phase 2 (Smooth Exit) at Frame %d", depth_fusion_frame_count);
-                ROS_WARN("[3-Phase] Linear decay: Huber threshold 5.0 → %.3f over 70 frames",
-                         steady_state_huber_threshold);
-                phase2_entry_printed = true;
-            }
-
-            ROS_INFO_THROTTLE(5.0, "[3-Phase] Phase 2 (Decay): Frame %d/100, "
-                             "Huber=%.3f (progress=%.1f%%), W=%.2f, smoothed_score=%.3f",
-                             depth_fusion_frame_count, current_huber_threshold,
-                             decay_progress * 100.0, adaptive_weight, smoothed_instability_score);
-        }
-        // Phase 3: Steady State (Frame 101+)
-        // 使用自适应Huber阈值，基于运动评分动态调整
-        else
-        {
-            current_huber_threshold = steady_state_huber_threshold;
-            depth_loss_function = new ceres::HuberLoss(current_huber_threshold);
-
-            // 首次进入Phase 3时打印完整说明
-            static bool phase3_entry_printed = false;
-            if (!phase3_entry_printed)
-            {
-                ROS_WARN("[3-Phase] Entering Phase 3 (Steady State) at Frame %d", depth_fusion_frame_count);
-                ROS_WARN("[3-Phase] Now using adaptive Huber threshold (physics-aware)");
-                phase3_entry_printed = true;
-            }
-
-            ROS_INFO_THROTTLE(10.0, "[3-Phase] Phase 3 (Steady): Frame %d, "
-                             "Huber=%.3f, W=%.2f, smoothed_score=%.3f",
-                             depth_fusion_frame_count, current_huber_threshold,
-                             adaptive_weight, smoothed_instability_score);
-        }
-
-        // 包装自适应权重缩放
-        // Note: Both warm-up Huber and normal Huber need weight scaling
-        if (depth_loss_function != nullptr)
-        {
-            // Wrap the Huber loss with adaptive weight
-            depth_loss_function = new ceres::ScaledLoss(depth_loss_function, adaptive_weight, ceres::TAKE_OWNERSHIP);
-        }
-        else
-        {
-            // This branch should never be reached now (warm-up uses Huber, not L2)
-            // Keep for safety: L2 loss with weight scaling
-            depth_loss_function = new ceres::ScaledLoss(nullptr, adaptive_weight, ceres::DO_NOT_TAKE_OWNERSHIP);
-        }
-
-        // 每10帧打印一次自适应参数（更新为使用平滑后的评分）
-        static int last_log_frame = -10;
-        if (global_frame_count - last_log_frame >= 10 || global_frame_count < 5)
-        {
-            ROS_INFO("[Filtered Motion] Frame %d: Gyro=%.3f, AccDist=%.3f, "
-                     "Raw_Score=%.3f, Smoothed_Score=%.3f, W=%.2f, Huber=%.3f | a=%.4f",
-                     global_frame_count,
-                     current_gyro_norm,
-                     current_acc_disturbance,
-                     raw_instability_score,
-                     smoothed_instability_score,
-                     adaptive_weight,
-                     current_huber_threshold,
-                     DEPTH_SCALE_A);
-            last_log_frame = global_frame_count;
-        }
+        // Note: adaptive mode already created depth_loss_function in the else block above
 
         // 重新遍历所有特征点，为有深度图的观测添加深度约束
         feature_index = -1;

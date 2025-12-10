@@ -3,7 +3,120 @@
 #common parameters
 imu_topic: "/imu0"
 image_topic: "/cam0/image_raw"
-output_path: "/home/tony-ws1/output/"
+output_path: "/home/linux/mxm/output/experiment_backend/V203_test/1204/o-d"
+
+# depth_model_path: "/home/linux/mxm/proj/VINS-Mo/src/VINS-Mo/vins_estimator/models/Midas-V2.onnx" # path to depth estimation model
+depth_model_path: "/home/linux/mxm/proj/VINS-Mo/src/VINS-Mo/vins_estimator/models/depth_anything_v2_vits.onnx" # path to depth estimation model
+
+use_fast_init: 0      # 0: normal initialization; 1: use fast initialization with depth estimation
+
+# fast init parameters (optional; defaults used if omitted)
+fast_init.min_features: 50                 # 最小特征数阈值（初始化前检测）
+fast_init.min_acc_var: 0.15               # IMU加速度方差下限，用于激励检测（无单位）
+fast_init.ransac.min_measurements: 4      # RANSAC最小观测对数量
+fast_init.ransac.max_iterations: 500      # RANSAC最大迭代次数
+fast_init.ransac.residual_thresh_px: 0.01 # RANSAC残差阈值（像素）
+fast_init.ransac.min_inliers: 20          # RANSAC最少内点数
+fast_init.ransac.early_exit_inlier_ratio: 0.7 # 早停：内点比例超过该值即提前退出
+fast_init.svd.min_sigma: 1.0e-8           # SVD最小奇异值阈值（数值稳定性）
+fast_init.cond.threshold: 3.0e5          # 线性系统条件数上限（数值稳定性）
+fast_init.depth.inv_min: 1.0e-6           # 归一化逆深度最小值（有效性检查）
+fast_init.depth.inv_max: 10.0             # 归一化逆深度最大值（有效性检查）
+fast_init.depth.z_min: 0.1                # 有效景深下限（米）
+fast_init.depth.z_max: 50.0               # 有效景深上限（米）
+fast_init.depth.min_valid_features: 10    # 有效深度特征的最少数量
+fast_init.irls.iters: 3                   # IRLS迭代次数
+fast_init.irls.huber_delta: 1.5e-2        # IRLS Huber阈值（像面误差尺度）
+fast_init.reg.lambda_a: 1.0e-2            # 正则：尺度因子a的权重
+fast_init.reg.lambda_b: 1.0e-2            # 正则：深度偏移b的权重
+fast_init.reg.lambda_v: 1.0e-3            # 正则：初始速度v的权重
+
+# --- Backend Depth Constraint Parameters (深度传感器因子约束参数) ---
+# 是否在后端优化中启用深度约束因子 (0: 关闭, 1: 开启)
+depth_constraint.estimate_scale_shift: 1
+# 深度仿射变换尺度因子 a 的初始值 (1/d_metric = a * d_nn + b)
+# 策略: "Physics-Aware Adaptive Depth Fusion"
+# - 使用中间值 a=0.15 作为通用默认值（适用于各种场景）
+# - 在线初始化（质量门控）：如果初始化质量高（r>0.6），自动接受计算值
+# - 否则回退到此配置默认值，后续由物理感知自适应机制处理
+# - 自适应权重: 5.0 (静止) → 1.5 (运动), 基于IMU陀螺仪实时调整
+# - 自适应Huber阈值: δ = W × 0.25 (物理不变量)
+depth_constraint.initial_scale_a: 0.15
+# 深度偏移因子 b 的初始值
+# - 设为 0.0（零偏移先验）
+# - 后端优化会根据实际场景自适应调整
+depth_constraint.initial_shift_b: 0.0
+# 深度参数随机游走过程噪声（Random Walk Process Noise）
+# 控制参数在相邻帧之间允许的最大变化量
+# 值越大，参数变化越自由，但可能震荡；值越小，参数变化越保守
+# 推荐范围：1e-4 到 1e-3
+depth_constraint.random_walk_a: 1.0e-3
+depth_constraint.random_walk_b: 1.0e-3
+
+# ========================================================================
+# 权重模式选择 (Weight Mode Selection)
+# ========================================================================
+# depth_constraint.weight_mode: 权重模式开关
+#   0 = 固定权重模式 (Fixed Weight Mode)
+#       - 使用 depth_constraint.weight 作为恒定权重
+#       - Huber阈值使用 depth_constraint.huber_threshold
+#       - 适用于: 实验对比、消融研究、已知稳定环境
+#       - 优点: 行为可预测，易于调试
+#       - 缺点: 无法适应运动变化，可能在动态场景中性能下降
+#
+#   1 = 自适应权重模式 (Adaptive Weight Mode) [推荐]
+#       - 根据IMU运动状态动态调整权重 (weight_static ↔ weight_dynamic)
+#       - 自适应Huber阈值: δ = W × 0.25 (物理不变量)
+#       - 适用于: 真实飞行、动态环境、通用场景
+#       - 优点: 自动平衡深度约束强度，提高鲁棒性
+#       - 缺点: 行为更复杂，调试难度稍高
+depth_constraint.weight_mode: 1
+
+# ========================================================================
+# 固定权重模式参数 (仅在 weight_mode=0 时生效)
+# ========================================================================
+# 深度因子的固定权重（控制深度约束对优化的影响强度）
+# 值越大，深度约束越强；建议从 1.0 到 5.0 范围内调整
+# 注意: 在 weight_mode=1 时，此参数被忽略，权重由自适应系统控制
+depth_constraint.weight: 2.5
+# 深度因子的固定Huber鲁棒核阈值（用于抑制深度估计的异常值）
+# 值越大，对异常值越宽容；建议从 0.5 到 5.0 范围内调整
+# 注意: 在 weight_mode=1 时，此参数被忽略，阈值自适应计算
+depth_constraint.huber_threshold: 0.5
+
+# 深度融合预热帧数（Warm-up frames）
+# 在前N帧使用L2损失以快速收敛，N帧后切换到Huber损失抑制异常值
+# 建议范围：30-100帧（约1-5秒）
+# 注意: 此参数在两种模式下都生效
+depth_constraint.warmup_frames: 30
+
+# ========================================================================
+# Physics-Aware Adaptive Depth Fusion Parameters (Multi-Factor Version)
+# ========================================================================
+# 基于IMU陀螺仪和加速度计的多因子运动感知自适应权重系统
+# 核心思想：深度预测质量 ∝ 1/运动模糊
+#           运动模糊由旋转(角速度)和平移振动(线加速度)共同引起
+#
+# 静止时的最大权重（高置信度，保守设为3.0以增强鲁棒性）
+depth_constraint.adaptive.weight_static: 3.0
+# 剧烈运动/振动时的最小权重（低置信度）
+depth_constraint.adaptive.weight_dynamic: 1.0
+# 物理不变量：Depth Anything V2 网络的特征误差下限（逆深度单位: 1/m）
+depth_constraint.adaptive.physical_error_threshold: 0.25
+# 综合不稳定性评分低阈值（低于此值视为"稳定"状态）
+depth_constraint.adaptive.instability_threshold_low: 0.3
+# 综合不稳定性评分高阈值（高于此值视为"不稳定"状态）
+depth_constraint.adaptive.instability_threshold_high: 1.5
+# 加速度扰动权重因子（用于平衡陀螺仪和加速度的贡献）
+# combined_score = gyro_norm + acc_disturbance_weight × |acc_norm - 9.81|
+depth_constraint.adaptive.acc_disturbance_weight: 0.5
+#
+# 多因子自适应行为:
+#   Score < 0.3:  W=3.0, δ=0.75  [稳定：静止悬停，无振动]
+#   Score 0.3-1.5: W线性插值(3.0→1.0), δ=W×0.25  [渐变适应]
+#   Score > 1.5:  W=1.0, δ=0.25  [不稳定：快速运动+振动]
+#
+# 优势：能够捕捉到MH_05中低旋转但高平移/振动的场景
 
 #camera calibration 
 model_type: KANNALA_BRANDT

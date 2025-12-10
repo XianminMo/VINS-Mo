@@ -51,9 +51,11 @@ extern int ESTIMATE_DEPTH_SCALE_SHIFT;
 extern double DEPTH_SCALE_A;
 // 深度偏移因子初始值
 extern double DEPTH_SHIFT_B;
-// 深度因子的权重 (影响约束强度)
+// 权重模式: 0=固定权重, 1=自适应权重
+extern int DEPTH_WEIGHT_MODE;
+// 深度因子的权重 (影响约束强度) - 仅在 weight_mode=0 时使用
 extern double DEPTH_FACTOR_WEIGHT;
-// 深度因子的Huber鲁棒核阈值 (用于抑制异常值)
+// 深度因子的Huber鲁棒核阈值 (用于抑制异常值) - 仅在 weight_mode=0 时使用
 extern double DEPTH_FACTOR_HUBER_THRESHOLD;
 // 深度融合预热帧数 (Warm-up frames for depth fusion)
 extern int DEPTH_FUSION_WARMUP_FRAMES;
