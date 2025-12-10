@@ -382,6 +382,16 @@ void process()
             pubKeyframe(*estimator_ptr);
             if (relo_msg != NULL)
                 pubRelocalization(*estimator_ptr);
+
+            // 发布深度图可视化
+            if (ESTIMATE_DEPTH_SCALE_SHIFT && estimator_ptr->isDepthEstimatorReady())
+            {
+                cv::Mat depth_map = estimator_ptr->getLatestDepthMap();
+                if (!depth_map.empty())
+                {
+                    pubDepthMap(depth_map, header);
+                }
+            }
             //ROS_ERROR("end: %f, at %f", feature_msg->header.stamp.toSec(), ros::Time::now().toSec());
         }
         m_estimator.unlock();

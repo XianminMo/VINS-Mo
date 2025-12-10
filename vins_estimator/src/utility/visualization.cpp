@@ -1,4 +1,6 @@
 #include "visualization.h"
+#include <cv_bridge/cv_bridge.h>
+#include <opencv2/opencv.hpp>
 
 using namespace ros;
 using namespace Eigen;
@@ -14,6 +16,7 @@ nav_msgs::Path path, relo_path;
 ros::Publisher pub_keyframe_pose;
 ros::Publisher pub_keyframe_point;
 ros::Publisher pub_extrinsic;
+ros::Publisher pub_depth_image;
 
 CameraPoseVisualization cameraposevisual(0, 1, 0, 1);
 CameraPoseVisualization keyframebasevisual(0.0, 0.0, 1.0, 1.0);
@@ -35,6 +38,7 @@ void registerPub(ros::NodeHandle &n)
     pub_keyframe_point = n.advertise<sensor_msgs::PointCloud>("keyframe_point", 1000);
     pub_extrinsic = n.advertise<nav_msgs::Odometry>("extrinsic", 1000);
     pub_relo_relative_pose=  n.advertise<nav_msgs::Odometry>("relo_relative_pose", 1000);
+    pub_depth_image = n.advertise<sensor_msgs::Image>("depth_image", 1000);
 
     cameraposevisual.setScale(1);
     cameraposevisual.setLineWidth(0.05);
@@ -492,4 +496,76 @@ void pubRelocalization(const Estimator &estimator)
     odometry.twist.twist.linear.y = estimator.relo_frame_index;
 
     pub_relo_relative_pose.publish(odometry);
+}
+
+void pubDepthMap(const cv::Mat &depth_map, const std_msgs::Header &header)
+{
+    if (depth_map.empty())
+    {
+        ROS_WARN_THROTTLE(5.0, "Depth map is empty, skipping publication");
+        return;
+    }
+
+    // 深度图已经是原图尺寸（在 DepthEstimator::predict 中已经 resize 到原图尺寸）
+    // 将归一化逆深度图转换为可视化图像（伪彩色）
+    cv::Mat depth_vis;
+
+    // 找到有效深度值的范围（排除 NaN 和 Inf）
+    double min_val = std::numeric_limits<double>::max();
+    double max_val = std::numeric_limits<double>::lowest();
+
+    for (int i = 0; i < depth_map.rows; i++)
+    {
+        for (int j = 0; j < depth_map.cols; j++)
+        {
+            float val = depth_map.at<float>(i, j);
+            if (std::isfinite(val))
+            {
+                min_val = std::min(min_val, static_cast<double>(val));
+                max_val = std::max(max_val, static_cast<double>(val));
+            }
+        }
+    }
+
+    // 归一化到 0-255 并应用伪彩色
+    cv::Mat depth_normalized(depth_map.rows, depth_map.cols, CV_8UC1);
+    for (int i = 0; i < depth_map.rows; i++)
+    {
+        for (int j = 0; j < depth_map.cols; j++)
+        {
+            float val = depth_map.at<float>(i, j);
+            if (std::isfinite(val) && max_val > min_val)
+            {
+                // 归一化到 0-255
+                depth_normalized.at<uchar>(i, j) = static_cast<uchar>(
+                    255.0 * (val - min_val) / (max_val - min_val)
+                );
+            }
+            else
+            {
+                depth_normalized.at<uchar>(i, j) = 0;
+            }
+        }
+    }
+
+    // 应用 COLORMAP_JET 伪彩色（蓝色=近，红色=远）
+    cv::applyColorMap(depth_normalized, depth_vis, cv::COLORMAP_JET);
+
+    // 转换为 ROS 消息并发布
+    try
+    {
+        cv_bridge::CvImage cv_image;
+        cv_image.header = header;
+        cv_image.encoding = sensor_msgs::image_encodings::BGR8;
+        cv_image.image = depth_vis;
+
+        pub_depth_image.publish(cv_image.toImageMsg());
+
+        ROS_INFO_THROTTLE(5.0, "Published depth map: %dx%d, range [%.3f, %.3f]",
+                         depth_map.cols, depth_map.rows, min_val, max_val);
+    }
+    catch (cv_bridge::Exception& e)
+    {
+        ROS_ERROR("cv_bridge exception when publishing depth map: %s", e.what());
+    }
 }

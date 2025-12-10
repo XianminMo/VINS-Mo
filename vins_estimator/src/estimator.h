@@ -63,6 +63,22 @@ class Estimator
     }
 
     /**
+     * @brief 获取最新帧的深度图（用于可视化）
+     * @return 深度图的拷贝，如果不存在则返回空Mat
+     */
+    cv::Mat getLatestDepthMap() const {
+        if (all_image_frame.empty()) {
+            return cv::Mat();
+        }
+        // 获取最新帧
+        auto latest_frame = all_image_frame.rbegin();
+        if (latest_frame->second.depth_map_computed && !latest_frame->second.predicted_depth_map.empty()) {
+            return latest_frame->second.predicted_depth_map.clone();
+        }
+        return cv::Mat();
+    }
+
+    /**
      * @brief 在线估计深度尺度偏移参数（初始化完成后调用）
      *
      * 使用当前滑动窗口中的特征点，通过线性回归计算最优的 a, b 参数。
