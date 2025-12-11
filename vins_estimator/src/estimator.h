@@ -22,6 +22,7 @@
 
 #include <unordered_map>
 #include <queue>
+#include <fstream>
 #include <opencv2/core/eigen.hpp>
 
 // --- MODIFICATION START: Break circular dependency ---
@@ -268,4 +269,11 @@ class Estimator
     std::unique_ptr<FastInitializer> mp_fast_initializer;
     int m_depth_window_start_id = -1;
     std::atomic<bool> m_depth_estimator_ready{false};
+
+    // Depth fusion logging
+    std::ofstream depth_fusion_log_file;
+    int log_frame_counter = 0;
+    void logDepthFusionMetrics(int frame_id, double gyro_norm, double acc_disturbance,
+                               double raw_score, double smoothed_score, double weight,
+                               double huber_threshold, double scale_a, double shift_b);
 };

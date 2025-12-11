@@ -9,7 +9,9 @@ Estimator::Estimator(): f_manager{Rs}
     // 调用clearState()函数，重置所有状态变量和参数
     clearState();
     // 初始化标志，表示第一帧的深度图尚未计算
-    m_first_frame_depth_computed = false; 
+    m_first_frame_depth_computed = false;
+    // 初始化日志计数器
+    log_frame_counter = 0;
 }
 
 /**
@@ -72,6 +74,24 @@ void Estimator::setParameter()
     ProjectionTdFactor::sqrt_info = FOCAL_LENGTH / 1.5 * Matrix2d::Identity();
     // 设置IMU和相机之间的时间戳延迟
     td = TD;
+
+    // 初始化深度融合日志文件
+    if (ESTIMATE_DEPTH_SCALE_SHIFT)
+    {
+        std::string log_path = VINS_RESULT_PATH + "/depth_fusion_metrics.csv";
+        depth_fusion_log_file.open(log_path, std::ios::out);
+        if (depth_fusion_log_file.is_open())
+        {
+            // 写入CSV头部
+            depth_fusion_log_file << "frame_id,gyro_norm,acc_disturbance,raw_score,smoothed_score,"
+                                  << "weight,huber_threshold,scale_a,shift_b,weight_mode\n";
+            ROS_INFO("Depth fusion metrics log file opened: %s", log_path.c_str());
+        }
+        else
+        {
+            ROS_WARN("Failed to open depth fusion metrics log file: %s", log_path.c_str());
+        }
+    }
 }
 
 /**
@@ -170,6 +190,15 @@ void Estimator::clearState()
         m_first_frame_depth_computed = false; // 标记第一帧深度图未计算
         m_first_frame_depth_map.release();    // 释放深度图内存
     }
+
+    // 关闭日志文件（如果打开）
+    if (depth_fusion_log_file.is_open())
+    {
+        depth_fusion_log_file.flush();
+        depth_fusion_log_file.close();
+        ROS_INFO("Depth fusion metrics log file closed");
+    }
+    log_frame_counter = 0;
 
     failure_occur = 0; // 失败标志位清零
     relocalization_info = 0; // 重定位信息标志位清零
@@ -2031,6 +2060,12 @@ void Estimator::optimization()
         double final_weight;
         double final_huber_threshold;
 
+        // 声明日志需要的变量（在两种模式外部声明，以便日志函数可以访问）
+        double current_gyro_norm = 0.0;
+        double current_acc_disturbance = 0.0;
+        double raw_instability_score = 0.0;
+        double smoothed_instability_score = 0.0;
+
         if (DEPTH_WEIGHT_MODE == 0)
         {
             // ========================================================================
@@ -2060,8 +2095,7 @@ void Estimator::optimization()
             // ========================================================================
 
             // Step A1: 计算角速度强度 (从IMU陀螺仪数据)
-        double current_gyro_norm = 0.0;
-        int valid_gyro_count = 0;
+            int valid_gyro_count = 0;
 
         // 遍历滑动窗口中的所有预积分，计算平均陀螺仪幅值
         for (int i = 0; i < WINDOW_SIZE; i++)
@@ -2088,9 +2122,8 @@ void Estimator::optimization()
             current_gyro_norm = 0.0;
         }
 
-        // Step A2: 计算加速度扰动 (从IMU加速度计数据)
-        double current_acc_disturbance = 0.0;
-        int valid_acc_count = 0;
+            // Step A2: 计算加速度扰动 (从IMU加速度计数据)
+            int valid_acc_count = 0;
         const double GRAVITY_NOMINAL = 9.81; // 标称重力加速度 (m/s^2)
 
         // 遍历滑动窗口中的所有预积分，计算平均加速度扰动
@@ -2121,11 +2154,11 @@ void Estimator::optimization()
             current_acc_disturbance = 0.0;
         }
 
-        // ========================================================================
-        // Step B: Low-Pass Filter for Motion Score (Optimization B)
-        // ========================================================================
-        // 计算原始运动评分 (使用调整后的加速度权重 0.5)
-        double raw_instability_score = current_gyro_norm + 0.5 * current_acc_disturbance;
+            // ========================================================================
+            // Step B: Low-Pass Filter for Motion Score (Optimization B)
+            // ========================================================================
+            // 计算原始运动评分 (使用调整后的加速度权重 0.5)
+            raw_instability_score = current_gyro_norm + 0.5 * current_acc_disturbance;
 
         // 应用指数移动平均（EMA）滤波器，消除加速度计高频噪声
         // α = 0.2: 新测量权重20%，历史平滑值权重80%
@@ -2291,6 +2324,20 @@ void Estimator::optimization()
             depth_loss_function = new ceres::ScaledLoss(depth_loss_function, final_weight, ceres::TAKE_OWNERSHIP);
         }
         // Note: adaptive mode already created depth_loss_function in the else block above
+
+        // ========================================================================
+        // Log Depth Fusion Metrics (every 10 frames)
+        // ========================================================================
+        // 对于固定模式，IMU数据设为0（因为不使用）
+        double log_gyro = (DEPTH_WEIGHT_MODE == 1) ? current_gyro_norm : 0.0;
+        double log_acc = (DEPTH_WEIGHT_MODE == 1) ? current_acc_disturbance : 0.0;
+        double log_raw_score = (DEPTH_WEIGHT_MODE == 1) ? raw_instability_score : 0.0;
+        double log_smoothed_score = (DEPTH_WEIGHT_MODE == 1) ? smoothed_instability_score : 0.0;
+
+        logDepthFusionMetrics(global_frame_count, log_gyro, log_acc,
+                             log_raw_score, log_smoothed_score,
+                             final_weight, final_huber_threshold,
+                             DEPTH_SCALE_A, DEPTH_SHIFT_B);
 
         // 重新遍历所有特征点，为有深度图的观测添加深度约束
         feature_index = -1;
@@ -3066,5 +3113,41 @@ void Estimator::assignEstimatedDepthFromFastInit()
     if (assigned_count < 50) {
         ROS_WARN("assignEstimatedDepthFromFastInit: Low assignment success rate (%d features). Check depth map quality.",
                  assigned_count);
+    }
+}
+
+/**
+ * @brief 记录深度融合的关键指标到CSV文件
+ *
+ * 每10帧记录一次，包括IMU数据、运动评分、权重、Huber阈值和深度参数
+ */
+void Estimator::logDepthFusionMetrics(int frame_id, double gyro_norm, double acc_disturbance,
+                                      double raw_score, double smoothed_score, double weight,
+                                      double huber_threshold, double scale_a, double shift_b)
+{
+    // 每10帧记录一次
+    log_frame_counter++;
+    if (log_frame_counter % 10 != 0)
+        return;
+
+    if (!depth_fusion_log_file.is_open())
+        return;
+
+    // 写入CSV数据
+    depth_fusion_log_file << frame_id << ","
+                          << gyro_norm << ","
+                          << acc_disturbance << ","
+                          << raw_score << ","
+                          << smoothed_score << ","
+                          << weight << ","
+                          << huber_threshold << ","
+                          << scale_a << ","
+                          << shift_b << ","
+                          << DEPTH_WEIGHT_MODE << "\n";
+
+    // 定期刷新缓冲区，确保数据写入磁盘
+    if (log_frame_counter % 100 == 0)
+    {
+        depth_fusion_log_file.flush();
     }
 }
