@@ -78,7 +78,7 @@ void Estimator::setParameter()
     // 初始化深度融合日志文件
     if (ESTIMATE_DEPTH_SCALE_SHIFT)
     {
-        std::string log_path = VINS_RESULT_PATH + "/depth_fusion_metrics.csv";
+        std::string log_path = OUTPUT_PATH + "/depth_fusion_metrics.csv";
         depth_fusion_log_file.open(log_path, std::ios::out);
         if (depth_fusion_log_file.is_open())
         {
@@ -2041,8 +2041,26 @@ void Estimator::optimization()
     // --- 深度传感器因子约束：添加深度约束残差块 (Backend Depth Constraint) ---
     if (ESTIMATE_DEPTH_SCALE_SHIFT)
     {
-        // 首先添加 para_DepthScaleShift 参数块
+        // 首先添加 para_DepthScaleShift 参数块，并设置物理约束
         problem.AddParameterBlock(para_DepthScaleShift[0], 2);
+
+        // 设置参数的上下界约束，确保物理合理性
+        // a (尺度参数): 必须为正，范围 [0.01, 5.0]
+        // b (偏移参数): 可正可负，范围 [-2.0, 2.0]
+        std::vector<double> lower_bounds(2);
+        std::vector<double> upper_bounds(2);
+        lower_bounds[0] = 0.01;   // a 的下界（必须为正）
+        upper_bounds[0] = 5.0;    // a 的上界
+        lower_bounds[1] = -2.0;   // b 的下界
+        upper_bounds[1] = 2.0;    // b 的上界
+
+        problem.SetParameterLowerBound(para_DepthScaleShift[0], 0, lower_bounds[0]);
+        problem.SetParameterUpperBound(para_DepthScaleShift[0], 0, upper_bounds[0]);
+        problem.SetParameterLowerBound(para_DepthScaleShift[0], 1, lower_bounds[1]);
+        problem.SetParameterUpperBound(para_DepthScaleShift[0], 1, upper_bounds[1]);
+
+        ROS_INFO_ONCE("[DepthParams] Parameter bounds set: a ∈ [%.2f, %.2f], b ∈ [%.2f, %.2f]",
+                     lower_bounds[0], upper_bounds[0], lower_bounds[1], upper_bounds[1]);
 
         TicToc t_depth_factor;
         int depth_factor_cnt = 0;
