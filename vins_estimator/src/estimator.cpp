@@ -2093,6 +2093,9 @@ void Estimator::optimization()
             final_weight = DEPTH_FACTOR_WEIGHT;
             final_huber_threshold = DEPTH_FACTOR_HUBER_THRESHOLD;
 
+            // 递增深度融合帧计数器（固定模式也需要计数用于预热）
+            depth_fusion_frame_count++;
+
             ROS_INFO_THROTTLE(10.0, "[Fixed Weight] Frame %d: W=%.2f, Huber=%.3f | a=%.4f",
                              global_frame_count, final_weight, final_huber_threshold, DEPTH_SCALE_A);
         }
@@ -2296,18 +2299,49 @@ void Estimator::optimization()
                                  adaptive_weight, smoothed_instability_score);
             }
 
-            // 包装自适应权重缩放
+            // ========================================================================
+            // Step F: Weight Warm-up (Linear Ramp for First 50 Frames After Init)
+            // ========================================================================
+            // 目的：防止初期不稳定的a/b参数和深度约束干扰VINS收敛
+            // 策略：在VINS初始化完成后的前50帧，权重从0线性增加到目标值
+            // 适用：固定权重模式和自适应权重模式都使用此预热策略
+
+            double final_weight_with_warmup = adaptive_weight;  // 默认使用完整权重
+
+            const int WEIGHT_WARMUP_FRAMES = 50;  // 权重预热帧数
+            if (depth_fusion_frame_count <= WEIGHT_WARMUP_FRAMES)
+            {
+                // 线性增加：从0到目标权重
+                double warmup_ratio = static_cast<double>(depth_fusion_frame_count) / static_cast<double>(WEIGHT_WARMUP_FRAMES);
+                final_weight_with_warmup = warmup_ratio * adaptive_weight;
+
+                // 每10帧打印一次预热进度
+                if (depth_fusion_frame_count % 10 == 0 || depth_fusion_frame_count == 1)
+                {
+                    ROS_INFO("[Weight Warmup] Frame %d/%d: ratio=%.2f%%, target_weight=%.2f, actual_weight=%.2f",
+                             depth_fusion_frame_count, WEIGHT_WARMUP_FRAMES,
+                             warmup_ratio * 100.0, adaptive_weight, final_weight_with_warmup);
+                }
+            }
+            else if (depth_fusion_frame_count == WEIGHT_WARMUP_FRAMES + 1)
+            {
+                // 预热完成，打印提示
+                ROS_WARN("[Weight Warmup] Completed at frame %d. Now using full weight: %.2f",
+                         depth_fusion_frame_count, adaptive_weight);
+            }
+
+            // 包装权重缩放（使用预热后的权重）
             // Note: Both warm-up Huber and normal Huber need weight scaling
             if (depth_loss_function != nullptr)
             {
-                // Wrap the Huber loss with adaptive weight
-                depth_loss_function = new ceres::ScaledLoss(depth_loss_function, adaptive_weight, ceres::TAKE_OWNERSHIP);
+                // Wrap the Huber loss with warmed-up weight
+                depth_loss_function = new ceres::ScaledLoss(depth_loss_function, final_weight_with_warmup, ceres::TAKE_OWNERSHIP);
             }
             else
             {
                 // This branch should never be reached now (warm-up uses Huber, not L2)
                 // Keep for safety: L2 loss with weight scaling
-                depth_loss_function = new ceres::ScaledLoss(nullptr, adaptive_weight, ceres::DO_NOT_TAKE_OWNERSHIP);
+                depth_loss_function = new ceres::ScaledLoss(nullptr, final_weight_with_warmup, ceres::DO_NOT_TAKE_OWNERSHIP);
             }
 
             // 每10帧打印一次自适应参数（更新为使用平滑后的评分）
@@ -2333,14 +2367,39 @@ void Estimator::optimization()
         } // end of adaptive mode
 
         // ========================================================================
-        // Create Loss Function for Fixed Mode
+        // Weight Warm-up for Fixed Mode (Linear Ramp for First 50 Frames)
         // ========================================================================
+        // 固定权重模式也需要预热，防止初期不稳定的a/b参数干扰VINS收敛
         ceres::LossFunction *depth_loss_function = nullptr;
         if (DEPTH_WEIGHT_MODE == 0)
         {
-            // Fixed mode: simple Huber loss with fixed threshold
+            double final_weight_with_warmup = final_weight;  // 默认使用完整权重
+
+            const int WEIGHT_WARMUP_FRAMES = 50;  // 权重预热帧数
+            if (depth_fusion_frame_count <= WEIGHT_WARMUP_FRAMES)
+            {
+                // 线性增加：从0到目标权重
+                double warmup_ratio = static_cast<double>(depth_fusion_frame_count) / static_cast<double>(WEIGHT_WARMUP_FRAMES);
+                final_weight_with_warmup = warmup_ratio * final_weight;
+
+                // 每10帧打印一次预热进度
+                if (depth_fusion_frame_count % 10 == 0 || depth_fusion_frame_count == 1)
+                {
+                    ROS_INFO("[Fixed Weight Warmup] Frame %d/%d: ratio=%.2f%%, target_weight=%.2f, actual_weight=%.2f",
+                             depth_fusion_frame_count, WEIGHT_WARMUP_FRAMES,
+                             warmup_ratio * 100.0, final_weight, final_weight_with_warmup);
+                }
+            }
+            else if (depth_fusion_frame_count == WEIGHT_WARMUP_FRAMES + 1)
+            {
+                // 预热完成，打印提示
+                ROS_WARN("[Fixed Weight Warmup] Completed at frame %d. Now using full weight: %.2f",
+                         depth_fusion_frame_count, final_weight);
+            }
+
+            // Fixed mode: simple Huber loss with fixed threshold and warmed-up weight
             depth_loss_function = new ceres::HuberLoss(final_huber_threshold);
-            depth_loss_function = new ceres::ScaledLoss(depth_loss_function, final_weight, ceres::TAKE_OWNERSHIP);
+            depth_loss_function = new ceres::ScaledLoss(depth_loss_function, final_weight_with_warmup, ceres::TAKE_OWNERSHIP);
         }
         // Note: adaptive mode already created depth_loss_function in the else block above
 
