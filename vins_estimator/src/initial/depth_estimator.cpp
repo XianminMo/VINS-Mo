@@ -379,11 +379,75 @@ bool DepthEstimator::predictInternal(const cv::Mat& image, cv::Mat& norm_inv_dep
         cv::Mat normalized_float_map;
         {
             if (m_model_type == DepthModelType::DEPTH_ANYTHING_V2) {
-                // Depth Anything V2: 直接使用原始值，不做分位数裁剪和归一化
-                // 这样可以保留模型的原始输出用于后续优化
-                normalized_float_map = raw_inv_depth.clone();
+                // Depth Anything V2: 使用帧内标准化，避免连续帧之间的全局尺度跳变
+                // 策略：对每帧进行 Z-score 标准化（零均值，单位方差），然后映射到 [1, 2] 范围
+                // 这样可以保持帧内的相对深度关系，同时消除帧间的全局尺度差异
 
-                if (!quiet) ROS_DEBUG("Depth Anything V2: Using raw values (no clipping, no normalization)");
+                // 计算有效像素的均值和标准差
+                std::vector<float> valid_vals;
+                valid_vals.reserve(static_cast<size_t>(raw_inv_depth.total()));
+                for (int r = 0; r < raw_inv_depth.rows; ++r) {
+                    const float* ptr = raw_inv_depth.ptr<float>(r);
+                    for (int c = 0; c < raw_inv_depth.cols; ++c) {
+                        float v = ptr[c];
+                        if (std::isfinite(v)) {
+                            valid_vals.push_back(v);
+                        }
+                    }
+                }
+
+                if (!valid_vals.empty()) {
+                    // 计算均值和标准差
+                    double sum = 0.0;
+                    for (float v : valid_vals) {
+                        sum += v;
+                    }
+                    double mean = sum / valid_vals.size();
+
+                    double sq_sum = 0.0;
+                    for (float v : valid_vals) {
+                        double diff = v - mean;
+                        sq_sum += diff * diff;
+                    }
+                    double std_dev = std::sqrt(sq_sum / valid_vals.size());
+
+                    // 避免除零
+                    if (std_dev < 1e-6) {
+                        std_dev = 1e-6;
+                    }
+
+                    // Z-score 标准化，然后映射到 [1, 2]
+                    // z = (x - mean) / std_dev
+                    // 将 z 的 [-3, +3] 范围映射到 [1, 2]（覆盖 99.7% 的数据）
+                    normalized_float_map.create(raw_inv_depth.size(), CV_32F);
+                    for (int r = 0; r < raw_inv_depth.rows; ++r) {
+                        const float* src = raw_inv_depth.ptr<float>(r);
+                        float* dst = normalized_float_map.ptr<float>(r);
+                        for (int c = 0; c < raw_inv_depth.cols; ++c) {
+                            float v = src[c];
+                            if (!std::isfinite(v)) {
+                                v = static_cast<float>(mean);
+                            }
+                            // Z-score
+                            float z = static_cast<float>((v - mean) / std_dev);
+                            // 裁剪到 [-3, +3]
+                            z = std::min(std::max(z, -3.0f), 3.0f);
+                            // 映射到 [1, 2]: (z + 3) / 6 * 1 + 1
+                            dst[c] = 1.0f + (z + 3.0f) / 6.0f;
+                        }
+                    }
+
+                    if (!quiet) {
+                        ROS_DEBUG("Depth Anything V2: Z-score normalization (mean=%.6f, std=%.6f) -> [1, 2]",
+                                 mean, std_dev);
+                    }
+                } else {
+                    // 如果没有有效值，直接使用原始值
+                    normalized_float_map = raw_inv_depth.clone();
+                    if (!quiet) {
+                        ROS_WARN("Depth Anything V2: No valid pixels, using raw values");
+                    }
+                }
             } else {
                 // MiDaS V2: 使用分位数裁剪增强鲁棒性（1%~99%），然后归一化到 [1, 2]
                 std::vector<float> vals;
