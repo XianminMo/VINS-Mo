@@ -2082,7 +2082,8 @@ void Estimator::optimization()
         double current_gyro_norm = 0.0;
         double current_acc_disturbance = 0.0;
         double raw_instability_score = 0.0;
-        double smoothed_instability_score = 0.0;
+        // NOTE: smoothed_instability_score is a CLASS MEMBER variable (declared in estimator.h)
+        // Do NOT redeclare it here to avoid shadowing the persistent state
 
         if (DEPTH_WEIGHT_MODE == 0)
         {
