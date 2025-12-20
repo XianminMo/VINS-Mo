@@ -3,7 +3,7 @@
 #common parameters
 imu_topic: "/imu0"
 image_topic: "/cam0/image_raw"
-output_path: "/home/linux/mxm/output/experiment_backend/V203_test/1204/o-d"
+output_path: "/home/linux/mxm/output/experiments_backend/room2_test/1216/o-d/k_10/0"
 
 # depth_model_path: "/home/linux/mxm/proj/VINS-Mo/src/VINS-Mo/vins_estimator/models/Midas-V2.onnx" # path to depth estimation model
 depth_model_path: "/home/linux/mxm/proj/VINS-Mo/src/VINS-Mo/vins_estimator/models/depth_anything_v2_vits.onnx" # path to depth estimation model
@@ -31,92 +31,81 @@ fast_init.reg.lambda_a: 1.0e-2            # 正则：尺度因子a的权重
 fast_init.reg.lambda_b: 1.0e-2            # 正则：深度偏移b的权重
 fast_init.reg.lambda_v: 1.0e-3            # 正则：初始速度v的权重
 
-# --- Backend Depth Constraint Parameters (深度传感器因子约束参数) ---
+# ========================================================================
+# Backend Depth Constraint Parameters (后端深度约束参数)
+# ========================================================================
+# 架构说明: Hierarchical Decoupling Depth Fusion (层次解耦深度融合)
+#   - 前端: SolveLinearAlignment() 每帧计算尺度s和偏移t
+#   - 后端: Ceres优化每帧独立的para_a_global[i] (初始值=1.0)
+#   - 约束: RandomWalkFactor 保证相邻帧的para_a平滑变化
+#   - 损失: 固定使用 HuberLoss(1.0), 不再使用动态权重
+#   - 优势: 消除全局参数漂移,提高鲁棒性
+#
 # 是否在后端优化中启用深度约束因子 (0: 关闭, 1: 开启)
 depth_constraint.estimate_scale_shift: 1
-# 深度仿射变换尺度因子 a 的初始值 (1/d_metric = a * d_nn + b)
-# 策略: "Physics-Aware Adaptive Depth Fusion"
-# - 使用中间值 a=0.15 作为通用默认值（适用于各种场景）
-# - 在线初始化（质量门控）：如果初始化质量高（r>0.6），自动接受计算值
-# - 否则回退到此配置默认值，后续由物理感知自适应机制处理
-# - 自适应权重: 5.0 (静止) → 1.5 (运动), 基于IMU陀螺仪实时调整
-# - 自适应Huber阈值: δ = W × 0.25 (物理不变量)
-depth_constraint.initial_scale_a: 0.15
-# 深度偏移因子 b 的初始值
-# - 设为 0.0（零偏移先验）
-# - 后端优化会根据实际场景自适应调整
-depth_constraint.initial_shift_b: 0.0
-# 深度参数随机游走过程噪声（Random Walk Process Noise）
-# 控制参数在相邻帧之间允许的最大变化量
-# 值越大，参数变化越自由，但可能震荡；值越小，参数变化越保守
-# 推荐范围：1e-4 到 1e-3
-depth_constraint.random_walk_a: 1.0e-3
-depth_constraint.random_walk_b: 1.0e-3
+
+# 深度尺度参数的随机游走过程噪声 (Random Walk Process Noise)
+# 控制 para_a_global[i] 在相邻帧之间允许的最大变化量
+# 值越大: 参数变化越自由,能快速适应尺度跳变,但可能震荡
+# 值越小: 参数变化越保守,更加平滑,但响应较慢
+# 推荐范围: 1e-4 到 1e-3
+depth_constraint.random_walk_a: 5.0e-5
 
 # ========================================================================
-# 权重模式选择 (Weight Mode Selection)
+# 深度权重调参系数 K (Depth Weight Tuning Parameter)
 # ========================================================================
-# depth_constraint.weight_mode: 权重模式开关
-#   0 = 固定权重模式 (Fixed Weight Mode)
-#       - 使用 depth_constraint.weight 作为恒定权重
-#       - Huber阈值使用 depth_constraint.huber_threshold
-#       - 适用于: 实验对比、消融研究、已知稳定环境
-#       - 优点: 行为可预测，易于调试
-#       - 缺点: 无法适应运动变化，可能在动态场景中性能下降
+# K 用于深度因子权重公式: W = 1.0 / (K × σ + ε)²
+# 作用: 平衡视觉重投影误差和深度微调误差的贡献
 #
-#   1 = 自适应权重模式 (Adaptive Weight Mode) [推荐]
-#       - 根据IMU运动状态动态调整权重 (weight_static ↔ weight_dynamic)
-#       - 自适应Huber阈值: δ = W × 0.25 (物理不变量)
-#       - 适用于: 真实飞行、动态环境、通用场景
-#       - 优点: 自动平衡深度约束强度，提高鲁棒性
-#       - 缺点: 行为更复杂，调试难度稍高
-depth_constraint.weight_mode: 1
+# K 越大 → 权重越小 → 深度约束越弱 (更信任视觉)
+# K 越小 → 权重越大 → 深度约束越强 (更信任深度)
+#
+# 调参历史:
+#   - K=2.0 (配置值, 但实际运行 K=1.0 由于Bug):
+#       平均 Balance Ratio = 2.11 (接近目标,但波动大)
+#       分布: 35.8%太弱(<0.2), 55.6%合适, 8.6%太强(>5.0)
+#       极端值: 0.0001 ~ 34.48 (不稳定)
+#       结论: K=1.0效果尚可,需微调以减少"太弱"比例
+#   - K=1.0 (当前推荐): 基于实际测试结果
+#       说明: 修复Bug后,从实际生效的K=1.0开始调参
+#
+# 调参建议:
+#   - 如果 Balance Ratio < 0.2: K 太大,深度约束太弱,减小K
+#   - 如果 Balance Ratio > 5.0: K 太小,深度约束太强,增大K
+#   - 目标: Balance Ratio ≈ 1.0 (深度和视觉成本相当)
+#   - 追踪: 减少 <0.2 的比例 (当前35.8% → 目标<20%)
+#
+# 推荐范围: 0.5 ~ 2.0
+depth_constraint.weight_k: 10
 
 # ========================================================================
-# 固定权重模式参数 (仅在 weight_mode=0 时生效)
+# 已废弃参数 (Deprecated Parameters) - 保留用于参考
 # ========================================================================
-# 深度因子的固定权重（控制深度约束对优化的影响强度）
-# 值越大，深度约束越强；建议从 1.0 到 5.0 范围内调整
-# 注意: 在 weight_mode=1 时，此参数被忽略，权重由自适应系统控制
-depth_constraint.weight: 2.5
-# 深度因子的固定Huber鲁棒核阈值（用于抑制深度估计的异常值）
-# 值越大，对异常值越宽容；建议从 0.5 到 5.0 范围内调整
-# 注意: 在 weight_mode=1 时，此参数被忽略，阈值自适应计算
-depth_constraint.huber_threshold: 0.5
-
-# 深度融合预热帧数（Warm-up frames）
-# 在前N帧使用L2损失以快速收敛，N帧后切换到Huber损失抑制异常值
-# 建议范围：30-100帧（约1-5秒）
-# 注意: 此参数在两种模式下都生效
-depth_constraint.warmup_frames: 30
-
+# 以下参数在新架构中已不再使用,保留注释仅供历史参考:
+#
+# 1. 全局初值参数 (已废弃)
+# depth_constraint.initial_scale_a: 0.25      # ❌ 每帧para_a初始化为1.0
+# depth_constraint.initial_shift_b: 0.35      # ❌ 偏移由前端对齐处理
+# depth_constraint.random_walk_b: 1.0e-4      # ❌ 不再优化shift参数b
+#
+# 2. 权重模式和自适应参数 (已废弃)
+# depth_constraint.weight_mode: 0                    # ❌ 固定使用HuberLoss(1.0)
+# depth_constraint.weight: 0.25                      # ❌ 不再使用可配置权重
+# depth_constraint.huber_threshold: 0.5              # ❌ 固定使用1.0阈值
+# depth_constraint.warmup_frames: 30                 # ❌ 不再使用预热机制
+# depth_constraint.adaptive.weight_static: 5.0       # ❌ 不再使用自适应权重
+# depth_constraint.adaptive.weight_dynamic: 1.0      # ❌ 不再使用自适应权重
+# depth_constraint.adaptive.physical_error_threshold: 0.25   # ❌
+# depth_constraint.adaptive.instability_threshold_low: 0.3   # ❌
+# depth_constraint.adaptive.instability_threshold_high: 1.5  # ❌
+# depth_constraint.adaptive.acc_disturbance_weight: 0.5      # ❌
+#
+# 废弃时间: 2025-12-14
+# 废弃原因:
+#   - 新架构使用每帧独立优化para_a_global[i],不需要全局初值
+#   - shift参数b由前端SolveLinearAlignment处理,后端只优化scale参数a
+#   - 后端统一使用HuberLoss(1.0),简化设计,不再需要动态权重调整
 # ========================================================================
-# Physics-Aware Adaptive Depth Fusion Parameters (Multi-Factor Version)
-# ========================================================================
-# 基于IMU陀螺仪和加速度计的多因子运动感知自适应权重系统
-# 核心思想：深度预测质量 ∝ 1/运动模糊
-#           运动模糊由旋转(角速度)和平移振动(线加速度)共同引起
-#
-# 静止时的最大权重（高置信度，保守设为3.0以增强鲁棒性）
-depth_constraint.adaptive.weight_static: 3.0
-# 剧烈运动/振动时的最小权重（低置信度）
-depth_constraint.adaptive.weight_dynamic: 1.0
-# 物理不变量：Depth Anything V2 网络的特征误差下限（逆深度单位: 1/m）
-depth_constraint.adaptive.physical_error_threshold: 0.25
-# 综合不稳定性评分低阈值（低于此值视为"稳定"状态）
-depth_constraint.adaptive.instability_threshold_low: 0.3
-# 综合不稳定性评分高阈值（高于此值视为"不稳定"状态）
-depth_constraint.adaptive.instability_threshold_high: 1.5
-# 加速度扰动权重因子（用于平衡陀螺仪和加速度的贡献）
-# combined_score = gyro_norm + acc_disturbance_weight × |acc_norm - 9.81|
-depth_constraint.adaptive.acc_disturbance_weight: 0.5
-#
-# 多因子自适应行为:
-#   Score < 0.3:  W=3.0, δ=0.75  [稳定：静止悬停，无振动]
-#   Score 0.3-1.5: W线性插值(3.0→1.0), δ=W×0.25  [渐变适应]
-#   Score > 1.5:  W=1.0, δ=0.25  [不稳定：快速运动+振动]
-#
-# 优势：能够捕捉到MH_05中低旋转但高平移/振动的场景
 
 #camera calibration 
 model_type: KANNALA_BRANDT

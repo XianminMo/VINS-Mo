@@ -18,6 +18,7 @@ int ESTIMATE_EXTRINSIC;
 int ESTIMATE_TD;
 int ROLLING_SHUTTER;
 std::string EX_CALIB_RESULT_PATH;
+std::string OUTPUT_PATH;
 std::string VINS_RESULT_PATH;
 std::string VINS_TUM_OPEN_PATH;
 std::string VINS_TUM_CLOSED_PATH;
@@ -38,6 +39,9 @@ double DEPTH_FACTOR_HUBER_THRESHOLD;
 int DEPTH_FUSION_WARMUP_FRAMES;
 double DEPTH_A_RANDOM_WALK;
 double DEPTH_B_RANDOM_WALK;
+
+// Depth Weight Tuning Parameter
+double DEPTH_WEIGHT_K;
 
 // Physics-Aware Adaptive Depth Fusion Parameters (Multi-Factor Version)
 double DEPTH_WEIGHT_STATIC;
@@ -102,7 +106,6 @@ void readParameters(ros::NodeHandle &n)
     MIN_PARALLAX = fsSettings["keyframe_parallax"];
     MIN_PARALLAX = MIN_PARALLAX / FOCAL_LENGTH;
 
-    std::string OUTPUT_PATH;
     fsSettings["output_path"] >> OUTPUT_PATH;
     VINS_RESULT_PATH = OUTPUT_PATH + "/vins_result_no_loop.csv";
     VINS_TUM_OPEN_PATH = OUTPUT_PATH + "/vins_open_loop.tum";
@@ -230,63 +233,46 @@ void readParameters(ros::NodeHandle &n)
     FAST_INIT_REG_LAMBDA_V = readOr("fast_init.reg.lambda_v", 1e-3);
     FAST_INIT_EARLY_EXIT_INLIER_RATIO = readOr("fast_init.ransac.early_exit_inlier_ratio", 0.7);
 
-    ROS_INFO("FastInit Params: min_features=%d, min_acc_var=%.3f, ransac[min_meas=%d, max_iter=%d, thr_px=%.4f, min_inliers=%d], svd_min=%.1e, cond_thr=%.1e",
-             FAST_INIT_MIN_FEATURES, FAST_INIT_MIN_ACC_VAR, FAST_INIT_RANSAC_MIN_MEASUREMENTS,
-             FAST_INIT_RANSAC_MAX_ITERATIONS, ransac_residual_thresh_px, FAST_INIT_RANSAC_MIN_INLIERS,
-             FAST_INIT_SVD_MIN_SIGMA, FAST_INIT_COND_THRESHOLD);
-    ROS_INFO("FastInit Depth: inv[%g,%g], z[%g,%g], min_valid=%d",
-             FAST_INIT_DEPTH_INV_MIN, FAST_INIT_DEPTH_INV_MAX, FAST_INIT_DEPTH_Z_MIN, FAST_INIT_DEPTH_Z_MAX,
-             FAST_INIT_MIN_VALID_DEPTH_FEATURES);
-    ROS_INFO("FastInit IRLS: iters=%d, huber=%.3e, reg[a=%.2e, b=%.2e, v=%.2e], early_exit_ratio=%.2f",
-             FAST_INIT_IRLS_ITERS, FAST_INIT_IRLS_HUBER_DELTA, FAST_INIT_REG_LAMBDA_A,
-             FAST_INIT_REG_LAMBDA_B, FAST_INIT_REG_LAMBDA_V, FAST_INIT_EARLY_EXIT_INLIER_RATIO);
+    // ROS_INFO("FastInit Params: min_features=%d, min_acc_var=%.3f, ransac[min_meas=%d, max_iter=%d, thr_px=%.4f, min_inliers=%d], svd_min=%.1e, cond_thr=%.1e",
+    //          FAST_INIT_MIN_FEATURES, FAST_INIT_MIN_ACC_VAR, FAST_INIT_RANSAC_MIN_MEASUREMENTS,
+    //          FAST_INIT_RANSAC_MAX_ITERATIONS, ransac_residual_thresh_px, FAST_INIT_RANSAC_MIN_INLIERS,
+    //          FAST_INIT_SVD_MIN_SIGMA, FAST_INIT_COND_THRESHOLD);
+    // ROS_INFO("FastInit Depth: inv[%g,%g], z[%g,%g], min_valid=%d",
+    //          FAST_INIT_DEPTH_INV_MIN, FAST_INIT_DEPTH_INV_MAX, FAST_INIT_DEPTH_Z_MIN, FAST_INIT_DEPTH_Z_MAX,
+    //          FAST_INIT_MIN_VALID_DEPTH_FEATURES);
+    // ROS_INFO("FastInit IRLS: iters=%d, huber=%.3e, reg[a=%.2e, b=%.2e, v=%.2e], early_exit_ratio=%.2f",
+    //          FAST_INIT_IRLS_ITERS, FAST_INIT_IRLS_HUBER_DELTA, FAST_INIT_REG_LAMBDA_A,
+    //          FAST_INIT_REG_LAMBDA_B, FAST_INIT_REG_LAMBDA_V, FAST_INIT_EARLY_EXIT_INLIER_RATIO);
 
     // --- 读取深度传感器因子约束参数 (Backend Depth Constraint) ---
     ESTIMATE_DEPTH_SCALE_SHIFT = readOr("depth_constraint.estimate_scale_shift", 0);
-    DEPTH_SCALE_A = readOr("depth_constraint.initial_scale_a", 0.15);  // 通用默认值（在线初始化失败时的安全回退值）
-    DEPTH_SHIFT_B = readOr("depth_constraint.initial_shift_b", 0.21);  // 使用实验得到的最佳初值
-    DEPTH_WEIGHT_MODE = readOr("depth_constraint.weight_mode", 1);  // 默认使用自适应权重模式
-    DEPTH_FACTOR_WEIGHT = readOr("depth_constraint.weight", 1.0);  // 固定权重模式下使用
-    DEPTH_FACTOR_HUBER_THRESHOLD = readOr("depth_constraint.huber_threshold", 1.0);  // 固定权重模式下使用
-    DEPTH_FUSION_WARMUP_FRAMES = readOr("depth_constraint.warmup_frames", 50);  // 预热帧数
-    DEPTH_A_RANDOM_WALK = readOr("depth_constraint.random_walk_a", 5e-4);  // 随机游走噪声
-    DEPTH_B_RANDOM_WALK = readOr("depth_constraint.random_walk_b", 5e-4);  // 随机游走噪声
+    DEPTH_A_RANDOM_WALK = readOr("depth_constraint.random_walk_a", 5e-4);  // 尺度参数随机游走噪声
+    DEPTH_B_RANDOM_WALK = readOr("depth_constraint.random_walk_b", 1e-5);  // 偏移参数随机游走噪声
 
-    // Physics-Aware Adaptive Parameters (Multi-Factor: 陀螺仪 + 加速度计)
-    DEPTH_WEIGHT_STATIC = readOr("depth_constraint.adaptive.weight_static", 3.0);     // 静止时最大权重 (降低至3.0以增强鲁棒性)
-    DEPTH_WEIGHT_DYNAMIC = readOr("depth_constraint.adaptive.weight_dynamic", 1.0);   // 动态时最小权重
-    PHYSICAL_ERROR_THRESHOLD = readOr("depth_constraint.adaptive.physical_error_threshold", 0.25);  // 物理误差下限 (1/m)
-    INSTABILITY_THRESHOLD_LOW = readOr("depth_constraint.adaptive.instability_threshold_low", 0.3);   // 稳定阈值
-    INSTABILITY_THRESHOLD_HIGH = readOr("depth_constraint.adaptive.instability_threshold_high", 1.5); // 不稳定阈值
-    ACC_DISTURBANCE_WEIGHT = readOr("depth_constraint.adaptive.acc_disturbance_weight", 0.5);        // 加速度扰动权重因子
+    // Depth Weight Tuning Parameter (K coefficient for weight formula)
+    DEPTH_WEIGHT_K = readOr("depth_constraint.weight_k", 2.0);  // 默认值: 2.0
+
+    // ========================================================================
+    // 🔍 DEBUG: 明确输出深度约束参数读取结果
+    // ========================================================================
+    ROS_WARN("========================================");
+    ROS_WARN("Depth Constraint Config:");
+    ROS_WARN("  ESTIMATE_DEPTH_SCALE_SHIFT = %d", ESTIMATE_DEPTH_SCALE_SHIFT);
+    ROS_WARN("  DEPTH_A_RANDOM_WALK = %.6f", DEPTH_A_RANDOM_WALK);
+    ROS_WARN("  DEPTH_B_RANDOM_WALK = %.6f", DEPTH_B_RANDOM_WALK);
+    ROS_WARN("  DEPTH_WEIGHT_K = %.4f", DEPTH_WEIGHT_K);
+    ROS_WARN("========================================");
+    // ========================================================================
 
     if (ESTIMATE_DEPTH_SCALE_SHIFT)
     {
         ROS_INFO("Backend Depth Constraint ENABLED:");
-        ROS_INFO("  Initial Scale (a): %.4f", DEPTH_SCALE_A);
-        ROS_INFO("  Initial Shift (b): %.4f", DEPTH_SHIFT_B);
         ROS_INFO("  Random Walk Noise (a): %.6f", DEPTH_A_RANDOM_WALK);
-        ROS_INFO("  Random Walk Noise (b): %.6f", DEPTH_B_RANDOM_WALK);
-        ROS_INFO("  Warmup Frames: %d", DEPTH_FUSION_WARMUP_FRAMES);
 
-        if (DEPTH_WEIGHT_MODE == 0)
-        {
-            ROS_INFO("  Weight Mode: FIXED");
-            ROS_INFO("    Fixed Weight: %.4f", DEPTH_FACTOR_WEIGHT);
-            ROS_INFO("    Fixed Huber Threshold: %.4f", DEPTH_FACTOR_HUBER_THRESHOLD);
-        }
-        else
-        {
-            ROS_INFO("  Weight Mode: ADAPTIVE (Physics-Aware Multi-Factor: Gyro + Acceleration)");
-            ROS_INFO("    Weight Range: [%.2f (dynamic) → %.2f (static)]", DEPTH_WEIGHT_DYNAMIC, DEPTH_WEIGHT_STATIC);
-            ROS_INFO("    Physical Error Threshold: %.3f (1/m)", PHYSICAL_ERROR_THRESHOLD);
-            ROS_INFO("    Instability Thresholds: [%.2f → %.2f] (combined score)", INSTABILITY_THRESHOLD_LOW, INSTABILITY_THRESHOLD_HIGH);
-            ROS_INFO("    Acceleration Disturbance Weight: %.2f", ACC_DISTURBANCE_WEIGHT);
-        }
     }
     else
     {
-        ROS_INFO("Backend Depth Constraint DISABLED.");
+        ROS_WARN("Backend Depth Constraint DISABLED (estimate_scale_shift=0).");
     }
 
     // 统一验证深度模型路径：只要启用了快速初始化或深度约束后端，都需要深度模型

@@ -30,6 +30,7 @@ extern double BIAS_GYR_THRESHOLD;
 extern double SOLVER_TIME;
 extern int NUM_ITERATIONS;
 extern std::string EX_CALIB_RESULT_PATH;
+extern std::string OUTPUT_PATH;
 extern std::string VINS_RESULT_PATH;
 extern std::string VINS_TUM_OPEN_PATH;
 extern std::string VINS_TUM_CLOSED_PATH;
@@ -62,6 +63,15 @@ extern int DEPTH_FUSION_WARMUP_FRAMES;
 // 深度参数随机游走过程噪声 (Random Walk Process Noise)
 extern double DEPTH_A_RANDOM_WALK;
 extern double DEPTH_B_RANDOM_WALK;
+
+// ========================================================================
+// Depth Weight Tuning Parameter (深度权重调参系数)
+// ========================================================================
+// K 系数用于深度因子权重公式: W = 1.0 / (K × σ + ε)²
+// K 越大 → 权重越小 → 深度约束越弱
+// K 越小 → 权重越大 → 深度约束越强
+// 建议范围: 0.5 ~ 5.0, 默认: 2.0
+extern double DEPTH_WEIGHT_K;
 
 // ========================================================================
 // Physics-Aware Adaptive Depth Fusion Parameters (Multi-Factor Version)
@@ -124,3 +134,21 @@ enum NoiseOrder
     O_AW = 6,
     O_GW = 9
 };
+
+// ========================================
+// Depth Estimation Module Constants
+// ========================================
+
+namespace DepthConstants {
+    // Online depth provider settings
+    constexpr int ONLINE_DEPTH_QUEUE_SIZE = 5;
+    constexpr double DEPTH_RESULT_CACHE_DURATION = 1.0;  // seconds
+
+    // Depth alignment thresholds
+    constexpr double MIN_ALIGNMENT_INLIERS = 10.0;
+    constexpr double MAX_ALIGNMENT_ERROR = 0.5;
+
+    // Depth computation timeouts
+    constexpr int DEPTH_MODEL_READY_TIMEOUT_MS = 5000;
+}
+

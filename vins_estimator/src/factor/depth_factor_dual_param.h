@@ -1,28 +1,36 @@
 /**
- * @file depth_factor.h
- * @brief Hierarchical Decoupling Depth Factor (Backend Global Fine-tuning)
+ * @file depth_factor_dual_param.h
+ * @brief Dual-Parameter Depth Factor (Scale + Shift Refinement in Inverse Depth Space)
  *
- * This factor connects VINS triangulation with frontend-aligned depth measurements.
+ * This factor extends the original DepthFactor by introducing both scale (a) and shift (b)
+ * parameters for backend optimization to model residual offsets more accurately.
  *
- * Architecture:
- *   - Frontend: Handles scale-shift alignment (s, t) instantly after triangulation
- *   - Backend: Optimizes only per-frame global scale (a_global) for drift correction
- *
- * Residual:
- *   r = (lambda_vins - a_global * d_aligned_inv) * weight
+ * Mathematical Model (Inverse Depth Space):
+ *   r = lambda_vins - (a * lambda_aligned + b)
  *
  * where:
- *   - lambda_vins: VINS triangulated inverse depth (1/d_metric)
- *   - d_aligned_inv: Frontend-aligned depth (inverse) from TTA
- *   - a_global: Per-frame scale refinement parameter
- *   - weight: TTA-based uncertainty weighting (1 / (K * sigma + eps))^2
+ *   - lambda_vins: VINS triangulated inverse depth (1/d_metric) [State variable]
+ *   - lambda_aligned: Frontend-aligned depth measurement (inverse) [Fixed measurement]
+ *   - a: Scale refinement factor [State variable, initialized to 1.0]
+ *   - b: Shift refinement factor [State variable, initialized to 0.0]
+ *
+ * Random Walk Process Model:
+ *   - Both a and b are modeled as random walk processes (propagated frame-to-frame)
+ *   - a: Standard random walk noise (tracks scale drift)
+ *   - b: Very small random walk noise (acts as "buffer" for slight offsets, should be lazy)
+ *
+ * Jacobians:
+ *   ∂r/∂lambda_vins = 1
+ *   ∂r/∂a = -lambda_aligned
+ *   ∂r/∂b = -1
  *
  * Parameter blocks:
  *   [0] para_Pose_i (7D): Feature first observation frame pose
  *   [1] para_Pose_j (7D): Current frame pose (depth map frame)
  *   [2] para_Ex_Pose (7D): IMU-to-camera extrinsics
  *   [3] para_Feature (1D): Feature inverse depth in frame i
- *   [4] para_a_global (1D): Per-frame global scale parameter
+ *   [4] para_a (1D): Scale refinement parameter
+ *   [5] para_b (1D): Shift refinement parameter
  */
 
 #pragma once
@@ -32,7 +40,7 @@
 #include "../utility/utility.h"
 #include "../parameters.h"
 
-class DepthFactor : public ceres::SizedCostFunction<1, 7, 7, 7, 1, 1>
+class DepthFactorDualParam : public ceres::SizedCostFunction<1, 7, 7, 7, 1, 1, 1>
 {
 public:
     /**
@@ -41,18 +49,17 @@ public:
      * @param _aligned_sigma Frontend-aligned uncertainty (sigma_aligned = s * sigma_tta)
      * @param _pts_i Feature point in normalized camera coordinates [x, y, 1]
      */
-    DepthFactor(double _aligned_depth, double _aligned_sigma, const Eigen::Vector3d& _pts_i)
+    DepthFactorDualParam(double _aligned_depth, double _aligned_sigma, const Eigen::Vector3d& _pts_i)
         : aligned_depth(_aligned_depth), aligned_sigma(_aligned_sigma), pts_i(_pts_i)
     {
         // TTA-based adaptive weighting using global parameter DEPTH_WEIGHT_K
-        // Note: DEPTH_WEIGHT_K is loaded from config file (depth_constraint.weight_k)
         const double K = DEPTH_WEIGHT_K;  // Use global parameter from config
         const double eps = 1e-6;  // Numerical stability
         const double MIN_REL_ERROR = 0.05;
 
         double safe_depth = std::max(aligned_depth, 0.1);
         double floor_sigma = MIN_REL_ERROR / safe_depth;
-        
+
         double final_sigma = std::max(aligned_sigma, floor_sigma);
         // Weight inversely proportional to uncertainty: W = 1 / (K * sigma + eps)^2
         double variance = std::pow(K * final_sigma + eps, 2);
@@ -90,8 +97,9 @@ public:
         // Feature inverse depth
         double inv_dep_i = parameters[3][0];
 
-        // Per-frame global scale parameter
-        double a_global = parameters[4][0];
+        // Dual refinement parameters
+        double a = parameters[4][0];  // Scale
+        double b = parameters[5][0];  // Shift
 
         // ========== Step 2: Compute VINS metric inverse depth (lambda_vins) ==========
         // Transform feature from frame i to frame j
@@ -115,16 +123,19 @@ public:
                 if (jacobians[2]) Eigen::Map<Eigen::Matrix<double, 1, 7, Eigen::RowMajor>>(jacobians[2]).setZero();
                 if (jacobians[3]) Eigen::Map<Eigen::Matrix<double, 1, 1>>(jacobians[3]).setZero();
                 if (jacobians[4]) Eigen::Map<Eigen::Matrix<double, 1, 1>>(jacobians[4]).setZero();
+                if (jacobians[5]) Eigen::Map<Eigen::Matrix<double, 1, 1>>(jacobians[5]).setZero();
             }
             return true;
         }
 
         double lambda_vins = 1.0 / depth_metric_j;  // VINS inverse depth
-        double d_aligned_inv = 1.0 / aligned_depth;  // Aligned inverse depth
+        double lambda_aligned = 1.0 / aligned_depth;  // Aligned inverse depth (measurement)
 
         // ========== Step 4: Compute residual ==========
-        // Residual: r = (lambda_vins - a_global * d_aligned_inv) * sqrt_info
-        residuals[0] = sqrt_info * (lambda_vins - a_global * d_aligned_inv);
+        // Residual: r = (lambda_vins - (a * lambda_aligned + b)) * sqrt_info
+        // This models: lambda_vins = a * lambda_aligned + b + noise
+        double predicted_lambda = a * lambda_aligned + b;
+        residuals[0] = sqrt_info * (lambda_vins - predicted_lambda);
 
         // ========== Step 5: Compute Jacobians (if requested) ==========
         if (jacobians)
@@ -193,13 +204,22 @@ public:
                 jacobian_feature = d_res_d_Pcam_j * d_Pcam_j_d_lambda;
             }
 
-            // ---------- Jacobian w.r.t. a_global (per-frame scale parameter) ----------
+            // ---------- Jacobian w.r.t. a (scale parameter) ----------
             if (jacobians[4])
             {
                 Eigen::Map<Eigen::Matrix<double, 1, 1>> jacobian_a(jacobians[4]);
 
-                // d(residual)/d(a_global) = -sqrt_info * d_aligned_inv
-                jacobian_a(0, 0) = -sqrt_info * d_aligned_inv;
+                // d(residual)/d(a) = -sqrt_info * lambda_aligned
+                jacobian_a(0, 0) = -sqrt_info * lambda_aligned;
+            }
+
+            // ---------- Jacobian w.r.t. b (shift parameter) ----------
+            if (jacobians[5])
+            {
+                Eigen::Map<Eigen::Matrix<double, 1, 1>> jacobian_b(jacobians[5]);
+
+                // d(residual)/d(b) = -sqrt_info
+                jacobian_b(0, 0) = -sqrt_info;
             }
         }
 

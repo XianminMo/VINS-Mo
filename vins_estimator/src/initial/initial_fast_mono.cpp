@@ -3,7 +3,8 @@
 // 构造函数
 FastInitializer::FastInitializer(FeatureManager* f_manager_ptr)
     : m_feature_manager(f_manager_ptr),
-      m_random_generator(std::random_device{}()) // 初始化随机数生成器
+    //   m_random_generator(std::random_device{}()) // 初始化随机数生成器
+    m_random_generator(54321) // 初始化随机数生成器
 {
 }
 

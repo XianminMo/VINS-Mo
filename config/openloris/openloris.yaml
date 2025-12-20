@@ -4,9 +4,10 @@
 imu_topic: "/imu0"
 image_topic: "/cam0/image_raw"
 
-# output_path: "/home/linux/mxm/output/experiments_backend/V203_test/1216/o-d/test/k_0.5/0"
-# output_path: "/home/linux/mxm/output/experiments_backend/MH04_test/1216/new/o-d/k_15/0"
-output_path: "/home/linux/mxm/output/experiments_backend/V201_test/1217/o-d/k_10/5"
+
+# output_path: "/home/linux/mxm/output/experiments_backend/market1-1/1219/o-d/k_5/1"
+output_path: "/home/linux/mxm/output/experiments_backend/corridor1-2/1219/o-d/test"
+# output_path: "/home/linux/mxm/output/experiments_backend/cafe1-2/1220/o-o/0"
 
 # depth_model_path: "/home/linux/mxm/proj/VINS-Mo/src/VINS-Mo/vins_estimator/models/Midas-V2.onnx" # path to depth estimation model
 depth_model_path: "/home/linux/mxm/proj/VINS-Mo/src/VINS-Mo/vins_estimator/models/depth_anything_v2_vits.onnx" # path to depth estimation model
@@ -52,7 +53,7 @@ depth_constraint.estimate_scale_shift: 1
 # 值越大: 参数变化越自由,能快速适应尺度跳变,但可能震荡
 # 值越小: 参数变化越保守,更加平滑,但响应较慢
 # 推荐范围: 1e-4 到 1e-3
-depth_constraint.random_walk_a: 5.0e-4
+depth_constraint.random_walk_a: 1.0e-3
 
 # 深度偏移参数 (b) 的随机游走过程噪声 (Random Walk Process Noise for Shift)
 # 控制 para_depth_shift[i] 在相邻帧之间允许的最大变化量
@@ -60,7 +61,7 @@ depth_constraint.random_walk_a: 5.0e-4
 # 值越大: b 越活跃,可能引入不必要的自由度
 # 值越小: b 越惰性,保持接近零,提高系统稳定性
 # 推荐范围: 1e-6 到 1e-4 (应远小于 random_walk_a)
-depth_constraint.random_walk_b: 5.0e-6
+depth_constraint.random_walk_b: 1.0e-5
 
 # ========================================================================
 # 深度权重调参系数 K (Depth Weight Tuning Parameter)
@@ -87,7 +88,7 @@ depth_constraint.random_walk_b: 5.0e-6
 #   - 追踪: 减少 <0.2 的比例 (当前35.8% → 目标<20%)
 #
 # 推荐范围: 0.5 ~ 2.0
-depth_constraint.weight_k: 10
+depth_constraint.weight_k: 5
 
 # ========================================================================
 # 已废弃参数 (Deprecated Parameters) - 保留用于参考
@@ -118,21 +119,23 @@ depth_constraint.weight_k: 10
 #   - 后端统一使用HuberLoss(1.0),简化设计,不再需要动态权重调整
 # ========================================================================
 
-#camera calibration 
+#camera calibration
 model_type: PINHOLE
 camera_name: camera
-image_width: 752
+image_width: 848
 image_height: 480
+  #TODO modify distortion
+
 distortion_parameters:
-   k1: -2.917e-01
-   k2: 8.228e-02
-   p1: 5.333e-05
-   p2: -1.578e-04
+   k1: 0.0
+   k2: 0.0
+   p1: 0.0
+   p2: 0.0
 projection_parameters:
-   fx: 4.616e+02
-   fy: 4.603e+02
-   cx: 3.630e+02
-   cy: 2.481e+02
+   fx: 611.4509887695312
+   fy: 611.4857177734375
+   cx: 433.2039794921875
+   cy: 249.4730224609375
 
 # Extrinsic parameter between IMU and Camera.
 estimate_extrinsic: 0   # 0  Have an accurate extrinsic parameters. We will trust the following imu^R_cam, imu^T_cam, don't change it.
@@ -144,15 +147,15 @@ extrinsicRotation: !!opencv-matrix
    rows: 3
    cols: 3
    dt: d
-   data: [0.0148655429818, -0.999880929698, 0.00414029679422,
-           0.999557249008, 0.0149672133247, 0.025715529948, 
-           -0.0257744366974, 0.00375618835797, 0.999660727178]
+   data: [ 0.999975572679493,  0.003849141066713,  0.005854714944742,
+           -0.003828680351062,  0.999986658473099,  -0.003501944262433,
+           -0.005868115609379,  0.003479442469180,  0.999976848846595]
 #Translation from camera frame to imu frame, imu^T_cam
 extrinsicTranslation: !!opencv-matrix
    rows: 3
    cols: 1
    dt: d
-   data: [-0.0216401454975,-0.064676986768, 0.00981073058949]
+   data: [0.0203127935529, -0.00510325236246, -0.0112013882026]
 
 #feature traker paprameters
 max_cnt: 150            # max feature number in feature tracking
@@ -169,14 +172,15 @@ max_num_iterations: 8   # max solver itrations, to guarantee real time
 keyframe_parallax: 10.0 # keyframe selection threshold (pixel)
 
 #imu parameters       The more accurate parameters you provide, the better performance
-acc_n: 0.08          # accelerometer measurement noise standard deviation. #0.2   0.04
-gyr_n: 0.004         # gyroscope measurement noise standard deviation.     #0.05  0.004
-acc_w: 0.00004         # accelerometer bias random work noise standard deviation.  #0.02
-gyr_w: 2.0e-6       # gyroscope bias random work noise standard deviation.     #4.0e-5
-g_norm: 9.81007     # gravity magnitude
+acc_n: 0.1          # accelerometer measurement noise standard deviation. 
+gyr_n: 0.01         # gyroscope measurement noise standard deviation.   
+acc_w: 0.0002         # accelerometer bias random work noise standard deviation.  #0.02
+gyr_w: 2.0e-5       # gyroscope bias random work noise standard deviation.     #4.0e-5
+
+g_norm: 9.805       # gravity magnitude
 
 #loop closure parameters
-loop_closure: 1                    # start loop closure
+loop_closure: 0                    # start loop closure
 load_previous_pose_graph: 0        # load and reuse previous pose graph; load from 'pose_graph_save_path'
 fast_relocalization: 1             # useful in real-time and large project
 pose_graph_save_path: "/home/linux/mxm/output/pose_graph/" # save and load path
@@ -190,6 +194,6 @@ rolling_shutter: 0                  # 0: global shutter camera, 1: rolling shutt
 rolling_shutter_tr: 0               # unit: s. rolling shutter read out time per frame (from data sheet). 
 
 #visualization parameters
-save_image: 1                   # save image in pose graph for visualization prupose; you can close this function by setting 0 
+save_image: 0                   # save image in pose graph for visualization prupose; you can close this function by setting 0 
 visualize_imu_forward: 0        # output imu forward propogation to achieve low latency and high frequence results
 visualize_camera_size: 0.4      # size of camera marker in RVIZ

@@ -1,5 +1,9 @@
 #include "estimator.h"
 #include "initial/initial_fast_mono.h" // Include full definition here
+#include "utility/visualization.h"  // For DepthConstraintDebugInfo structure
+#include <sstream>  // for std::ostringstream
+#include <iomanip>  // for std::setprecision, std::fixed
+#include "factor/depth_factor_dual_param.h"  // Dual-parameter depth factor (a, b)
 
 // Estimator类的构造函数
 Estimator::Estimator(): f_manager{Rs}
@@ -15,33 +19,89 @@ Estimator::Estimator(): f_manager{Rs}
 }
 
 /**
- * @brief 初始化深度估计器（如果启用）
- * 这个函数应该在 readParameters() 之后被调用
+ * @brief 初始化深度估计模块（在读取配置参数后调用）
+ *
+ * **功能说明**：
+ * - 创建共享的深度模型 (DepthModelONNX)，用于所有深度推理任务
+ * - 根据配置创建 InitDepthProvider（用于快速初始化）
+ * - 根据配置创建 OnlineDepthProvider（用于在线深度约束）
+ * - 初始化 FastInitializer（快速初始化算法）
+ *
+ * **调用时机**：
+ * - 在 readParameters() 之后，setParameter() 之前调用
+ * - 确保 USE_FAST_INIT 和 ESTIMATE_DEPTH_SCALE_SHIFT 等配置已加载
+ *
+ * **架构设计**（共享模型模式）：
+ * ```
+ * DepthModelONNX (shared, 273 lines) - 共享的 ONNX 推理核心
+ *     ↑ 被两个提供者复用
+ *     ├── InitDepthProvider (68 lines)     - 用于初始化阶段
+ *     └── OnlineDepthProvider (226 lines)  - 用于在线优化阶段
+ * ```
+ *
+ * **优势**：
+ * - 代码复用：单一 ONNX 实现，消除重复代码
+ * - 内存优化：共享模型权重，节省 GPU 显存
+ * - 性能提升：模型只加载一次，预热一次
+ *
+ * **注意事项**：
+ * - 深度模型初始化失败会导致 ROS 节点关闭（致命错误）
+ * - GPU 预热 (warmup) 在模型加载后立即执行
+ * - OnlineDepthProvider 启动后台推理线程（异步处理）
  */
 void Estimator::initDepthEstimator()
 {
-    // 如果启用了快速初始化或者启用了深度约束后端，则需要初始化深度估计器
+    // 检查是否需要深度模块（快速初始化或深度约束）
     if (USE_FAST_INIT || ESTIMATE_DEPTH_SCALE_SHIFT)
     {
-        ROS_INFO("Initializing DepthEstimator asynchronously...");
+        ROS_INFO("Initializing shared DepthModelONNX...");
 
-        // 创建一个深度估计器的智能指针实例
-        mp_depth_estimator = std::make_unique<DepthEstimator>();
+        // 1. 创建共享的 DepthModelONNX（核心 ONNX 推理引擎）
+        mp_depth_model = std::make_shared<depth_estimation::DepthModelONNX>();
 
-        // 使用配置文件中指定的模型路径初始化深度估计器
-        if (!mp_depth_estimator->initAsync(DEPTH_MODEL_PATH))
+        // 初始化模型（加载权重，创建 ONNX 会话）
+        if (!mp_depth_model->init(DEPTH_MODEL_PATH))
         {
-            // 如果初始化失败
-            // 打印致命错误日志，提示用户检查模型路径和相关配置（如ONNX, CUDA）
-            ROS_FATAL("DepthEstimator initialization failed! Please check the model path and ONNX/CUDA configuration.");
-            // 可以在此处添加 ros::shutdown() 来终止节点，防止进一步错误
+            ROS_FATAL("DepthModelONNX initialization failed! Check model path and ONNX/CUDA configuration.");
             ros::shutdown();
+            return;
         }
 
-        // 注意：这里不等待模型加载完成，让它在后台进行
+        // GPU 预热（首次推理预分配显存，避免运行时卡顿）
+        mp_depth_model->warmup();
+        ROS_INFO("DepthModelONNX initialized and warmed up successfully");
+
+        // 2. 创建 InitDepthProvider（用于快速初始化阶段）
+        if (USE_FAST_INIT)
+        {
+            ROS_INFO("Creating InitDepthProvider for fast initialization...");
+            mp_init_depth_provider = std::make_unique<InitDepthProvider>(mp_depth_model);
+            if (!mp_init_depth_provider->isReady())
+            {
+                ROS_FATAL("InitDepthProvider not ready!");
+                ros::shutdown();
+                return;
+            }
+            ROS_INFO("InitDepthProvider ready");
+        }
+
+        // 3. 创建 OnlineDepthProvider（用于在线深度约束优化）
+        if (ESTIMATE_DEPTH_SCALE_SHIFT)
+        {
+            ROS_INFO("Creating OnlineDepthProvider for online depth constraint...");
+            mp_online_depth_provider = std::make_unique<depth_estimation::OnlineDepthProvider>(
+                mp_depth_model, DepthConstants::ONLINE_DEPTH_QUEUE_SIZE);
+            if (!mp_online_depth_provider->start())
+            {
+                ROS_FATAL("OnlineDepthProvider failed to start!");
+                ros::shutdown();
+                return;
+            }
+            ROS_INFO("OnlineDepthProvider started successfully");
+        }
     }
 
-    // 快速初始化器只在USE_FAST_INIT为true时初始化
+    // 4. 初始化 FastInitializer（快速单目初始化算法）
     if (USE_FAST_INIT)
     {
         ROS_INFO("Initializing FastInitializer...");
@@ -91,6 +151,44 @@ void Estimator::setParameter()
         {
             ROS_WARN("Failed to open depth fusion metrics log file: %s", log_path.c_str());
         }
+
+        // 初始化 dual-parameter depth 日志文件
+        std::string para_a_log_path = OUTPUT_PATH + "/para_a_global.csv";
+        para_a_log_file.open(para_a_log_path, std::ios::out);
+        if (para_a_log_file.is_open())
+        {
+            // 写入CSV头部（包含时间戳和所有窗口帧的 a, b 值）
+            para_a_log_file << "timestamp,global_frame_id";
+            // 写入所有帧的 a 和 b 列名
+            for (int i = 0; i <= WINDOW_SIZE; i++) {
+                para_a_log_file << ",frame_" << i << "_para_a"
+                                << ",frame_" << i << "_para_b";
+            }
+            // 写入统计列
+            para_a_log_file << ",avg_para_a,avg_para_b"
+                            << ",min_para_a,max_para_a,min_para_b,max_para_b"
+                            << ",spread_a,spread_b\n";
+            ROS_INFO("para_a_global log file opened: %s", para_a_log_path.c_str());
+        }
+        else
+        {
+            ROS_WARN("Failed to open para_a_global log file: %s", para_a_log_path.c_str());
+        }
+
+        // 初始化 balance_ratio 日志文件
+        std::string balance_ratio_log_path = OUTPUT_PATH + "/balance_ratio.csv";
+        balance_ratio_log_file.open(balance_ratio_log_path, std::ios::out);
+        if (balance_ratio_log_file.is_open())
+        {
+            // 写入CSV头部
+            balance_ratio_log_file << "timestamp,global_frame_id,balance_ratio,avg_visual_cost,avg_depth_cost,"
+                                  << "visual_factor_count,depth_factor_count,current_K\n";
+            ROS_INFO("Balance ratio log file opened: %s", balance_ratio_log_path.c_str());
+        }
+        else
+        {
+            ROS_WARN("Failed to open balance ratio log file: %s", balance_ratio_log_path.c_str());
+        }
     }
 }
 
@@ -119,6 +217,9 @@ void Estimator::clearState()
         dt_buf[i].clear();
         linear_acceleration_buf[i].clear();
         angular_velocity_buf[i].clear();
+
+        // --- Adaptive Backfill: 初始化深度对齐标记 ---
+        depth_aligned[i] = false;
 
         // 如果预积分对象存在，则释放内存
         if (pre_integrations[i] != nullptr)
@@ -168,20 +269,24 @@ void Estimator::clearState()
     // 清空特征管理器中的所有特征点状态
     f_manager.clearState();
 
-    // --- 深度传感器因子约束状态初始化 (Backend Depth Constraint) ---
-    // 从全局配置参数初始化深度仿射变换参数
-    para_DepthScaleShift[0][0] = DEPTH_SCALE_A;  // 尺度因子 a
-    para_DepthScaleShift[0][1] = DEPTH_SHIFT_B;  // 偏移因子 b
+    // --- Dual-Parameter Depth Constraint: Initialize scale and shift parameters ---
+    // Initialize to identity transform since RANSAC already provides rough alignment
+    for (int i = 0; i <= WINDOW_SIZE; i++)
+    {
+        para_depth_scale[i][0] = 1.0;  // Scale: no additional scaling (RANSAC aligned)
+        para_depth_shift[i][0] = 0.0;  // Shift: no additional offset (RANSAC aligned)
+    }
 
-    // 初始化随机游走相关变量
-    last_depth_a = DEPTH_SCALE_A;
-    last_depth_b = DEPTH_SHIFT_B;
-    has_last_depth_params = false;  // 系统刚启动，没有"上一次"的值
-    is_first_depth_optimization = true;  // 标记为第一次优化，允许大幅跳转
+    // Reset depth optimization flags
+    has_last_depth_params = false;  // No previous parameters on startup
+    is_first_depth_optimization = true;  // First optimization allows larger jumps
 
     // 初始化信号滤波状态（运动评分平滑）
     smoothed_instability_score = 0.0;
     is_score_initialized = false;
+
+    // 初始化动态预热标志位
+    is_depth_fusion_ready = false;
 
     // 添加对我们新成员变量的重置
     {
@@ -199,6 +304,14 @@ void Estimator::clearState()
         ROS_INFO("Depth fusion metrics log file closed");
     }
     log_frame_counter = 0;
+
+    // 关闭 para_a_global 日志文件（如果打开）
+    if (para_a_log_file.is_open())
+    {
+        para_a_log_file.flush();
+        para_a_log_file.close();
+        ROS_INFO("para_a_global log file closed");
+    }
 
     failure_occur = 0; // 失败标志位清零
     relocalization_info = 0; // 重定位信息标志位清零
@@ -230,6 +343,31 @@ void Estimator::clearState()
  * - 只计算一帧（~50-100ms），避免推理多帧的高延迟
  * - 一帧的特征点（~150个）足以求解2个参数（a, b）
  */
+// ============================================================================
+// ⚠️ DEPRECATED FUNCTIONS - 废弃函数（保留用于参考）
+// ============================================================================
+//
+// 以下函数在引入"Hierarchical Decoupling Depth Fusion"架构后已被废弃。
+//
+// **旧架构**：
+//   - 初始化后估计全局 a,b 参数
+//   - 后端使用全局参数进行深度约束
+//
+// **新架构（当前使用）**：
+//   - 前端：performFrontendDepthAlignment() 实时对齐（无需初始化阶段估计）
+//   - 后端：每帧独立的 para_a_global[i] 进行尺度精调
+//   - 优势：消除全局参数漂移，更鲁棒
+//
+// **废弃原因**：
+//   - 新架构不再需要全局 a,b 初值
+//   - para_a_global 初始化为 1.0，由 Ceres 自动优化
+//   - 前端对齐提供实时尺度估计，无需初始化阶段对齐
+//
+// **废弃时间**：2025-12-14
+// ============================================================================
+
+#if 0  // 废弃代码块开始
+
 bool Estimator::ensureDepthMapForAlignment()
 {
     // 1. 检查是否启用深度约束
@@ -239,7 +377,7 @@ bool Estimator::ensureDepthMapForAlignment()
     }
 
     // 2. 检查深度估计器是否可用
-    if (!mp_depth_estimator || !mp_depth_estimator->isReady())
+    if (!mp_init_depth_provider || !mp_init_depth_provider->isReady())
     {
         ROS_WARN("[Depth Alignment] Depth estimator not ready, skipping depth map computation.");
         return false;
@@ -289,7 +427,7 @@ bool Estimator::ensureDepthMapForAlignment()
     // 计算深度图
     TicToc t_depth;
     cv::Mat depth_map;
-    if (!mp_depth_estimator->predict(frame.raw_image, depth_map))
+    if (!mp_init_depth_provider->predict(frame.raw_image, depth_map))
     {
         ROS_WARN("[Depth Alignment] Depth prediction failed for frame %d.", selected_frame_id);
         return false;
@@ -308,14 +446,36 @@ bool Estimator::ensureDepthMapForAlignment()
 /**
  * @brief 在线估计深度尺度偏移参数（初始化完成后调用）
  *
- * 通过线性回归对齐VINS三角化深度和网络预测深度：
- * depth_vins = a * depth_net + b
+ * **功能说明**：
+ * - 使用当前滑动窗口中的特征点，通过线性回归计算最优的尺度和偏移参数
+ * - 对齐公式：inv_depth_vins = a * inv_depth_net + b（逆深度空间的线性关系）
+ * - 为后端优化提供更好的深度参数初始值
  *
- * 算法流程：
- * 1. 遍历滑动窗口中所有已成功三角化的特征点
- * 2. 对每个特征点，找到对应帧的网络预测深度值
- * 3. 构建线性最小二乘系统并求解
- * 4. 更新全局参数 para_DepthScaleShift 和随机游走历史值
+ * **调用时机**：
+ * - VIO 初始化成功后立即调用（无论快速初始化还是标准SFM初始化）
+ * - 在 ensureDepthMapForAlignment() 之后调用，确保有足够的深度图数据
+ *
+ * **工作流程**：
+ * 1. 遍历特征管理器中的所有特征点
+ * 2. 对于每个已三角化的特征点（estimated_depth > 0）：
+ *    a. 获取 VINS 三角化深度 -> 转换为逆深度 inv_depth_vins
+ *    b. 在该特征的观测帧中查找有深度图的帧
+ *    c. 从深度图中读取对应像素的逆深度 inv_depth_net
+ *    d. 收集配对数据 (inv_depth_net, inv_depth_vins)
+ * 3. 使用收集到的配对点构建线性最小二乘系统
+ * 4. 求解最优参数 a, b，并更新到全局变量
+ *
+ * **鲁棒性策略**：
+ * - 数据过滤：排除深度值异常的特征点（<0.01m 或 >100m）
+ * - 最小点数要求：至少需要 20 个有效配对点
+ * - 异常值检测：基于标准差过滤离群点
+ * - 条件数检查：避免病态线性系统
+ *
+ * **诊断信息**：
+ * - 打印详细的统计信息，帮助调试深度对齐问题：
+ *   * 检查的特征数 / 三角化的特征数 / 有效深度配对数
+ *   * 观测帧检查数 / 有深度图的观测帧数
+ *   * 边界外观测数 / 无效深度值数
  */
 void Estimator::estimateDepthScaleShift()
 {
@@ -730,28 +890,31 @@ void Estimator::estimateDepthScaleShift()
     ROS_WARN("[Depth Init]   New: a=%.6f, b=%.6f (online estimation)", estimated_a, estimated_b);
     ROS_WARN("[Depth Init] ═══════════════════════════════════════════════════");
 
-    // Update system parameters
+    // Update system parameters (keep for backward compatibility)
     DEPTH_SCALE_A = estimated_a;
     DEPTH_SHIFT_B = estimated_b;
 
-    // Store for random walk constraint
-    last_depth_a = estimated_a;
-    last_depth_b = estimated_b;
+    // Initialize dual parameters to estimated values from RANSAC
+    for (int i = 0; i <= WINDOW_SIZE; i++) {
+        para_depth_scale[i][0] = estimated_a;
+        para_depth_shift[i][0] = estimated_b;
+    }
+
     has_last_depth_params = true;
 
-    // Update parameter block (para_DepthScaleShift is double[1][2])
-    para_DepthScaleShift[0][0] = DEPTH_SCALE_A;
-    para_DepthScaleShift[0][1] = DEPTH_SHIFT_B;
+    ROS_INFO("[Depth Init] Initialized para_depth_scale to %.6f, para_depth_shift to %.6f",
+             estimated_a, estimated_b);
 }
+
+#endif  // 废弃代码块结束
+// ============================================================================
 
 /**
  * @brief 处理收到的IMU数据
- * 
+ *
  * @param dt 时间间隔
  * @param linear_acceleration IMU测得的线加速度
  * @param angular_velocity IMU测得的角速度
- * 
- * 该函数负责IMU预积分。它将IMU数据累积到预积分对象中，并用于预测下一时刻的位姿。
  */
 void Estimator::processIMU(double dt, const Vector3d &linear_acceleration, const Vector3d &angular_velocity)
 {
@@ -806,26 +969,59 @@ void Estimator::processIMU(double dt, const Vector3d &linear_acceleration, const
 }
 
 /**
- * @brief 处理新的图像帧和其中的特征点
- * 
- * @param image 图像数据，包含特征点ID及其在图像中的位置 image: feature_id -> (camera_id, [x,y,z,u,v,velocity_x,velocity_y])
- * @param header ROS消息头，包含时间戳等信息
- * 
- * 这是VIO系统的核心驱动函数之一。它负责决定当前帧是否为关键帧，
- * 触发VIO初始化、后端优化和滑动窗口操作。
+ * @brief 处理新的图像帧和其中的特征点（VIO 系统的核心驱动函数）
+ *
+ * **功能说明**：
+ * - 决定当前帧是否为关键帧（基于特征视差）
+ * - 触发 VIO 初始化（快速初始化或标准 SFM 初始化）
+ * - 执行后端优化（位姿、速度、偏置、深度参数等）
+ * - 管理滑动窗口（边缘化旧帧或次新帧）
+ *
+ * **参数说明**：
+ * @param image 特征点数据，格式: feature_id -> (camera_id, [x, y, z, u, v, vx, vy]), 如果是多目相机，一个特征点有多组位置速度信息
+ *              - x, y, z: 归一化相机坐标系下的坐标
+ *              - u, v: 图像像素坐标
+ *              - vx, vy: 特征点在图像中的运动速度
+ * @param header ROS 消息头（包含时间戳等信息）
+ * @param raw_image 原始输入图像（用于深度估计）
+ *
+ * **处理流程**：
+ * 1. **前端预处理**：
+ *    - 推送图像到在线深度提供者（异步推理，不阻塞）
+ *    - 检查特征视差，决定是否为关键帧
+ *    - 标定外参（如果需要）
+ *
+ * 2. **初始化阶段** (solver_flag == INITIAL)：
+ *    - 快速初始化：基于深度学习深度图快速恢复尺度和重力
+ *    - 标准初始化：纯视觉 SFM + 视觉-IMU 对齐
+ *    - 初始化成功后切换到 NON_LINEAR 模式
+ *
+ * 3. **正常运行阶段** (solver_flag == NON_LINEAR)：
+ *    - 三角化新特征点
+ *    - 后端优化（位姿、速度、偏置、深度参数）
+ *    - 滑动窗口边缘化
+ *    - 故障检测与恢复
+ *
+ * **关键帧策略**：
+ * - 关键帧（MARGIN_OLD）：视差大，边缘化最老的帧
+ * - 非关键帧（MARGIN_SECOND_NEW）：视差小，丢弃当前帧
  */
 void Estimator::processImage(const map<int, vector<pair<int, Eigen::Matrix<double, 7, 1>>>> &image, const std_msgs::Header &header, const cv::Mat &raw_image)
 {
-    // image数据结构: feature_id -> (camera_id, [x,y,z,u,v,velocity_x,velocity_y])
     ROS_DEBUG("new image coming ------------------------------------------");
     ROS_DEBUG("Adding feature points %lu", image.size());
+
+    // 前端：推送图像到在线深度提供者（异步推理，立即返回）
+    double timestamp = header.stamp.toSec();
+    pushImageToOnlineDepthProvider(timestamp, raw_image);
 
     // 递增全局帧计数器（每次处理新图像时递增，持续增长）
     global_frame_count++;
 
     // 1. 检查特征点视差，决定当前帧是否为关键帧
     // addFeatureCheckParallax会检查当前帧与之前关键帧的平均视差
-    if (f_manager.addFeatureCheckParallax(frame_count, image, td))
+    // 使用 getCurrentFrameIndex() 明确表示"当前帧在窗口中的索引"
+    if (f_manager.addFeatureCheckParallax(getCurrentFrameIndex(), image, td))
         marginalization_flag = MARGIN_OLD; // 视差足够大，是关键帧，后续需要边缘化最老的帧
     else
         marginalization_flag = MARGIN_SECOND_NEW; // 视差不足，是非关键帧，后续需要边缘化次新帧（即丢弃当前帧）
@@ -937,20 +1133,21 @@ void Estimator::processImage(const map<int, vector<pair<int, Eigen::Matrix<doubl
                    initial_timestamp = header.stamp.toSec();
                 }
             }
-            
+
             // --- 统一处理初始化结果 ---
             if(is_init_success)
             {
-                // *** 确保至少有一帧深度图可用于参数对齐 ***
-                // 快速初始化路径：第一帧深度图已存在，直接返回true
-                // 传统SFM初始化路径：计算一帧深度图（当前帧 WINDOW_SIZE）
-                ensureDepthMapForAlignment();
+                // *** 废弃逻辑已移除（2025-12-14）***
+                // 旧架构：ensureDepthMapForAlignment() + estimateDepthScaleShift()
+                //   - 初始化后计算深度图，估计全局 a,b 参数
+                //
+                // 新架构（Hierarchical Decoupling）：
+                //   - para_a_global[i] 初始化为 1.0（clearState 中完成）
+                //   - 前端：performFrontendDepthAlignment() 提供实时尺度估计
+                //   - 后端：Ceres 自动优化每帧的 para_a_global[i]
+                //   - 优势：无需初始化阶段对齐，消除全局参数漂移
 
                 solver_flag = NON_LINEAR; // 切换到非线性优化模式
-
-                // *** 在线估计深度尺度偏移参数 ***
-                // 现在特征点已经三角化，可以进行参数对齐
-                estimateDepthScaleShift();
 
                 solveOdometry();          // 立即进行一次后端优化
                 slideWindow();            // 滑动窗口
@@ -973,50 +1170,8 @@ void Estimator::processImage(const map<int, vector<pair<int, Eigen::Matrix<doubl
     }
     else // 如果系统已完成初始化，进入正常的非线性优化流程
     {
-        // --- 深度传感器因子约束：计算滑动窗口帧的深度图 (Backend Depth Constraint) ---
-        // 为当前滑动窗口中的所有帧计算深度图（如果尚未计算）
-        if (ESTIMATE_DEPTH_SCALE_SHIFT && mp_depth_estimator && mp_depth_estimator->isReady())
-        {
-            TicToc t_depth_backend;
-            int depth_computed_count = 0;
-
-            // 遍历滑动窗口中的所有帧
-            for (int i = 0; i <= WINDOW_SIZE; i++)
-            {
-                double timestamp = Headers[i].stamp.toSec();
-                auto frame_it = all_image_frame.find(timestamp);
-
-                // 检查帧是否存在且有原始图像
-                if (frame_it != all_image_frame.end() && !frame_it->second.raw_image.empty())
-                {
-                    auto& frame = frame_it->second;
-
-                    // 如果该帧的深度图尚未计算，则计算之
-                    if (!frame.depth_map_computed)
-                    {
-                        if (mp_depth_estimator->predict(frame.raw_image, frame.predicted_depth_map))
-                        {
-                            frame.depth_map_computed = true;
-                            depth_computed_count++;
-                            ROS_DEBUG("Backend: computed depth for frame %d (t=%.3f)", i, timestamp);
-                        }
-                        else
-                        {
-                            ROS_DEBUG("Backend: depth prediction failed for frame %d", i);
-                        }
-                    }
-                }
-            }
-
-            if (depth_computed_count > 0)
-            {
-                // ROS_INFO("[Backend] Computed depth maps for %d frames (%.1f ms)",
-                //          depth_computed_count, t_depth_backend.toc());
-            }
-        }
-
         TicToc t_solve;
-        // 核心步骤：执行后端优化
+        // 核心步骤：执行后端优化（内部会处理深度）
         solveOdometry();
         ROS_DEBUG("solver costs: %fms", t_solve.toc());
 
@@ -1075,13 +1230,10 @@ void Estimator::processImage(const map<int, vector<pair<int, Eigen::Matrix<doubl
      }
      
      // 等待深度估计模型就绪
-     if (!mp_depth_estimator->isReady()) {
-         ROS_WARN_THROTTLE(1.0, "Fast-Init: Depth model still loading, waiting...");
-         if (!mp_depth_estimator->waitForReady(5000)) {
-             ROS_WARN_THROTTLE(1.0, "Fast-Init: Depth model not ready after timeout, skipping depth computation.");
-             return false;
-         }
-     }
+     if (!mp_init_depth_provider->isReady()) {
+        ROS_WARN_THROTTLE(1.0, "Fast-Init: Depth model not ready, skipping depth computation.");
+        return false;
+    }
      
      // 检查原始图像是否可用
      if (first_frame_it->second.raw_image.empty()) {
@@ -1094,7 +1246,7 @@ void Estimator::processImage(const map<int, vector<pair<int, Eigen::Matrix<doubl
      TicToc t_depth;
      cv::Mat depth_map;
      
-     if (!mp_depth_estimator->predict(first_frame_it->second.raw_image, depth_map)) {
+     if (!mp_init_depth_provider->predict(first_frame_it->second.raw_image, depth_map)) {
          return false;
      }
      
@@ -1453,7 +1605,6 @@ bool Estimator::initialStructure()
         ROS_INFO("misalign visual structure with IMU");
         return false;
     }
-
     }
 }
 
@@ -1622,7 +1773,21 @@ void Estimator::solveOdometry()
         // 1. 三角化新的特征点
         f_manager.triangulate(Ps, tic, ric);
         ROS_DEBUG("triangulation costs %f", t_tri.toc());
-        // 2. 执行后端优化
+
+        // 2. 深度处理流程（分层解耦架构）
+        // Step 1: 尝试存储已完成的TTA深度结果到ImageFrame（优先级最高）
+        tryStoreOnlineDepthToImageFrame();
+
+        // Step 2: 补充缺失的深度图（使用同步推理作为备用）
+        // 注意：这一步会跳过已有TTA深度的帧
+        // Backend depth maps (synchronous backup for missing TTA results)
+        computeBackendDepthMaps();
+
+        // Step 3: 自适应回填深度对齐（新策略：遍历滑窗所有未对齐帧）
+        // Frontend: adaptive backfill - align depth for all unaligned frames in window
+        backfillDepthAlignment();
+
+        // 3. 执行后端优化
         optimization();
     }
 }
@@ -1679,9 +1844,9 @@ void Estimator::vector2double()
         para_Td[0][0] = td;
 
     // --- 深度传感器因子约束状态转换 (Backend Depth Constraint) ---
-    // 注意：para_DepthScaleShift 在Ceres优化中是持久的，
-    // 它会在clearState时初始化，在优化过程中被Ceres修改，
-    // 在double2vector中被同步回全局变量。
+    // 注意：para_a_global 在Ceres优化中是持久的，
+    // 它会在clearState时初始化为1.0，在优化过程中被Ceres修改，
+    // 在slideWindow中根据边缘化策略更新。
     // 这里不需要每次都从全局变量重新赋值。
 }
 
@@ -1766,42 +1931,14 @@ void Estimator::double2vector()
     if (ESTIMATE_TD)
         td = para_Td[0][0];
 
-    // --- 深度传感器因子约束状态转换 (Backend Depth Constraint) ---
-    // 将Ceres优化后的深度仿射变换参数同步回全局变量
-    if (ESTIMATE_DEPTH_SCALE_SHIFT)
+    // === Dual-Parameter Depth: para_depth_scale and para_depth_shift already optimized ===
+    // No need to copy back - parameter arrays contain final values
+    // (Frontend alignment handles initial scale+shift, backend fine-tunes both a and b)
+    if (ESTIMATE_DEPTH_SCALE_SHIFT && solver_flag == NON_LINEAR)
     {
-        double old_a = DEPTH_SCALE_A;
-        double old_b = DEPTH_SHIFT_B;
-
-        DEPTH_SCALE_A = para_DepthScaleShift[0][0];  // 尺度因子 a
-        DEPTH_SHIFT_B = para_DepthScaleShift[0][1];  // 偏移因子 b
-
-        // 计算参数变化量
-        double delta_a = DEPTH_SCALE_A - old_a;
-        double delta_b = DEPTH_SHIFT_B - old_b;
-
-        // 更新随机游走模型的"上一次"值
-        last_depth_a = DEPTH_SCALE_A;
-        last_depth_b = DEPTH_SHIFT_B;
-        has_last_depth_params = true;
-
-        // 在第一次非线性优化后重置标志，之后使用正常的随机游走约束
-        if (solver_flag == NON_LINEAR && is_first_depth_optimization)
-        {
-            is_first_depth_optimization = false;
-            ROS_INFO("[Depth Opt] First optimization completed. Future optimizations will use normal random walk constraint.");
-        }
-
-        // 定期打印深度参数的变化轨迹（用于验证随机游走效果）
-        static int frame_counter = 0;
-        frame_counter++;
-
-        // 降低打印频率，每 10 帧打印一次
-        if (frame_counter % 10 == 0)
-        {
-            ROS_INFO("[DepthParams] Frame %d: a=%.6f (delta %.6f), b=%.6f (delta %.6f)",
-                     frame_counter, DEPTH_SCALE_A, delta_a, DEPTH_SHIFT_B, delta_b);
-        }
+        ROS_DEBUG("[Backend] Dual-param optimized: a=[%.4f, %.4f, ..., %.4f], b=[%.6f, %.6f, ..., %.6f]",
+                  para_depth_scale[0][0], para_depth_scale[1][0], para_depth_scale[WINDOW_SIZE][0],
+                  para_depth_shift[0][0], para_depth_shift[1][0], para_depth_shift[WINDOW_SIZE][0]);
     }
 
     // 如果有重定位信息，计算漂移修正
@@ -1902,6 +2039,14 @@ void Estimator::optimization()
     ceres::LossFunction *loss_function;
     // 使用柯西核函数来减小外点的影响
     loss_function = new ceres::CauchyLoss(1.0);
+
+    // ========================================================================
+    // Cost Monitor & Tuning Assistant: 残差块ID容器
+    // ========================================================================
+    // 用于跟踪视觉和深度因子的残差块ID,以便在优化后分析成本平衡
+    std::vector<ceres::ResidualBlockId> visual_block_ids;
+    std::vector<ceres::ResidualBlockId> depth_block_ids;
+    // ========================================================================
     
     // 1. 添加参数块
     // 添加滑动窗口中所有帧的位姿(Pose)和速度/偏置(SpeedBias)作为待优化变量
@@ -1974,581 +2119,324 @@ void Estimator::optimization()
         {
             int imu_j = it_per_id.start_frame + idx;
             Vector3d pts_j = it_per_id.feature_per_frame[idx].point;
-            
+
             if (ESTIMATE_TD)
             {
                 ProjectionTdFactor *f_td = new ProjectionTdFactor(
-                    pts_i, pts_j, 
-                    it_per_id.feature_per_frame[0].velocity, 
+                    pts_i, pts_j,
+                    it_per_id.feature_per_frame[0].velocity,
                     it_per_id.feature_per_frame[idx].velocity,
-                    it_per_id.feature_per_frame[0].cur_td, 
+                    it_per_id.feature_per_frame[0].cur_td,
                     it_per_id.feature_per_frame[idx].cur_td,
-                    it_per_id.feature_per_frame[0].uv.y(), 
+                    it_per_id.feature_per_frame[0].uv.y(),
                     it_per_id.feature_per_frame[idx].uv.y());
-                problem.AddResidualBlock(f_td, loss_function, 
-                    para_Pose[imu_i], para_Pose[imu_j], 
+                ceres::ResidualBlockId visual_id = problem.AddResidualBlock(f_td, loss_function,
+                    para_Pose[imu_i], para_Pose[imu_j],
                     para_Ex_Pose[0], para_Feature[feature_index], para_Td[0]);
+                visual_block_ids.push_back(visual_id);  // 捕获视觉因子ID
             }
             else
             {
                 ProjectionFactor *f = new ProjectionFactor(pts_i, pts_j);
-                problem.AddResidualBlock(f, loss_function, 
-                    para_Pose[imu_i], para_Pose[imu_j], 
+                ceres::ResidualBlockId visual_id = problem.AddResidualBlock(f, loss_function,
+                    para_Pose[imu_i], para_Pose[imu_j],
                     para_Ex_Pose[0], para_Feature[feature_index]);
+                visual_block_ids.push_back(visual_id);  // 捕获视觉因子ID
             }
             f_m_cnt++;
         }
         
-        // 方案2：相邻帧对之间建立约束（提高局部精度）
-        for (int idx = 0; idx < it_per_id.feature_per_frame.size() - 1; idx++)
-        {
-            int imu_i_adj = it_per_id.start_frame + idx;
-            int imu_j_adj = it_per_id.start_frame + idx + 1;
-            Vector3d pts_i_adj = it_per_id.feature_per_frame[idx].point;
-            Vector3d pts_j_adj = it_per_id.feature_per_frame[idx + 1].point;
+        // // 方案2：相邻帧对之间建立约束（提高局部精度）
+        // for (int idx = 0; idx < it_per_id.feature_per_frame.size() - 1; idx++)
+        // {
+        //     int imu_i_adj = it_per_id.start_frame + idx;
+        //     int imu_j_adj = it_per_id.start_frame + idx + 1;
+        //     Vector3d pts_i_adj = it_per_id.feature_per_frame[idx].point;
+        //     Vector3d pts_j_adj = it_per_id.feature_per_frame[idx + 1].point;
             
-            // 跳过第一帧参考的约束（避免重复）
-            if (idx == 0) continue;  // 因为 (0,1) 已经在方案1中建立了
+        //     // 跳过第一帧参考的约束（避免重复）
+        //     if (idx == 0) continue;  // 因为 (0,1) 已经在方案1中建立了
             
-            if (ESTIMATE_TD)
-            {
-                ProjectionTdFactor *f_td = new ProjectionTdFactor(
-                    pts_i_adj, pts_j_adj, 
-                    it_per_id.feature_per_frame[idx].velocity, 
-                    it_per_id.feature_per_frame[idx + 1].velocity,
-                    it_per_id.feature_per_frame[idx].cur_td, 
-                    it_per_id.feature_per_frame[idx + 1].cur_td,
-                    it_per_id.feature_per_frame[idx].uv.y(), 
-                    it_per_id.feature_per_frame[idx + 1].uv.y());
-                problem.AddResidualBlock(f_td, loss_function, 
-                    para_Pose[imu_i_adj], para_Pose[imu_j_adj], 
-                    para_Ex_Pose[0], para_Feature[feature_index], para_Td[0]);
-            }
-            else
-            {
-                ProjectionFactor *f = new ProjectionFactor(pts_i_adj, pts_j_adj);
-                problem.AddResidualBlock(f, loss_function, 
-                    para_Pose[imu_i_adj], para_Pose[imu_j_adj], 
-                    para_Ex_Pose[0], para_Feature[feature_index]);
-            }
-            f_m_cnt++;
-        }
+        //     if (ESTIMATE_TD)
+        //     {
+        //         ProjectionTdFactor *f_td = new ProjectionTdFactor(
+        //             pts_i_adj, pts_j_adj, 
+        //             it_per_id.feature_per_frame[idx].velocity, 
+        //             it_per_id.feature_per_frame[idx + 1].velocity,
+        //             it_per_id.feature_per_frame[idx].cur_td, 
+        //             it_per_id.feature_per_frame[idx + 1].cur_td,
+        //             it_per_id.feature_per_frame[idx].uv.y(), 
+        //             it_per_id.feature_per_frame[idx + 1].uv.y());
+        //         problem.AddResidualBlock(f_td, loss_function, 
+        //             para_Pose[imu_i_adj], para_Pose[imu_j_adj], 
+        //             para_Ex_Pose[0], para_Feature[feature_index], para_Td[0]);
+        //     }
+        //     else
+        //     {
+        //         ProjectionFactor *f = new ProjectionFactor(pts_i_adj, pts_j_adj);
+        //         problem.AddResidualBlock(f, loss_function, 
+        //             para_Pose[imu_i_adj], para_Pose[imu_j_adj], 
+        //             para_Ex_Pose[0], para_Feature[feature_index]);
+        //     }
+        //     f_m_cnt++;
+        // }
     }
 
     ROS_DEBUG("visual measurement count: %d", f_m_cnt);
     ROS_INFO_THROTTLE(20.0, "[Backend] Visual factors: %d", f_m_cnt);
 
-    // --- 深度传感器因子约束：添加深度约束残差块 (Backend Depth Constraint) ---
-    if (ESTIMATE_DEPTH_SCALE_SHIFT)
+    // ========================================================================
+    // Hierarchical Decoupling Depth Fusion (Backend Global Fine-tuning)
+    // ========================================================================
+    // Architecture:
+    //   - Frontend (in solveOdometry): Computes scale+shift alignment instantly
+    //   - Backend (here): Optimizes ONLY per-frame para_a_global for drift correction
+    //
+    // Removed: para_b (shift), last_depth_a, last_depth_b, global para_DepthScaleShift
+    // Added: para_a_global[WINDOW_SIZE+1] + RandomWalkFactor
+    // ========================================================================
+    // ========================================================================
+    // Depth Fusion Dynamic Warmup: IMU Bias Convergence Check
+    // ========================================================================
+    // Instead of fixed 15s timer, we now check if IMU bias has converged by
+    // computing std_dev(Bas) < 0.1 across the sliding window.
+    // Once stable, the flag is latched (never toggles off).
+
+    if (ESTIMATE_DEPTH_SCALE_SHIFT && solver_flag == NON_LINEAR)
     {
-        // 首先添加 para_DepthScaleShift 参数块，并设置物理约束
-        problem.AddParameterBlock(para_DepthScaleShift[0], 2);
+        // Check system stability (IMU bias convergence)
+        bool system_is_stable = checkSystemStability();
 
-        // 设置参数的上下界约束，确保物理合理性
-        // a (尺度参数): 必须为正，范围 [0.01, 5.0]
-        // b (偏移参数): 可正可负，范围 [-2.0, 2.0]
-        std::vector<double> lower_bounds(2);
-        std::vector<double> upper_bounds(2);
-        lower_bounds[0] = 0.01;   // a 的下界（必须为正）
-        upper_bounds[0] = 5.0;    // a 的上界
-        lower_bounds[1] = -2.0;   // b 的下界
-        upper_bounds[1] = 2.0;    // b 的上界
-
-        problem.SetParameterLowerBound(para_DepthScaleShift[0], 0, lower_bounds[0]);
-        problem.SetParameterUpperBound(para_DepthScaleShift[0], 0, upper_bounds[0]);
-        problem.SetParameterLowerBound(para_DepthScaleShift[0], 1, lower_bounds[1]);
-        problem.SetParameterUpperBound(para_DepthScaleShift[0], 1, upper_bounds[1]);
-
-        ROS_INFO_ONCE("[DepthParams] Parameter bounds set: a ∈ [%.2f, %.2f], b ∈ [%.2f, %.2f]",
-                     lower_bounds[0], upper_bounds[0], lower_bounds[1], upper_bounds[1]);
-
-        TicToc t_depth_factor;
-        int depth_factor_cnt = 0;
-        int features_checked = 0;
-        int frames_with_depth = 0;
-
-        // ========================================================================
-        // Depth Fusion Weight and Huber Threshold Calculation
-        // ========================================================================
-        // 支持两种模式：
-        // - Mode 0 (Fixed): 使用固定权重和Huber阈值
-        // - Mode 1 (Adaptive): 基于IMU运动状态动态调整权重和阈值
-        // ========================================================================
-
-        double final_weight;
-        double final_huber_threshold;
-
-        // 声明日志需要的变量（在两种模式外部声明，以便日志函数可以访问）
-        double current_gyro_norm = 0.0;
-        double current_acc_disturbance = 0.0;
-        double raw_instability_score = 0.0;
-        // NOTE: smoothed_instability_score is a CLASS MEMBER variable (declared in estimator.h)
-        // Do NOT redeclare it here to avoid shadowing the persistent state
-
-        if (DEPTH_WEIGHT_MODE == 0)
+        // Gatekeeper: Block depth fusion until system is stable
+        if (!system_is_stable)
         {
-            // ========================================================================
-            // Fixed Weight Mode (weight_mode = 0)
-            // ========================================================================
-            final_weight = DEPTH_FACTOR_WEIGHT;
-            final_huber_threshold = DEPTH_FACTOR_HUBER_THRESHOLD;
-
-            // 递增深度融合帧计数器（固定模式也需要计数用于预热）
-            depth_fusion_frame_count++;
-
-            ROS_INFO_THROTTLE(10.0, "[Fixed Weight] Frame %d: W=%.2f, Huber=%.3f | a=%.4f",
-                             global_frame_count, final_weight, final_huber_threshold, DEPTH_SCALE_A);
+            ROS_WARN_THROTTLE(1.0, "[Backend] Depth fusion waiting for IMU bias convergence...");
+            // Skip all depth fusion logic (parameters, factors, residuals)
+            // Continue with rest of optimization without depth constraints
         }
         else
         {
-            // ========================================================================
-            // Physics-Aware Adaptive Depth Fusion (Multi-Factor Version)
-            // ========================================================================
-            // 理论基础：单目深度预测质量与运动模糊成反比
-            // - 运动模糊由相机快速旋转(角速度)和平移振动(线加速度)共同引起
-            // - IMU陀螺仪 + 加速度计提供更全面的运动感知
-            // - 物理不变量：Depth Anything V2 特征误差下限 ≈ 0.25 (1/m)
-            //
-            // 多因子自适应策略：
-            // - 综合不稳定性评分 = gyro_norm + acc_disturbance_weight × acc_disturbance
-            // - 稳定 (score < 0.3):  高权重 (W=3.0), 严格阈值 (δ=0.75)
-            // - 不稳定 (score > 1.5):  低权重 (W=1.0), 宽松阈值 (δ=0.25)
-            // - 中间状态: 线性插值
-            // ========================================================================
+            // ====================================================================
+            // Warmup Complete: Add depth fusion constraints
+            // ====================================================================
 
-            // Step A1: 计算角速度强度 (从IMU陀螺仪数据)
-            int valid_gyro_count = 0;
-
-        // 遍历滑动窗口中的所有预积分，计算平均陀螺仪幅值
-        for (int i = 0; i < WINDOW_SIZE; i++)
-        {
-            if (pre_integrations[i] != nullptr && !pre_integrations[i]->gyr_buf.empty())
+            // Step 1: Add dual-parameter blocks (per-frame scale and shift)
+            for (int i = 0; i <= WINDOW_SIZE; i++)
             {
-                // 计算该预积分中所有陀螺仪测量的平均范数
-                for (const auto& gyr : pre_integrations[i]->gyr_buf)
-                {
-                    current_gyro_norm += gyr.norm();
-                    valid_gyro_count++;
-                }
-            }
-        }
+                // Scale parameter (a)
+                problem.AddParameterBlock(para_depth_scale[i], 1);
+                problem.SetParameterLowerBound(para_depth_scale[i], 0, 0.5);
+                problem.SetParameterUpperBound(para_depth_scale[i], 0, 2);
 
-        // 计算平均值
-        if (valid_gyro_count > 0)
-        {
-            current_gyro_norm /= valid_gyro_count;
-        }
-        else
-        {
-            // 如果没有有效陀螺仪数据，假设为静止状态
-            current_gyro_norm = 0.0;
-        }
-
-            // Step A2: 计算加速度扰动 (从IMU加速度计数据)
-            int valid_acc_count = 0;
-        const double GRAVITY_NOMINAL = 9.81; // 标称重力加速度 (m/s^2)
-
-        // 遍历滑动窗口中的所有预积分，计算平均加速度扰动
-        for (int i = 0; i < WINDOW_SIZE; i++)
-        {
-            if (pre_integrations[i] != nullptr && !pre_integrations[i]->acc_buf.empty())
-            {
-                // 计算该预积分中所有加速度测量与重力的偏差
-                for (const auto& acc : pre_integrations[i]->acc_buf)
-                {
-                    // 加速度扰动 = |测量幅值 - 重力幅值|
-                    // 这捕捉到平移加速度和振动，即使旋转很小时也能检测到
-                    double acc_norm = acc.norm();
-                    current_acc_disturbance += std::abs(acc_norm - GRAVITY_NOMINAL);
-                    valid_acc_count++;
-                }
-            }
-        }
-
-        // 计算平均值
-        if (valid_acc_count > 0)
-        {
-            current_acc_disturbance /= valid_acc_count;
-        }
-        else
-        {
-            // 如果没有有效加速度数据，假设无扰动
-            current_acc_disturbance = 0.0;
-        }
-
-            // ========================================================================
-            // Step B: Low-Pass Filter for Motion Score (Optimization B)
-            // ========================================================================
-            // 计算原始运动评分 (使用调整后的加速度权重 0.5)
-            raw_instability_score = current_gyro_norm + 0.5 * current_acc_disturbance;
-
-        // 应用指数移动平均（EMA）滤波器，消除加速度计高频噪声
-        // α = 0.2: 新测量权重20%，历史平滑值权重80%
-        // 时间常数 τ ≈ 5帧 @ 20Hz (约0.25秒响应时间)
-        if (!is_score_initialized)
-        {
-            // 首帧：直接使用原始值初始化
-            smoothed_instability_score = raw_instability_score;
-            is_score_initialized = true;
-            ROS_INFO("[Signal Filter] Initialized smoothed_instability_score = %.3f", smoothed_instability_score);
-        }
-        else
-        {
-            // 后续帧：EMA滤波
-            const double ALPHA = 0.2;  // 平滑因子 (0 = 完全平滑, 1 = 无滤波)
-            smoothed_instability_score = (1.0 - ALPHA) * smoothed_instability_score + ALPHA * raw_instability_score;
-        }
-
-        // Step C: 计算自适应权重 W (基于平滑后的评分线性插值)
-        // *** TUNED: Relaxed thresholds to allow higher weights during normal flight ***
-        // Old: THRESHOLD_LOW = 0.3, THRESHOLD_HIGH = 1.5
-        // New: THRESHOLD_LOW = 0.8, THRESHOLD_HIGH = 2.5
-        // Rationale: V2_03 has score ~1.2 (normal drone vibration), should get W >= 2.5
-        const double RELAXED_THRESHOLD_LOW = 0.8;   // Increased from 0.3
-        const double RELAXED_THRESHOLD_HIGH = 2.5;  // Increased from 1.5
-
-        double adaptive_weight;
-        if (smoothed_instability_score < RELAXED_THRESHOLD_LOW)
-        {
-            // 稳定状态：最大权重
-            adaptive_weight = DEPTH_WEIGHT_STATIC;
-        }
-        else if (smoothed_instability_score > RELAXED_THRESHOLD_HIGH)
-        {
-            // 不稳定状态：最小权重
-            adaptive_weight = DEPTH_WEIGHT_DYNAMIC;
-        }
-        else
-        {
-            // 中间状态：线性插值
-            double instability_ratio = (smoothed_instability_score - RELAXED_THRESHOLD_LOW) /
-                                      (RELAXED_THRESHOLD_HIGH - RELAXED_THRESHOLD_LOW);
-            adaptive_weight = DEPTH_WEIGHT_STATIC - instability_ratio * (DEPTH_WEIGHT_STATIC - DEPTH_WEIGHT_DYNAMIC);
-        }
-
-        // Step D: 计算自适应Huber阈值 (用于稳态，作为线性衰减的目标值)
-        // 物理不变量：无论权重如何变化，保持相同的物理误差下限
-        double steady_state_huber_threshold = adaptive_weight * PHYSICAL_ERROR_THRESHOLD;
-
-            // ========================================================================
-            // Step E: Linear Decay for Huber Threshold (Optimization A - 3-Phase Ramp)
-            // ========================================================================
-            // 递增深度融合帧计数器（每次执行深度融合时递增）
-            depth_fusion_frame_count++;
-
-            ceres::LossFunction *depth_loss_function = nullptr;
-            double current_huber_threshold;
-
-            // Phase 1: Aggressive Convergence (Frame 1-30)
-            // 使用极大阈值（近似L2损失），允许大梯度快速修正初值偏差
-            if (depth_fusion_frame_count <= 30)
-            {
-                current_huber_threshold = 999.0;  // 实质上是L2损失（所有残差 < 999都是二次惩罚）
-                depth_loss_function = new ceres::HuberLoss(current_huber_threshold);
-
-                ROS_INFO_THROTTLE(5.0, "[3-Phase] Phase 1 (Aggressive): Frame %d/30, "
-                                 "Huber=%.1f (≈L2), W=%.2f, smoothed_score=%.3f (raw=%.3f)",
-                                 depth_fusion_frame_count, current_huber_threshold,
-                                 adaptive_weight, smoothed_instability_score, raw_instability_score);
-            }
-            // Phase 2: Smooth Exit (Frame 31-100)
-            // 线性衰减从5.0降至1.0，逐步"关闭大门"，避免梯度突变
-            else if (depth_fusion_frame_count <= 100)
-            {
-                // 计算衰减进度 [0.0, 1.0]
-                double decay_progress = static_cast<double>(depth_fusion_frame_count - 30) / 70.0;
-
-                // 线性插值: 5.0 → steady_state_huber_threshold
-                current_huber_threshold = 5.0 * (1.0 - decay_progress) + steady_state_huber_threshold * decay_progress;
-                depth_loss_function = new ceres::HuberLoss(current_huber_threshold);
-
-                // 首次进入Phase 2时打印完整说明
-                static bool phase2_entry_printed = false;
-                if (!phase2_entry_printed)
-                {
-                    ROS_WARN("[3-Phase] Entering Phase 2 (Smooth Exit) at Frame %d", depth_fusion_frame_count);
-                    ROS_WARN("[3-Phase] Linear decay: Huber threshold 5.0 → %.3f over 70 frames",
-                             steady_state_huber_threshold);
-                    phase2_entry_printed = true;
-                }
-
-                ROS_INFO_THROTTLE(5.0, "[3-Phase] Phase 2 (Decay): Frame %d/100, "
-                                 "Huber=%.3f (progress=%.1f%%), W=%.2f, smoothed_score=%.3f",
-                                 depth_fusion_frame_count, current_huber_threshold,
-                                 decay_progress * 100.0, adaptive_weight, smoothed_instability_score);
-            }
-            // Phase 3: Steady State (Frame 101+)
-            // 使用自适应Huber阈值，基于运动评分动态调整
-            else
-            {
-                current_huber_threshold = steady_state_huber_threshold;
-                depth_loss_function = new ceres::HuberLoss(current_huber_threshold);
-
-                // 首次进入Phase 3时打印完整说明
-                static bool phase3_entry_printed = false;
-                if (!phase3_entry_printed)
-                {
-                    ROS_WARN("[3-Phase] Entering Phase 3 (Steady State) at Frame %d", depth_fusion_frame_count);
-                    ROS_WARN("[3-Phase] Now using adaptive Huber threshold (physics-aware)");
-                    phase3_entry_printed = true;
-                }
-
-                ROS_INFO_THROTTLE(10.0, "[3-Phase] Phase 3 (Steady): Frame %d, "
-                                 "Huber=%.3f, W=%.2f, smoothed_score=%.3f",
-                                 depth_fusion_frame_count, current_huber_threshold,
-                                 adaptive_weight, smoothed_instability_score);
+                // Shift parameter (b)
+                problem.AddParameterBlock(para_depth_shift[i], 1);
+                problem.SetParameterLowerBound(para_depth_shift[i], 0, -0.40);  // Small shift range
+                problem.SetParameterUpperBound(para_depth_shift[i], 0, 0.40);
             }
 
-            // ========================================================================
-            // Step F: Weight Warm-up (Linear Ramp for First 50 Frames After Init)
-            // ========================================================================
-            // 目的：防止初期不稳定的a/b参数和深度约束干扰VINS收敛
-            // 策略：在VINS初始化完成后的前50帧，权重从0线性增加到目标值
-            // 适用：固定权重模式和自适应权重模式都使用此预热策略
+            // Step 2: Add Random Walk priors for temporal consistency (differentiated noise)
+            // Process noise parameters (从配置文件读取)
+            const double SIGMA_A = DEPTH_A_RANDOM_WALK;   // 尺度参数随机游走噪声
+            const double SIGMA_B = DEPTH_B_RANDOM_WALK;   // 偏移参数随机游走噪声 (lazy buffer)
 
-            double final_weight_with_warmup = adaptive_weight;  // 默认使用完整权重
+            // For first optimization, use relaxed constraints (放大10倍和100倍)
+            const double SIGMA_A_FIRST = DEPTH_A_RANDOM_WALK * 10.0;
+            const double SIGMA_B_FIRST = DEPTH_B_RANDOM_WALK * 100.0;
 
-            const int WEIGHT_WARMUP_FRAMES = 50;  // 权重预热帧数
-            if (depth_fusion_frame_count <= WEIGHT_WARMUP_FRAMES)
-            {
-                // 线性增加：从0到目标权重
-                double warmup_ratio = static_cast<double>(depth_fusion_frame_count) / static_cast<double>(WEIGHT_WARMUP_FRAMES);
-                final_weight_with_warmup = warmup_ratio * adaptive_weight;
+            double sigma_a = is_first_depth_optimization ? SIGMA_A_FIRST : SIGMA_A;
+            double sigma_b = is_first_depth_optimization ? SIGMA_B_FIRST : SIGMA_B;
 
-                // 每10帧打印一次预热进度
-                if (depth_fusion_frame_count % 10 == 0 || depth_fusion_frame_count == 1)
-                {
-                    ROS_INFO("[Weight Warmup] Frame %d/%d: ratio=%.2f%%, target_weight=%.2f, actual_weight=%.2f",
-                             depth_fusion_frame_count, WEIGHT_WARMUP_FRAMES,
-                             warmup_ratio * 100.0, adaptive_weight, final_weight_with_warmup);
-                }
-            }
-            else if (depth_fusion_frame_count == WEIGHT_WARMUP_FRAMES + 1)
+            // Add random walk priors for frames 1..WINDOW_SIZE
+            int random_walk_count = 0;
+            for (int i = 1; i <= WINDOW_SIZE; i++)
             {
-                // 预热完成，打印提示
-                ROS_WARN("[Weight Warmup] Completed at frame %d. Now using full weight: %.2f",
-                         depth_fusion_frame_count, adaptive_weight);
-            }
+                // Random walk for scale (a): a[i] ≈ a[i-1]
+                ceres::CostFunction* rw_a = new RandomWalkFactor(sigma_a);
+                problem.AddResidualBlock(rw_a, nullptr,
+                                         para_depth_scale[i-1],
+                                         para_depth_scale[i]);
 
-            // 包装权重缩放（使用预热后的权重）
-            // Note: Both warm-up Huber and normal Huber need weight scaling
-            if (depth_loss_function != nullptr)
-            {
-                // Wrap the Huber loss with warmed-up weight
-                depth_loss_function = new ceres::ScaledLoss(depth_loss_function, final_weight_with_warmup, ceres::TAKE_OWNERSHIP);
-            }
-            else
-            {
-                // This branch should never be reached now (warm-up uses Huber, not L2)
-                // Keep for safety: L2 loss with weight scaling
-                depth_loss_function = new ceres::ScaledLoss(nullptr, final_weight_with_warmup, ceres::DO_NOT_TAKE_OWNERSHIP);
+                // Random walk for shift (b): b[i] ≈ b[i-1] (very small noise)
+                ceres::CostFunction* rw_b = new RandomWalkFactor(sigma_b);
+                problem.AddResidualBlock(rw_b, nullptr,
+                                         para_depth_shift[i-1],
+                                         para_depth_shift[i]);
+
+                random_walk_count += 2;
             }
 
-            // 每10帧打印一次自适应参数（更新为使用平滑后的评分）
-            static int last_log_frame = -10;
-            if (global_frame_count - last_log_frame >= 10 || global_frame_count < 5)
+            ROS_DEBUG("[Backend] Added %d dual-parameter RandomWalkFactors (scale + shift)", random_walk_count);
+
+            // Step 3: Add hierarchical DepthFactors using aligned depth from frontend
+            // with Chi-Square Gatekeeper for outlier rejection
+            TicToc t_depth_factor;
+            int depth_factor_cnt = 0;
+            int depth_factor_rejected = 0;  // Track rejected outliers
+            int features_checked = 0;
+            int features_with_aligned_depth = 0;
+
+            // Clear visualization debug info from previous frame
+            depth_constraint_debug_info.clear();
+
+            const double CHI2_THRESHOLD = 9.0;  // 3-sigma threshold (chi2(1 DOF, 99.7%) ≈ 9.0)
+
+            feature_index = -1;
+            for (auto &it_per_id : f_manager.feature)
             {
-                ROS_INFO("[Filtered Motion] Frame %d: Gyro=%.3f, AccDist=%.3f, "
-                         "Raw_Score=%.3f, Smoothed_Score=%.3f, W=%.2f, Huber=%.3f | a=%.4f",
-                         global_frame_count,
-                         current_gyro_norm,
-                         current_acc_disturbance,
-                         raw_instability_score,
-                         smoothed_instability_score,
-                         adaptive_weight,
-                         current_huber_threshold,
-                         DEPTH_SCALE_A);
-                last_log_frame = global_frame_count;
-            }
-
-            // 将自适应模式计算的结果赋值给最终变量
-            final_weight = adaptive_weight;
-            final_huber_threshold = current_huber_threshold;
-        } // end of adaptive mode
-
-        // ========================================================================
-        // Weight Warm-up for Fixed Mode (Linear Ramp for First 50 Frames)
-        // ========================================================================
-        // 固定权重模式也需要预热，防止初期不稳定的a/b参数干扰VINS收敛
-        ceres::LossFunction *depth_loss_function = nullptr;
-        if (DEPTH_WEIGHT_MODE == 0)
-        {
-            double final_weight_with_warmup = final_weight;  // 默认使用完整权重
-
-            const int WEIGHT_WARMUP_FRAMES = 50;  // 权重预热帧数
-            if (depth_fusion_frame_count <= WEIGHT_WARMUP_FRAMES)
-            {
-                // 线性增加：从0到目标权重
-                double warmup_ratio = static_cast<double>(depth_fusion_frame_count) / static_cast<double>(WEIGHT_WARMUP_FRAMES);
-                final_weight_with_warmup = warmup_ratio * final_weight;
-
-                // 每10帧打印一次预热进度
-                if (depth_fusion_frame_count % 10 == 0 || depth_fusion_frame_count == 1)
-                {
-                    ROS_INFO("[Fixed Weight Warmup] Frame %d/%d: ratio=%.2f%%, target_weight=%.2f, actual_weight=%.2f",
-                             depth_fusion_frame_count, WEIGHT_WARMUP_FRAMES,
-                             warmup_ratio * 100.0, final_weight, final_weight_with_warmup);
-                }
-            }
-            else if (depth_fusion_frame_count == WEIGHT_WARMUP_FRAMES + 1)
-            {
-                // 预热完成，打印提示
-                ROS_WARN("[Fixed Weight Warmup] Completed at frame %d. Now using full weight: %.2f",
-                         depth_fusion_frame_count, final_weight);
-            }
-
-            // Fixed mode: simple Huber loss with fixed threshold and warmed-up weight
-            depth_loss_function = new ceres::HuberLoss(final_huber_threshold);
-            depth_loss_function = new ceres::ScaledLoss(depth_loss_function, final_weight_with_warmup, ceres::TAKE_OWNERSHIP);
-        }
-        // Note: adaptive mode already created depth_loss_function in the else block above
-
-        // ========================================================================
-        // Log Depth Fusion Metrics (every 10 frames)
-        // ========================================================================
-        // 对于固定模式，IMU数据设为0（因为不使用）
-        double log_gyro = (DEPTH_WEIGHT_MODE == 1) ? current_gyro_norm : 0.0;
-        double log_acc = (DEPTH_WEIGHT_MODE == 1) ? current_acc_disturbance : 0.0;
-        double log_raw_score = (DEPTH_WEIGHT_MODE == 1) ? raw_instability_score : 0.0;
-        double log_smoothed_score = (DEPTH_WEIGHT_MODE == 1) ? smoothed_instability_score : 0.0;
-
-        logDepthFusionMetrics(global_frame_count, log_gyro, log_acc,
-                             log_raw_score, log_smoothed_score,
-                             final_weight, final_huber_threshold,
-                             DEPTH_SCALE_A, DEPTH_SHIFT_B);
-
-        // 重新遍历所有特征点，为有深度图的观测添加深度约束
-        feature_index = -1;
-        for (auto &it_per_id : f_manager.feature)
-        {
-            // 使用与视觉约束相同的筛选条件
-            if (!(it_per_id.used_num >= 2 && it_per_id.start_frame < WINDOW_SIZE - 2))
-                continue;
-
-            ++feature_index;
-            features_checked++;
-
-            int first_obs_frame_id = it_per_id.start_frame;
-            Vector3d pts_i = it_per_id.feature_per_frame[0].point;  // 特征在首次观测帧的归一化坐标
-
-            // 遍历该特征点的所有观测
-            for (int idx = 0; idx < it_per_id.feature_per_frame.size(); idx++)
-            {
-                int current_obs_frame_id = it_per_id.start_frame + idx;
-
-                // 避免重复参数块：如果首次观测帧和当前观测帧是同一帧，跳过
-                if (first_obs_frame_id == current_obs_frame_id)
+                // Same filter as visual factors
+                if (!(it_per_id.used_num >= 2 && it_per_id.start_frame < WINDOW_SIZE - 2))
                     continue;
 
-                // 找到对应的 ImageFrame
-                double timestamp = Headers[current_obs_frame_id].stamp.toSec();
-                auto frame_it = all_image_frame.find(timestamp);
+                ++feature_index;
+                features_checked++;
 
-                // 检查深度图是否已计算
-                if (frame_it == all_image_frame.end() || !frame_it->second.depth_map_computed)
-                    continue;  // 没有可用的深度图
+                int imu_i = it_per_id.start_frame;
+                Vector3d pts_i = it_per_id.feature_per_frame[0].point;
 
-                frames_with_depth++;
-                auto& frame = frame_it->second;
-                const cv::Mat& depth_map = frame.predicted_depth_map;
+                // Iterate over all observations of this feature
+                int obs_idx = 0;
+                for (auto &it_per_frame : it_per_id.feature_per_frame)
+                {
+                    int imu_j = imu_i + obs_idx;
+                    obs_idx++;
 
-                // 获取特征点的像素坐标
-                Vector2d uv = it_per_id.feature_per_frame[idx].uv;
+                    // Skip if first observation (same frame)
+                    if (imu_i == imu_j)
+                        continue;
 
-                // 边界检查
-                int u = static_cast<int>(uv.x() + 0.5);
-                int v = static_cast<int>(uv.y() + 0.5);
-                if (v < 0 || v >= depth_map.rows || u < 0 || u >= depth_map.cols)
-                    continue;
+                    // Skip if no aligned depth available from frontend
+                    if (it_per_frame.aligned_depth <= 0.0 || it_per_frame.aligned_sigma <= 0.0)
+                        continue;
 
-                // 查找测量值：从深度图中提取预测的逆深度
-                // 假设 MiDaS 输出是 CV_32F 格式的归一化逆深度
-                double d_nn = static_cast<double>(depth_map.at<float>(v, u));
+                    features_with_aligned_depth++;
 
-                // 检查测量值有效性
-                const double min_valid_inv_depth = 1e-6;
-                const double max_valid_inv_depth = 100.0;
-                if (d_nn <= min_valid_inv_depth || d_nn > max_valid_inv_depth)
-                    continue;  // 无效测量
+                    // ================================================================
+                    // Chi-Square Gatekeeper: Reject outliers before adding to problem
+                    // ================================================================
 
-                // 创建深度因子
-                DepthFactor* depth_factor = new DepthFactor(d_nn, pts_i);
+                    // Step 1: Instantiate the dual-parameter depth factor
+                    DepthFactorDualParam* depth_factor = new DepthFactorDualParam(
+                        it_per_frame.aligned_depth,   // Frontend-aligned depth (d_aligned = s * d_mean + t)
+                        it_per_frame.aligned_sigma,   // Frontend-aligned uncertainty (sigma_aligned = s * sigma_tta)
+                        pts_i                         // Feature point in frame i
+                    );
 
-                // 添加残差块：连接 Pose_i, Pose_j, Ex_Pose, Feature, ScaleShift
-                problem.AddResidualBlock(depth_factor, depth_loss_function,
-                    para_Pose[first_obs_frame_id],     // 首次观测帧位姿
-                    para_Pose[current_obs_frame_id],   // 当前观测帧位姿
-                    para_Ex_Pose[0],                   // 外参
-                    para_Feature[feature_index],       // 特征点逆深度
-                    para_DepthScaleShift[0]);          // 尺度偏移参数
+                    // Step 2: Prepare parameter block pointers for manual evaluation (6 blocks now)
+                    const double* parameter_blocks[6] = {
+                        para_Pose[imu_i],            // [0] First observation pose
+                        para_Pose[imu_j],            // [1] Current frame pose
+                        para_Ex_Pose[0],             // [2] IMU-camera extrinsics
+                        para_Feature[feature_index], // [3] Feature inverse depth
+                        para_depth_scale[imu_j],     // [4] Scale parameter (a)
+                        para_depth_shift[imu_j]      // [5] Shift parameter (b)
+                    };
 
-                depth_factor_cnt++;
+                    // Step 3: Manually evaluate residual at current parameter values
+                    double residual = 0.0;
+                    bool eval_success = depth_factor->Evaluate(parameter_blocks, &residual, nullptr);
+
+                    if (!eval_success)
+                    {
+                        ROS_WARN_THROTTLE(1.0, "[Backend] DepthFactor evaluation failed for feature %d", it_per_id.feature_id);
+                        delete depth_factor;  // Prevent memory leak
+                        depth_factor_rejected++;
+                        continue;
+                    }
+
+                    // Step 4: Compute chi-square error
+                    // Note: residual is already weighted by sqrt_info in DepthFactor::Evaluate
+                    double chi2 = residual * residual;
+
+                    // ================================================================
+                    // Visualization: Collect debug info for Rviz
+                    // ================================================================
+                    // Compute 3D feature position in world frame for visualization
+                    Eigen::Vector3d pts_camera_i = pts_i / para_Feature[feature_index][0];
+                    Eigen::Quaterniond Q_i(para_Pose[imu_i][6], para_Pose[imu_i][3],
+                                          para_Pose[imu_i][4], para_Pose[imu_i][5]);
+                    Eigen::Vector3d P_i(para_Pose[imu_i][0], para_Pose[imu_i][1], para_Pose[imu_i][2]);
+                    Eigen::Quaterniond Q_ic(para_Ex_Pose[0][6], para_Ex_Pose[0][3],
+                                           para_Ex_Pose[0][4], para_Ex_Pose[0][5]);
+                    Eigen::Vector3d P_ic(para_Ex_Pose[0][0], para_Ex_Pose[0][1], para_Ex_Pose[0][2]);
+
+                    Eigen::Vector3d pts_imu_i = Q_ic * pts_camera_i + P_ic;
+                    Eigen::Vector3d pts_world = Q_i * pts_imu_i + P_i;
+
+                    // Camera position in world frame (for current observation frame j)
+                    Eigen::Quaterniond Q_j(para_Pose[imu_j][6], para_Pose[imu_j][3],
+                                          para_Pose[imu_j][4], para_Pose[imu_j][5]);
+                    Eigen::Vector3d P_j(para_Pose[imu_j][0], para_Pose[imu_j][1], para_Pose[imu_j][2]);
+                    Eigen::Vector3d camera_pos_world = Q_j * P_ic + P_j;
+
+                    // Step 5: Threshold check
+                    if (chi2 > CHI2_THRESHOLD)
+                    {
+                        // REJECT: This is an outlier - collect debug info and delete factor
+                        DepthConstraintDebugInfo debug_info;
+                        debug_info.feature_pos_world = pts_world;
+                        debug_info.camera_pos_world = camera_pos_world;
+                        debug_info.accepted = false;
+                        debug_info.chi2_value = chi2;
+                        debug_info.feature_id = it_per_id.feature_id;
+                        depth_constraint_debug_info.push_back(debug_info);
+
+                        ROS_DEBUG_THROTTLE(0.5, "[Backend] Rejected DepthFactor: chi2=%.2f > %.2f (feature %d, frame %d->%d, depth=%.2f)",
+                                           chi2, CHI2_THRESHOLD, it_per_id.feature_id, imu_i, imu_j, it_per_frame.aligned_depth);
+                        delete depth_factor;  // CRITICAL: Prevent memory leak
+                        depth_factor_rejected++;
+                        continue;
+                    }
+
+                    // Step 6: ACCEPT - Collect debug info and add to optimization problem
+                    DepthConstraintDebugInfo debug_info;
+                    debug_info.feature_pos_world = pts_world;
+                    debug_info.camera_pos_world = camera_pos_world;
+                    debug_info.accepted = true;
+                    debug_info.chi2_value = chi2;
+                    debug_info.feature_id = it_per_id.feature_id;
+                    depth_constraint_debug_info.push_back(debug_info);
+
+                    // Use Huber loss for additional robustness against residual outliers
+                    ceres::LossFunction* depth_loss = new ceres::HuberLoss(1.0);
+
+                    // Add residual block with dual-parameter structure:
+                    // [0] para_Pose[imu_i]        - First observation pose
+                    // [1] para_Pose[imu_j]        - Current frame pose
+                    // [2] para_Ex_Pose[0]         - Extrinsics
+                    // [3] para_Feature[...]       - Feature inverse depth
+                    // [4] para_depth_scale[imu_j] - Per-frame scale (a)
+                    // [5] para_depth_shift[imu_j] - Per-frame shift (b)
+                    ceres::ResidualBlockId depth_id = problem.AddResidualBlock(depth_factor, depth_loss,
+                        para_Pose[imu_i],
+                        para_Pose[imu_j],
+                        para_Ex_Pose[0],
+                        para_Feature[feature_index],
+                        para_depth_scale[imu_j],  // Scale parameter
+                        para_depth_shift[imu_j]); // Shift parameter
+
+                    depth_block_ids.push_back(depth_id);  // 捕获深度因子ID
+                    depth_factor_cnt++;
+                }
             }
-        }
 
-        ROS_DEBUG("depth factor count: %d, time: %.2f ms", depth_factor_cnt, t_depth_factor.toc());
+            ROS_DEBUG("Hierarchical depth factors: %d (rejected %d), time: %.2f ms",
+                      depth_factor_cnt, depth_factor_rejected, t_depth_factor.toc());
 
-        // 输出深度约束信息（添加更多诊断信息）
-        if (depth_factor_cnt > 0)
-        {
-            ROS_INFO_THROTTLE(10.0,"[Backend] Depth factors: %d (checked %d features, %d frames with depth) | a=%.6f, b=%.6f",
-                     depth_factor_cnt, features_checked, frames_with_depth, DEPTH_SCALE_A, DEPTH_SHIFT_B);
-        }
-        else
-        {
-            static int no_depth_count = 0;
-            no_depth_count++;
-            if (no_depth_count % 5 == 1)  // 每5帧打印一次
+            if (depth_factor_cnt > 0)
             {
-                ROS_WARN_THROTTLE(5.0,
-                         "[Backend] No depth factors! (checked %d features, %d frames with depth maps)",
-                         features_checked, frames_with_depth);
-            }
-        }
-
-        // --- 添加随机游走先验因子 (Random Walk Prior) ---
-        // 如果有上一次的参数值，添加随机游走先验约束参数变化不要太大
-        // 即使没有深度因子，这个先验也能提供约束，避免参数发散
-        if (has_last_depth_params && solver_flag == NON_LINEAR)
-        {
-            // 根据是否是第一次优化来决定随机游走噪声的大小
-            double current_rw_a = DEPTH_A_RANDOM_WALK;
-            double current_rw_b = DEPTH_B_RANDOM_WALK;
-
-            // 如果是第一次优化，放松约束 100 倍，允许参数从错误的初始化跳转到正确值
-            // 这对于从糟糕的 SFM 初始化恢复非常重要
-            if (is_first_depth_optimization)
-            {
-                current_rw_a *= 100.0;
-                current_rw_b *= 100.0;
-                ROS_WARN("[Depth Opt] Relaxing random walk constraint for FIRST optimization (sigma_a: %.6f -> %.6f, sigma_b: %.6f -> %.6f)",
-                         DEPTH_A_RANDOM_WALK, current_rw_a, DEPTH_B_RANDOM_WALK, current_rw_b);
-            }
-
-            // 创建随机游走先验因子
-            DepthScaleShiftRandomWalkFactor* random_walk_factor =
-                new DepthScaleShiftRandomWalkFactor(
-                    last_depth_a, last_depth_b,
-                    current_rw_a, current_rw_b);
-
-            // 添加残差块（不使用鲁棒核函数，因为这是一个软约束）
-            problem.AddResidualBlock(random_walk_factor, nullptr, para_DepthScaleShift[0]);
-
-            ROS_DEBUG("[Backend] Added random walk prior: last_a=%.6f, last_b=%.6f, sigma_a=%.6f, sigma_b=%.6f",
-                     last_depth_a, last_depth_b, current_rw_a, current_rw_b);
-        }
-        else if (solver_flag == NON_LINEAR)
-        {
-            // 第一次优化，没有先验，但如果有深度因子就不需要固定参数
-            if (depth_factor_cnt == 0)
-            {
-                // 没有深度因子也没有先验，必须固定参数避免欠约束
-                ROS_DEBUG("No depth factors and no prior, fixing para_DepthScaleShift");
-                problem.SetParameterBlockConstant(para_DepthScaleShift[0]);
+                double rejection_rate = 100.0 * depth_factor_rejected / (depth_factor_cnt + depth_factor_rejected);
+                ROS_INFO_THROTTLE(10.0, "[Backend] Depth factors: %d accepted, %d rejected (%.1f%%) | checked %d features, %d with aligned depth",
+                                 depth_factor_cnt, depth_factor_rejected, rejection_rate, features_checked, features_with_aligned_depth);
             }
             else
             {
-                ROS_INFO_THROTTLE(5.0, "[Backend] First optimization with depth factors, no random walk prior yet");
+                static int no_depth_count = 0;
+                no_depth_count++;
+                if (no_depth_count % 5 == 1)
+                {
+                    ROS_WARN_THROTTLE(5.0, "[Backend] No depth factors! (checked %d features, %d with aligned depth, %d rejected by chi2 test)",
+                                     features_checked, features_with_aligned_depth, depth_factor_rejected);
+                }
             }
         }
     }
@@ -2598,15 +2486,159 @@ void Estimator::optimization()
         options.max_solver_time_in_seconds = SOLVER_TIME * 4.0 / 5.0;
     else
         options.max_solver_time_in_seconds = SOLVER_TIME;
-        
+
     TicToc t_solver;
     ceres::Solver::Summary summary;
     ceres::Solve(options, &problem, &summary);
     ROS_DEBUG("Iterations : %d", static_cast<int>(summary.iterations.size()));
     ROS_DEBUG("solver costs: %f", t_solver.toc());
 
+    // ========================================================================
+    // Cost Monitor & Tuning Assistant: 分析视觉和深度成本平衡
+    // ========================================================================
+    if (ESTIMATE_DEPTH_SCALE_SHIFT && !visual_block_ids.empty() && !depth_block_ids.empty())
+    {
+        // 1. 计算视觉因子的总成本
+        ceres::Problem::EvaluateOptions eval_options;
+        eval_options.residual_blocks = visual_block_ids;
+        double total_visual_cost = 0.0;
+        problem.Evaluate(eval_options, &total_visual_cost, nullptr, nullptr, nullptr);
+
+        // 2. 计算深度因子的总成本
+        eval_options.residual_blocks = depth_block_ids;
+        double total_depth_cost = 0.0;
+        problem.Evaluate(eval_options, &total_depth_cost, nullptr, nullptr, nullptr);
+
+        // 3. 计算平均成本
+        double avg_visual_cost = total_visual_cost / visual_block_ids.size();
+        double avg_depth_cost = total_depth_cost / depth_block_ids.size();
+
+        // 4. 计算成本平衡比率
+        double balance_ratio = avg_depth_cost / (avg_visual_cost + 1e-10);  // 避免除零
+
+        // 5. 记录Balance Ratio到文件 (每次优化都记录)
+        logBalanceRatio(balance_ratio, avg_visual_cost, avg_depth_cost,
+                       visual_block_ids.size(), depth_block_ids.size(), DEPTH_WEIGHT_K);
+
+        // 6. 生成调参建议
+        std::string advice;
+        std::string status_icon;
+        if (balance_ratio < 0.2) {
+            advice = "K is too LARGE -> Depth constraint is WEAK -> Decrease K";
+            status_icon = "[TOO WEAK]";
+        } else if (balance_ratio > 5.0) {
+            advice = "K is too SMALL -> Depth constraint is STRONG -> Increase K";
+            status_icon = "[TOO STRONG]";
+        } else {
+            advice = "K is GOOD -> Costs are balanced";
+            status_icon = "[OK]";
+        }
+
+        // 7. 输出报告 (每10帧输出一次,避免刷屏)
+        static int report_counter = 0;
+        static int weak_count = 0;   // 统计太弱的次数
+        static int good_count = 0;   // 统计合适的次数
+        static int strong_count = 0; // 统计太强的次数
+        static double sum_ratio = 0.0; // 累计比率
+
+        // 更新统计
+        if (balance_ratio < 0.2) weak_count++;
+        else if (balance_ratio > 5.0) strong_count++;
+        else good_count++;
+        sum_ratio += balance_ratio;
+
+        if (report_counter % 10 == 0) {
+            // 使用 ostringstream 构建格式化字符串,避免 printf 格式问题
+            int total_count = weak_count + good_count + strong_count;
+            double avg_ratio = (total_count > 0) ? (sum_ratio / total_count) : 0.0;
+
+            // ========================================================================
+            // 统计 para_depth_scale 和 para_depth_shift 的分布
+            // ========================================================================
+            double a_sum = 0.0, b_sum = 0.0;
+            double a_min = 1e6, a_max = -1e6;
+            double b_min = 1e6, b_max = -1e6;
+            int a_count = 0;
+
+            for (int i = 0; i <= frame_count; i++) {
+                double a_val = para_depth_scale[i][0];
+                double b_val = para_depth_shift[i][0];
+                a_sum += a_val;
+                b_sum += b_val;
+                a_count++;
+                if (a_val < a_min) a_min = a_val;
+                if (a_val > a_max) a_max = a_val;
+                if (b_val < b_min) b_min = b_val;
+                if (b_val > b_max) b_max = b_val;
+            }
+
+            double a_avg = (a_count > 0) ? (a_sum / a_count) : 1.0;
+            double b_avg = (a_count > 0) ? (b_sum / a_count) : 0.0;
+            double a_range = a_max - a_min;
+            double b_range = b_max - b_min;
+
+            std::ostringstream oss;
+            oss << "\n"
+                << "========================================\n"
+                << " Cost Monitor & Tuning Assistant\n"
+                << "========================================\n"
+                << "  Current K:       " << std::fixed << std::setprecision(4) << DEPTH_WEIGHT_K << "\n"
+                << "  Visual Factors:  " << visual_block_ids.size() << " blocks, Avg Cost = "
+                << std::setprecision(6) << avg_visual_cost << "\n"
+                << "  Depth Factors:   " << depth_block_ids.size() << " blocks, Avg Cost = "
+                << std::setprecision(6) << avg_depth_cost << "\n"
+                << "  Balance Ratio:   " << std::setprecision(4) << balance_ratio
+                << " (Depth/Visual) " << status_icon << "\n"
+                << "----------------------------------------\n"
+                << "  Advice: " << advice << "\n"
+                << "----------------------------------------\n"
+                << "  Statistics (since start):\n"
+                << "    Total optimizations: " << total_count << "\n"
+                << "    Average Ratio:       " << std::setprecision(4) << avg_ratio << "\n"
+                << "    Too weak  (<0.2):    " << weak_count
+                << " (" << std::setprecision(1) << (100.0*weak_count/total_count) << "%)\n"
+                << "    Good [0.2-5.0]:      " << good_count
+                << " (" << std::setprecision(1) << (100.0*good_count/total_count) << "%)\n"
+                << "    Too strong (>5.0):   " << strong_count
+                << " (" << std::setprecision(1) << (100.0*strong_count/total_count) << "%)\n"
+                << "----------------------------------------\n"
+                << "  Dual-Parameter Depth (Per-frame):\n"
+                << "    Window frames:       " << a_count << "\n"
+                << "    Scale (a)  Average:  " << std::setprecision(4) << a_avg << "\n"
+                << "    Scale (a)  Range:    [" << std::setprecision(4) << a_min
+                << ", " << std::setprecision(4) << a_max << "]  (Δ=" << a_range << ")\n"
+                << "    Shift (b)  Average:  " << std::setprecision(6) << b_avg << "\n"
+                << "    Shift (b)  Range:    [" << std::setprecision(6) << b_min
+                << ", " << std::setprecision(6) << b_max << "]  (Δ=" << b_range << ")\n"
+                << "    Spread:              " << std::setprecision(4) << a_range << "\n";
+
+            // 判断 para_a 是否健康 (期望在1.0附近波动, 偏离不超过±0.5)
+            if (std::abs(a_avg - 1.0) < 0.2 && a_range < 0.5) {
+                oss << "    Status:              [STABLE] near 1.0\n";
+            } else if (std::abs(a_avg - 1.0) < 0.5) {
+                oss << "    Status:              [OK] reasonable variation\n";
+            } else {
+                oss << "    Status:              [DRIFT] deviating from 1.0!\n";
+            }
+
+            oss << "----------------------------------------\n"
+                << "  Target: Ratio ~= 1.0 (Equal contribution)\n"
+                << "  Range:  [0.2, 5.0] is acceptable\n"
+                << "========================================";
+
+            ROS_INFO("%s", oss.str().c_str());
+        }
+        report_counter++;
+    }
+    // ========================================================================
+
     // 将优化结果转换回系统状态变量
     double2vector();
+
+    // 记录 para_a_global 到文件（用于画图分析）
+    if (ESTIMATE_DEPTH_SCALE_SHIFT) {
+        logParaAGlobal();
+    }
 
     // 4. 处理边缘化
     TicToc t_whole_marginalization;
@@ -2692,102 +2724,26 @@ void Estimator::optimization()
         }
 
         // --- 深度传感器因子约束：将与frame 0相关的深度因子添加到边缘化 (Backend Depth Constraint) ---
+        // TODO: Update depth factor marginalization for hierarchical architecture
+        // The old code below used legacy DepthFactor(d_nn, pts_i) constructor
+        // with para_DepthScaleShift. The new architecture uses DepthFactor with
+        // aligned_depth and aligned_sigma from frontend alignment.
+        // For now, skip depth factors in marginalization.
         if (ESTIMATE_DEPTH_SCALE_SHIFT)
         {
-            // 创建鲁棒核函数（必须与optimization中使用的一致）
-            ceres::LossFunction *depth_loss_function = new ceres::CauchyLoss(DEPTH_FACTOR_HUBER_THRESHOLD);
-
-            int feature_index = -1;
-            for (auto &it_per_id : f_manager.feature)
+            /*
+            OLD DEPTH FACTOR MARGINALIZATION CODE - NEEDS UPDATE
             {
-                // 使用与视觉约束相同的筛选条件
-                if (!(it_per_id.used_num >= 2 && it_per_id.start_frame < WINDOW_SIZE - 2))
-                    continue;
+                // 创建鲁棒核函数（必须与optimization中使用的一致）
+                ceres::LossFunction *depth_loss_function = new ceres::CauchyLoss(DEPTH_FACTOR_HUBER_THRESHOLD);
 
-                ++feature_index;
-
-                int first_obs_frame_id = it_per_id.start_frame;
-                Vector3d pts_i = it_per_id.feature_per_frame[0].point;
-
-                // 遍历该特征点的所有观测
-                for (int idx = 0; idx < it_per_id.feature_per_frame.size(); idx++)
+                int feature_index = -1;
+                for (auto &it_per_id : f_manager.feature)
                 {
-                    int current_obs_frame_id = it_per_id.start_frame + idx;
-
-                    // 只添加与frame 0相关的因子到边缘化
-                    // 条件：首次观测帧是0 或 当前观测帧是0
-                    if (first_obs_frame_id != 0 && current_obs_frame_id != 0)
-                        continue;
-
-                    // 避免重复参数块：如果首次观测帧和当前观测帧是同一帧，跳过
-                    if (first_obs_frame_id == current_obs_frame_id)
-                        continue;
-
-                    // 找到对应的 ImageFrame
-                    double timestamp = Headers[current_obs_frame_id].stamp.toSec();
-                    auto frame_it = all_image_frame.find(timestamp);
-
-                    // 检查深度图是否已计算
-                    if (frame_it == all_image_frame.end() || !frame_it->second.depth_map_computed)
-                        continue;
-
-                    auto& frame = frame_it->second;
-                    const cv::Mat& depth_map = frame.predicted_depth_map;
-
-                    // 获取特征点的像素坐标
-                    Vector2d uv = it_per_id.feature_per_frame[idx].uv;
-
-                    // 边界检查
-                    int u = static_cast<int>(uv.x() + 0.5);
-                    int v = static_cast<int>(uv.y() + 0.5);
-                    if (v < 0 || v >= depth_map.rows || u < 0 || u >= depth_map.cols)
-                        continue;
-
-                    // 查找测量值
-                    double d_nn = static_cast<double>(depth_map.at<float>(v, u));
-
-                    // 检查测量值有效性
-                    const double min_valid_inv_depth = 1e-6;
-                    const double max_valid_inv_depth = 10.0;
-                    if (d_nn <= min_valid_inv_depth || d_nn > max_valid_inv_depth)
-                        continue;
-
-                    // 创建深度因子
-                    DepthFactor* depth_factor = new DepthFactor(d_nn, pts_i);
-
-                    // 定义参数块
-                    std::vector<double*> para_blocks = {
-                        para_Pose[first_obs_frame_id],
-                        para_Pose[current_obs_frame_id],
-                        para_Ex_Pose[0],
-                        para_Feature[feature_index],
-                        para_DepthScaleShift[0]
-                    };
-
-                    // 定义哪些参数块需要被丢弃（边缘化）
-                    std::vector<int> drop_set;
-                    if (first_obs_frame_id == 0)
-                        drop_set.push_back(0);  // para_Pose[0]
-                    if (current_obs_frame_id == 0)
-                        drop_set.push_back(1);  // para_Pose[0] (if first_obs != 0)
-                    // 如果特征的起始帧是0，特征也会被边缘化
-                    if (it_per_id.start_frame == 0 && it_per_id.feature_per_frame.size() == 1)
-                        drop_set.push_back(3);  // para_Feature (只有一个观测的特征)
-
-                    // 如果没有需要边缘化的参数块，跳过
-                    if (drop_set.empty())
-                    {
-                        delete depth_factor;
-                        continue;
-                    }
-
-                    // 添加到边缘化信息
-                    ResidualBlockInfo *residual_block_info = new ResidualBlockInfo(
-                        depth_factor, depth_loss_function, para_blocks, drop_set);
-
-                    marginalization_info->addResidualBlockInfo(residual_block_info);
+                    // ... old code that uses depth_map and para_DepthScaleShift ...
                 }
             }
+            */
         }
 
         // 执行边缘化，计算先验信息
@@ -2812,11 +2768,15 @@ void Estimator::optimization()
         {
             addr_shift[reinterpret_cast<long>(para_Td[0])] = para_Td[0];
         }
-        // --- 深度传感器因子约束：添加ScaleShift参数块地址映射 (Backend Depth Constraint) ---
-        // para_DepthScaleShift是全局参数，在滑动窗口中保持不变
+        // --- Dual-Parameter Depth: Add address mappings for scale and shift ---
+        // Both para_depth_scale and para_depth_shift are per-frame parameters
         if (ESTIMATE_DEPTH_SCALE_SHIFT)
         {
-            addr_shift[reinterpret_cast<long>(para_DepthScaleShift[0])] = para_DepthScaleShift[0];
+            for (int i = 0; i <= WINDOW_SIZE; i++)
+            {
+                addr_shift[reinterpret_cast<long>(para_depth_scale[i])] = para_depth_scale[i];
+                addr_shift[reinterpret_cast<long>(para_depth_shift[i])] = para_depth_shift[i];
+            }
         }
         vector<double *> parameter_blocks = marginalization_info->getParameterBlocks(addr_shift);
 
@@ -2884,10 +2844,14 @@ void Estimator::optimization()
             {
                 addr_shift[reinterpret_cast<long>(para_Td[0])] = para_Td[0];
             }
-            // --- 深度传感器因子约束：添加ScaleShift参数块地址映射 (Backend Depth Constraint) ---
+            // --- Dual-Parameter Depth: Add address mappings for scale and shift ---
             if (ESTIMATE_DEPTH_SCALE_SHIFT)
             {
-                addr_shift[reinterpret_cast<long>(para_DepthScaleShift[0])] = para_DepthScaleShift[0];
+                for (int i = 0; i <= WINDOW_SIZE; i++)
+                {
+                    addr_shift[reinterpret_cast<long>(para_depth_scale[i])] = para_depth_scale[i];
+                    addr_shift[reinterpret_cast<long>(para_depth_shift[i])] = para_depth_shift[i];
+                }
             }
 
             vector<double *> parameter_blocks = marginalization_info->getParameterBlocks(addr_shift);
@@ -2899,7 +2863,7 @@ void Estimator::optimization()
         }
     }
     ROS_DEBUG("whole marginalization costs: %f", t_whole_marginalization.toc());
-    
+
     ROS_DEBUG("whole time for ceres: %f", t_whole.toc());
 }
 
@@ -2944,6 +2908,13 @@ void Estimator::slideWindow()
                 Vs[i].swap(Vs[i + 1]);
                 Bas[i].swap(Bas[i + 1]);
                 Bgs[i].swap(Bgs[i + 1]);
+
+                // === Shift dual-parameter depth forward (discard oldest) ===
+                para_depth_scale[i][0] = para_depth_scale[i + 1][0];
+                para_depth_shift[i][0] = para_depth_shift[i + 1][0];
+
+                // --- Adaptive Backfill: 移动深度对齐标记 ---
+                depth_aligned[i] = depth_aligned[i + 1];
             }
             // 新的最后一帧状态暂时与前一帧相同
             Headers[WINDOW_SIZE] = Headers[WINDOW_SIZE - 1];
@@ -2952,6 +2923,13 @@ void Estimator::slideWindow()
             Rs[WINDOW_SIZE] = Rs[WINDOW_SIZE - 1];
             Bas[WINDOW_SIZE] = Bas[WINDOW_SIZE - 1];
             Bgs[WINDOW_SIZE] = Bgs[WINDOW_SIZE - 1];
+
+            // === Initialize new frame's dual parameters ===
+            para_depth_scale[WINDOW_SIZE][0] = 1.0;
+            para_depth_shift[WINDOW_SIZE][0] = 0.0;
+
+            // --- Adaptive Backfill: 新帧未对齐 ---
+            depth_aligned[WINDOW_SIZE] = false;
 
             // 为新的最后一帧创建预积分对象
             delete pre_integrations[WINDOW_SIZE];
@@ -3008,6 +2986,13 @@ void Estimator::slideWindow()
             Bas[frame_count - 1] = Bas[frame_count];
             Bgs[frame_count - 1] = Bgs[frame_count];
 
+            // === Reset newest frame's dual parameters (MARGIN_SECOND_NEW) ===
+            para_depth_scale[WINDOW_SIZE][0] = 1.0;
+            para_depth_shift[WINDOW_SIZE][0] = 0.0;
+
+            // --- Adaptive Backfill: 新帧未对齐 ---
+            depth_aligned[WINDOW_SIZE] = false;
+
             // 为新的最后一帧创建预积分对象
             delete pre_integrations[WINDOW_SIZE];
             pre_integrations[WINDOW_SIZE] = new IntegrationBase{acc_0, gyr_0, Bas[WINDOW_SIZE], Bgs[WINDOW_SIZE]};
@@ -3028,7 +3013,9 @@ void Estimator::slideWindow()
 void Estimator::slideWindowNew()
 {
     sum_of_front++;
-    f_manager.removeFront(frame_count);
+    // 使用 getCurrentFrameIndex() 明确表示"被边缘化帧的索引"
+    // 在 MARGIN_SECOND_NEW 策略下，被边缘化的是当前帧(最新帧)
+    f_manager.removeFront(getCurrentFrameIndex());
 }
 
 /**
@@ -3199,6 +3186,170 @@ void Estimator::assignEstimatedDepthFromFastInit()
  *
  * 每10帧记录一次，包括IMU数据、运动评分、权重、Huber阈值和深度参数
  */
+/**
+ * @brief 记录当前滑窗中所有帧的 dual-parameter depth 值到CSV文件
+ *
+ * **输出格式**:
+ * timestamp,global_frame_id,frame_0_a,frame_0_b,...,frame_10_a,frame_10_b,avg_a,avg_b,min_a,max_a,min_b,max_b
+ *
+ * **调用时机**: 每次优化后调用
+ */
+void Estimator::logParaAGlobal()
+{
+    if (!para_a_log_file.is_open())
+        return;
+
+    // 计算统计信息
+    double a_sum = 0.0, b_sum = 0.0;
+    double a_min = 1e6, a_max = -1e6;
+    double b_min = 1e6, b_max = -1e6;
+
+    for (int i = 0; i <= frame_count; i++) {
+        double a_val = para_depth_scale[i][0];
+        double b_val = para_depth_shift[i][0];
+        a_sum += a_val;
+        b_sum += b_val;
+        if (a_val < a_min) a_min = a_val;
+        if (a_val > a_max) a_max = a_val;
+        if (b_val < b_min) b_min = b_val;
+        if (b_val > b_max) b_max = b_val;
+    }
+
+    double a_avg = (frame_count + 1 > 0) ? (a_sum / (frame_count + 1)) : 1.0;
+    double b_avg = (frame_count + 1 > 0) ? (b_sum / (frame_count + 1)) : 0.0;
+    double a_spread = a_max - a_min;
+    double b_spread = b_max - b_min;
+
+    // 写入数据
+    para_a_log_file << std::fixed << std::setprecision(6)
+                    << Headers[frame_count].stamp.toSec() << ","
+                    << global_frame_count;
+
+    // 写入所有帧的 para_depth_scale 和 para_depth_shift 值
+    for (int i = 0; i <= WINDOW_SIZE; i++) {
+        if (i <= frame_count) {
+            para_a_log_file << "," << std::setprecision(6) << para_depth_scale[i][0]
+                            << "," << std::setprecision(8) << para_depth_shift[i][0];
+        } else {
+            para_a_log_file << ",,";  // 空白占位
+        }
+    }
+
+    // 写入统计信息
+    para_a_log_file << "," << std::setprecision(6) << a_avg
+                    << "," << std::setprecision(8) << b_avg
+                    << "," << a_min
+                    << "," << a_max
+                    << "," << b_min
+                    << "," << b_max
+                    << "," << a_spread
+                    << "," << b_spread << "\n";
+
+    // 定期刷新缓冲区
+    static int flush_counter = 0;
+    if (++flush_counter % 10 == 0) {
+        para_a_log_file.flush();
+    }
+}
+
+/**
+ * @brief 记录每次优化的Balance Ratio到文件
+ * @param balance_ratio 平衡比率 (depth_cost / visual_cost)
+ * @param avg_visual_cost 视觉因子的平均成本
+ * @param avg_depth_cost 深度因子的平均成本
+ * @param visual_count 视觉因子数量
+ * @param depth_count 深度因子数量
+ * @param current_K 当前的深度权重K值
+ */
+void Estimator::logBalanceRatio(double balance_ratio, double avg_visual_cost, double avg_depth_cost,
+                                int visual_count, int depth_count, double current_K)
+{
+    if (!balance_ratio_log_file.is_open())
+        return;
+
+    // 写入数据
+    balance_ratio_log_file << std::fixed << std::setprecision(6)
+                          << Headers[frame_count].stamp.toSec() << ","
+                          << global_frame_count << ","
+                          << std::setprecision(6) << balance_ratio << ","
+                          << avg_visual_cost << ","
+                          << avg_depth_cost << ","
+                          << visual_count << ","
+                          << depth_count << ","
+                          << std::setprecision(4) << current_K << "\n";
+
+    // 定期刷新缓冲区
+    static int flush_counter = 0;
+    if (++flush_counter % 10 == 0) {
+        balance_ratio_log_file.flush();
+    }
+}
+
+/**
+ * @brief 检查系统稳定性(IMU偏置是否收敛)
+ * @return true 如果加速度偏置标准差 < 0.1
+ *
+ * 在滑动窗口中计算 Bas(加速度偏置)的标准差,
+ * 如果 std_dev(Bas) < 0.1 则认为系统已稳定,可以启用深度融合。
+ * 该状态一旦为true就会锁定(is_depth_fusion_ready标志位),不会再变回false。
+ */
+bool Estimator::checkSystemStability()
+{
+    // 如果已经标记为就绪,直接返回true(锁定状态)
+    if (is_depth_fusion_ready)
+        return true;
+
+    // 只在NON_LINEAR状态下检查稳定性
+    if (solver_flag != NON_LINEAR)
+        return false;
+
+    // 需要至少有窗口满了才能计算
+    if (frame_count < WINDOW_SIZE)
+        return false;
+
+    // 计算滑动窗口中 Bas (加速度偏置) 的均值和标准差
+    Eigen::Vector3d sum_Bas = Eigen::Vector3d::Zero();
+    for (int i = 0; i <= WINDOW_SIZE; i++)
+    {
+        sum_Bas += Bas[i];
+    }
+    Eigen::Vector3d mean_Bas = sum_Bas / (WINDOW_SIZE + 1);
+
+    // 计算方差
+    double variance = 0.0;
+    for (int i = 0; i <= WINDOW_SIZE; i++)
+    {
+        Eigen::Vector3d diff = Bas[i] - mean_Bas;
+        variance += diff.squaredNorm();
+    }
+    variance /= (WINDOW_SIZE + 1);
+
+    // 标准差
+    double std_dev = std::sqrt(variance);
+
+    // 阈值检查
+    const double STABILITY_THRESHOLD = 0.1;
+
+    if (std_dev < STABILITY_THRESHOLD)
+    {
+        // 系统已稳定，锁定状态
+        if (!is_depth_fusion_ready)
+        {
+            is_depth_fusion_ready = true;
+            ROS_INFO("[Backend] ✓ IMU bias converged! std_dev(Bas)=%.4f < %.2f - Depth fusion ACTIVATED",
+                     std_dev, STABILITY_THRESHOLD);
+        }
+        return true;
+    }
+    else
+    {
+        // 系统尚未稳定
+        ROS_DEBUG_THROTTLE(2.0, "[Backend] IMU bias not yet converged: std_dev(Bas)=%.4f >= %.2f",
+                          std_dev, STABILITY_THRESHOLD);
+        return false;
+    }
+}
+
 void Estimator::logDepthFusionMetrics(int frame_id, double gyro_norm, double acc_disturbance,
                                       double raw_score, double smoothed_score, double weight,
                                       double huber_threshold, double scale_a, double shift_b)
@@ -3228,4 +3379,359 @@ void Estimator::logDepthFusionMetrics(int frame_id, double gyro_norm, double acc
     {
         depth_fusion_log_file.flush();
     }
+}
+
+/**
+ * @brief 尝试将在线深度提供者的TTA结果存储到ImageFrame（异步非阻塞）
+ *
+ * **功能说明**：
+ * - 从 OnlineDepthProvider 获取已完成的 TTA 深度推理结果
+ * - 将结果存储到对应的 ImageFrame.predicted_depth_map 中
+ * - 仅存储已完成的结果，未完成的跳过（不阻塞）
+ *
+ * **调用时机**：
+ * - 在 solveOdometry() 开始时调用
+ * - 在 computeBackendDepthMaps() 之前调用
+ * - 为后端优化准备 TTA 深度图
+ *
+ * **存储策略**：
+ * - TTA 深度图使用 depth_mean（忽略 depth_sigma）
+ * - 存储到 ImageFrame.predicted_depth_map（统一存储位置）
+ * - 设置 depth_map_computed = true 标记可用
+ *
+ * **注意事项**：
+ * - 异步非阻塞：只存储已完成的结果
+ * - 未完成的帧由 computeBackendDepthMaps() 补充（使用同步推理）
+ * - TTA 深度优先级高于同步深度（更准确）
+ */
+void Estimator::tryStoreOnlineDepthToImageFrame()
+{
+    // 前置条件检查：需要在线深度提供者就绪
+    if (!mp_online_depth_provider || !mp_online_depth_provider->isReady()) {
+        return;
+    }
+
+    int stored_count = 0;
+
+    // 遍历滑动窗口中的所有帧，尝试获取TTA深度结果
+    for (int i = 0; i <= WINDOW_SIZE; i++)
+    {
+        double timestamp = Headers[i].stamp.toSec();
+        auto frame_it = all_image_frame.find(timestamp);
+
+        if (frame_it == all_image_frame.end()) {
+            continue;  // 帧不存在，跳过
+        }
+
+        auto& frame = frame_it->second;
+
+        // 如果该帧已有深度图，跳过（避免重复存储）
+        if (frame.depth_map_computed) {
+            continue;
+        }
+
+        // 尝试从异步队列获取TTA深度结果
+        depth_estimation::DepthResult depth_result;
+        if (mp_online_depth_provider->getResult(timestamp, depth_result))
+        {
+            // 存储TTA深度均值图到ImageFrame
+            if (!depth_result.depth_mean.empty())
+            {
+                frame.predicted_depth_map = depth_result.depth_mean.clone();
+                frame.depth_map_computed = true;
+                stored_count++;
+                ROS_DEBUG("[TTA] Stored online depth for frame %d (t=%.3f)", i, timestamp);
+            }
+        }
+        // 注意：如果 getResult 返回 false，说明该帧的TTA推理尚未完成
+        // 这是正常的，computeBackendDepthMaps() 会用同步推理补充
+    }
+
+    if (stored_count > 0) {
+        ROS_DEBUG("[TTA] Stored %d online depth maps to ImageFrame", stored_count);
+    }
+}
+
+/**
+ * @brief 为滑动窗口中缺失深度图的帧计算深度（同步推理补充）
+ *
+ * **功能说明**：
+ * - 遍历滑动窗口，检查哪些帧缺少深度图
+ * - 使用 InitDepthProvider 同步推理补充缺失的深度图
+ * - 仅在 OnlineDepthProvider 未及时完成推理时使用
+ *
+ * **调用时机**：
+ * - 在 tryStoreOnlineDepthToImageFrame() 之后调用
+ * - 在 optimization() 之前调用
+ * - 确保后端优化有足够的深度信息用于约束
+ *
+ * **深度来源优先级**：
+ * 1. **TTA 深度（优先）** - 由 OnlineDepthProvider 提供（更准确）
+ * 2. **同步深度（备用）** - 由 InitDepthProvider 提供（保证可用性）
+ *
+ * **注意事项**：
+ * - 使用同步推理，会阻塞主线程（但只计算缺失的深度图）
+ * - TTA 深度如果在下一帧完成，会自动覆盖同步深度（更好的质量）
+ * - 深度图结果缓存在 ImageFrame.predicted_depth_map 中
+ */
+void Estimator::computeBackendDepthMaps()
+{
+    // 前置条件检查：需要启用深度约束且深度提供者就绪
+    if (!ESTIMATE_DEPTH_SCALE_SHIFT || !mp_init_depth_provider || !mp_init_depth_provider->isReady()) {
+        return;
+    }
+
+    TicToc t_depth_backend;
+    int depth_computed_count = 0;
+
+    // 遍历滑动窗口中的所有帧
+    for (int i = 0; i <= WINDOW_SIZE; i++)
+    {
+        double timestamp = Headers[i].stamp.toSec();
+        auto frame_it = all_image_frame.find(timestamp);
+
+        // 检查帧是否存在且有原始图像
+        if (frame_it != all_image_frame.end() && !frame_it->second.raw_image.empty())
+        {
+            auto& frame = frame_it->second;
+
+            // 如果该帧的深度图尚未计算，则使用同步推理补充（避免重复计算）
+            if (!frame.depth_map_computed)
+            {
+                if (mp_init_depth_provider->predict(frame.raw_image, frame.predicted_depth_map))
+                {
+                    frame.depth_map_computed = true;
+                    depth_computed_count++;
+                    ROS_DEBUG("[Sync] Computed backup depth for frame %d (t=%.3f)", i, timestamp);
+                }
+                else
+                {
+                    ROS_WARN("[Sync] Depth prediction failed for frame %d", i);
+                }
+            }
+        }
+    }
+
+    if (depth_computed_count > 0)
+    {
+        ROS_DEBUG("[Backend] Computed %d backup depth maps (%.1f ms)",
+                 depth_computed_count, t_depth_backend.toc());
+    }
+}
+
+/**
+ * @brief 自适应回填策略：遍历滑窗所有帧，尝试对齐未处理的深度
+ *
+ * **新策略逻辑**（取代固定滞后查询）：
+ * - VINS主循环(processImage)调用此函数
+ * - 遍历当前滑窗里的所有帧 frame[0] ~ frame[frame_count]
+ * - 检查每帧状态: 如果还没有被深度对齐过(!depth_aligned[i])
+ * - 去推理结果队列里查询 frame[i].timestamp
+ * - 回填(Backfill): 如果查到了,立即对这一帧执行SolveLinearAlignment,并标记为已对齐
+ * - 如果没查到: 跳过,等下一次processImage时再来查(给推理更多时间)
+ *
+ * **优势**：
+ * - 自适应延迟：无论推理是快（30ms）还是慢（300ms），只要帧还在滑窗里（通常滑窗覆盖1s~2s），
+ *   它最终都能被加上深度约束
+ * - 利用率最大化：不会因为设置了0.2s就浪费了0.05s就出来的结果，也不会因为0.21s而丢弃数据
+ *
+ * @return 本次回填成功对齐的帧数量
+ */
+int Estimator::backfillDepthAlignment()
+{
+    // 前置条件检查：需要在线深度提供者就绪
+    if (!mp_online_depth_provider || !mp_online_depth_provider->isReady()) {
+        return 0;
+    }
+
+    int aligned_count = 0;  // 统计本次成功对齐的帧数
+
+    // ========================================================================
+    // 自适应回填策略 (Adaptive Backfill Strategy)
+    // ========================================================================
+    // 遍历滑动窗口中的所有帧，尝试为未对齐的帧查询深度结果
+    // ========================================================================
+
+    for (int i = 0; i <= frame_count; i++)
+    {
+        // 跳过已经对齐过的帧
+        if (depth_aligned[i]) {
+            continue;
+        }
+
+        // 获取当前帧的时间戳
+        double frame_timestamp = Headers[i].stamp.toSec();
+
+        // 尝试从推理结果队列查询此帧的深度结果
+        depth_estimation::DepthResult depth_result;
+        if (mp_online_depth_provider->getResult(frame_timestamp, depth_result))
+        {
+            // 查询成功！执行深度对齐
+            double scale, shift;
+            TicToc t_align;
+
+            bool alignment_success = f_manager.SolveLinearAlignment(
+                i,                            // 当前帧索引
+                depth_result.depth_mean,      // TTA深度均值图
+                depth_result.depth_sigma,     // TTA深度标准差图
+                Ps, Rs,
+                tic[0], ric[0],
+                scale, shift
+            );
+
+            if (alignment_success) {
+                // 标记为已对齐
+                depth_aligned[i] = true;
+                aligned_count++;
+
+                ROS_INFO("[Backfill] Frame %d aligned: s=%.4f, t=%.4f (%.1f ms, timestamp=%.3f)",
+                         i, scale, shift, t_align.toc(), frame_timestamp);
+            } else {
+                // 对齐失败（可能是特征不足、负尺度等），但不标记为已对齐，下次可以重试
+                ROS_WARN("[Backfill] Alignment failed for frame %d (t=%.3f)",
+                        i, frame_timestamp);
+            }
+        }
+        // 如果查询失败（推理还没完成），什么都不做，等待下次回填
+    }
+
+    // 日志输出（每10次回填输出一次统计）
+    if (aligned_count > 0) {
+        ROS_INFO_THROTTLE(2.0, "[Backfill] Aligned %d frames in this call (window size: %d)",
+                 aligned_count, frame_count + 1);
+    }
+
+    return aligned_count;
+}
+
+/**
+ * @brief 【已废弃】滞后查询策略的深度对齐（已被 backfillDepthAlignment 取代）
+ *
+ * ⚠️ 此函数保留仅供参考，新策略请使用 backfillDepthAlignment()
+ */
+void Estimator::performFrontendDepthAlignment()
+{
+    // 前置条件检查：需要在线深度提供者就绪
+    if (!mp_online_depth_provider || !mp_online_depth_provider->isReady()) {
+        ROS_WARN_THROTTLE(5.0, "[Frontend] OnlineDepthProvider not ready");
+        return;
+    }
+
+    // ========================================================================
+    // 滞后查询策略 (Lagged Query Strategy)
+    // ========================================================================
+    // 问题: 当前帧刚推送,异步TTA推理需要50-200ms,立即查询必然失败
+    // 解决: 查询"前N帧"的深度结果,给推理留出时间
+    //
+    // 设计:
+    //   - lag_seconds = 0.2s (给TTA推理200ms的时间)
+    //   - 当前帧(t=1.0s)查询 t=0.8s 的深度结果
+    //   - 如果找到,为对应的历史帧对齐深度
+    //   - 窗口内的帧会逐步获得深度约束
+    // ========================================================================
+
+    const double lag_seconds = 0.2;  // 滞后时间: 200ms (可根据GPU性能调整)
+    double current_timestamp = Headers[frame_count].stamp.toSec();
+    double query_timestamp = current_timestamp - lag_seconds;
+
+    depth_estimation::DepthResult depth_result;
+
+    // 尝试获取滞后帧的TTA深度结果
+    if (mp_online_depth_provider->getResult(query_timestamp, depth_result))
+    {
+        // 找到了深度结果!现在需要找到对应的帧索引
+        // 在滑动窗口中查找时间戳最接近 query_timestamp 的帧
+        int target_frame_idx = -1;
+        double min_time_diff = 1e6;
+
+        for (int i = 0; i <= frame_count; i++) {
+            double time_diff = std::abs(Headers[i].stamp.toSec() - query_timestamp);
+            if (time_diff < min_time_diff) {
+                min_time_diff = time_diff;
+                target_frame_idx = i;
+            }
+        }
+
+        // 时间匹配阈值: 50ms (同一帧的容忍度)
+        const double time_match_threshold = 0.05;
+        if (target_frame_idx >= 0 && min_time_diff < time_match_threshold)
+        {
+            double scale, shift;
+            TicToc t_align;
+
+            ROS_INFO_THROTTLE(2.0, "[Frontend] Got depth result for t=%.3f (lagged query, target_frame=%d)",
+                             query_timestamp, target_frame_idx);
+
+            // 执行线性对齐: 为 target_frame_idx 对齐深度
+            bool alignment_success = f_manager.SolveLinearAlignment(
+                target_frame_idx,             // 目标帧索引(历史帧)
+                depth_result.depth_mean,      // TTA深度均值图
+                depth_result.depth_sigma,     // TTA深度标准差图
+                Ps, Rs,
+                tic[0], ric[0],
+                scale, shift
+            );
+
+            if (alignment_success) {
+                ROS_INFO("[Frontend] Alignment success for frame %d: s=%.4f, t=%.4f (%.1f ms)",
+                         target_frame_idx, scale, shift, t_align.toc());
+            } else {
+                ROS_WARN("[Frontend] Alignment failed for frame %d (t=%.3f)",
+                        target_frame_idx, query_timestamp);
+            }
+        }
+        else
+        {
+            ROS_WARN_THROTTLE(2.0, "[Frontend] Found depth result but no matching frame in window "
+                             "(query_t=%.3f, closest_frame=%d, time_diff=%.3f)",
+                             query_timestamp, target_frame_idx, min_time_diff);
+        }
+    }
+    else
+    {
+        // 没有找到滞后帧的深度结果
+        ROS_WARN_THROTTLE(2.0, "[Frontend] No depth result available for lagged query t=%.3f "
+                         "(lag=%.1fms, current_t=%.3f)",
+                         query_timestamp, lag_seconds * 1000.0, current_timestamp);
+    }
+
+    // 清理旧的深度结果缓存（节省内存，保留最近 N 秒的结果）
+    mp_online_depth_provider->clearOldResults(current_timestamp - DepthConstants::DEPTH_RESULT_CACHE_DURATION);
+}
+
+/**
+ * @brief 推送原始图像到在线深度提供者进行异步推理
+ *
+ * **功能说明**：
+ * - 将原始图像推送到 OnlineDepthProvider 的异步推理队列
+ * - 后台线程会执行 TTA 深度推理，不阻塞主线程
+ * - 推理结果稍后可通过 performFrontendDepthAlignment() 获取
+ *
+ * **调用时机**：
+ * - 在 processImage() 开始时立即调用（越早越好）
+ * - 异步推理与特征跟踪、IMU预积分等流程并行执行
+ *
+ * **注意事项**：
+ * - 非阻塞操作：立即返回，不等待推理完成
+ * - 队列满时会自动丢弃最旧的图像
+ * - 空图像会被跳过，避免无效推理
+ *
+ * @param timestamp 图像时间戳（用于结果匹配）
+ * @param raw_image 原始输入图像（灰度或彩色）
+ */
+void Estimator::pushImageToOnlineDepthProvider(double timestamp, const cv::Mat& raw_image)
+{
+    // 前置条件检查：需要在线深度提供者就绪
+    if (!mp_online_depth_provider || !mp_online_depth_provider->isReady()) {
+        return;
+    }
+
+    // 检查图像是否有效（避免无效推理）
+    if (raw_image.empty()) {
+        ROS_WARN_THROTTLE(5.0, "[OnlineDepthProvider] Empty image, skipping");
+        return;
+    }
+
+    // 推送图像到异步推理队列（立即返回，不阻塞）
+    mp_online_depth_provider->pushImage(timestamp, raw_image);
 }
