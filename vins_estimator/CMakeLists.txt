@@ -67,8 +67,11 @@ add_executable(vins_estimator
     src/initial/initial_aligment.cpp
     src/initial/initial_sfm.cpp
     src/initial/initial_ex_rotation.cpp
-    src/initial/depth_estimator.cpp
+    src/initial/init_depth_provider.cpp
     src/initial/initial_fast_mono.cpp
+    # Depth estimation module (modular architecture with shared DepthModelONNX)
+    src/depth_estimation/depth_model_onnx.cpp
+    src/depth_estimation/online_depth_provider.cpp
     )
 
 

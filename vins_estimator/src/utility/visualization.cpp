@@ -17,6 +17,7 @@ ros::Publisher pub_keyframe_pose;
 ros::Publisher pub_keyframe_point;
 ros::Publisher pub_extrinsic;
 ros::Publisher pub_depth_image;
+ros::Publisher pub_depth_constraints;  // NEW: Depth constraint visualization
 
 CameraPoseVisualization cameraposevisual(0, 1, 0, 1);
 CameraPoseVisualization keyframebasevisual(0.0, 0.0, 1.0, 1.0);
@@ -39,6 +40,7 @@ void registerPub(ros::NodeHandle &n)
     pub_extrinsic = n.advertise<nav_msgs::Odometry>("extrinsic", 1000);
     pub_relo_relative_pose=  n.advertise<nav_msgs::Odometry>("relo_relative_pose", 1000);
     pub_depth_image = n.advertise<sensor_msgs::Image>("depth_image", 1000);
+    pub_depth_constraints = n.advertise<visualization_msgs::Marker>("depth_constraints", 1000);  // NEW
 
     cameraposevisual.setScale(1);
     cameraposevisual.setLineWidth(0.05);
@@ -570,4 +572,96 @@ void pubDepthMap(const cv::Mat &depth_map, const std_msgs::Header &header)
     {
         ROS_ERROR("cv_bridge exception when publishing depth map: %s", e.what());
     }
+}
+// ========================================================================
+// Depth Constraint Visualization Implementation
+// ========================================================================
+
+/**
+ * @brief Publish depth constraint visualization markers
+ * 
+ * Draws lines connecting feature 3D positions to camera centers:
+ * - Green (transparent): Accepted constraints (chi2 <= 9.0)
+ * - Red (opaque, thick): Rejected constraints (chi2 > 9.0)
+ * 
+ * @param debug_info Vector of depth constraint debug information
+ * @param header ROS message header with timestamp
+ */
+void pubDepthConstraints(const std::vector<DepthConstraintDebugInfo>& debug_info,
+                        const std_msgs::Header &header)
+{
+    if (debug_info.empty()) {
+        return;  // Nothing to visualize
+    }
+
+    visualization_msgs::Marker marker;
+    marker.header = header;
+    marker.header.frame_id = "world";
+    marker.ns = "depth_constraints";
+    marker.id = 0;
+    marker.type = visualization_msgs::Marker::LINE_LIST;
+    marker.action = visualization_msgs::Marker::ADD;
+    marker.pose.orientation.w = 1.0;
+
+    // Line scale (thickness)
+    marker.scale.x = 0.01;  // Default line width (for accepted)
+
+    // Process each constraint
+    for (const auto& info : debug_info)
+    {
+        // Add start point (feature position in world frame)
+        geometry_msgs::Point p1;
+        p1.x = info.feature_pos_world.x();
+        p1.y = info.feature_pos_world.y();
+        p1.z = info.feature_pos_world.z();
+
+        // Add end point (camera center in world frame)
+        geometry_msgs::Point p2;
+        p2.x = info.camera_pos_world.x();
+        p2.y = info.camera_pos_world.y();
+        p2.z = info.camera_pos_world.z();
+
+        marker.points.push_back(p1);
+        marker.points.push_back(p2);
+
+        // Color coding based on acceptance status
+        std_msgs::ColorRGBA color;
+        if (info.accepted) {
+            // Green (transparent) for accepted constraints
+            color.r = 0.0f;
+            color.g = 1.0f;
+            color.b = 0.0f;
+            color.a = 0.5f;  // Transparent
+        } else {
+            // Red (opaque) for rejected constraints
+            color.r = 1.0f;
+            color.g = 0.0f;
+            color.b = 0.0f;
+            color.a = 1.0f;  // Opaque
+        }
+
+        // Each line segment needs 2 color values
+        marker.colors.push_back(color);
+        marker.colors.push_back(color);
+    }
+
+    // Publish marker
+    pub_depth_constraints.publish(marker);
+
+    // Debug statistics (throttled to avoid log flooding)
+    static int total_visualized = 0;
+    static int accepted_count = 0;
+    static int rejected_count = 0;
+
+    total_visualized += debug_info.size();
+    for (const auto& info : debug_info) {
+        if (info.accepted) accepted_count++;
+        else rejected_count++;
+    }
+
+    ROS_DEBUG_THROTTLE(2.0, "[Visualization] Depth constraints: %zu (%d accepted, %d rejected | Total: %d accepted, %d rejected)",
+                      debug_info.size(), 
+                      (int)std::count_if(debug_info.begin(), debug_info.end(), [](const DepthConstraintDebugInfo& i){return i.accepted;}),
+                      (int)std::count_if(debug_info.begin(), debug_info.end(), [](const DepthConstraintDebugInfo& i){return !i.accepted;}),
+                      accepted_count, rejected_count);
 }

@@ -18,6 +18,19 @@
 #include "../estimator.h"
 #include "../parameters.h"
 #include <fstream>
+#include <vector>
+
+// ========================================================================
+// Depth Constraint Visualization Structure
+// ========================================================================
+struct DepthConstraintDebugInfo
+{
+    Eigen::Vector3d feature_pos_world;  // Feature 3D position in world frame
+    Eigen::Vector3d camera_pos_world;   // Camera center in world frame
+    bool accepted;                      // true: accepted, false: rejected by chi2
+    double chi2_value;                  // Chi-square error value
+    int feature_id;                     // Feature ID for debugging
+};
 
 extern ros::Publisher pub_odometry;
 extern ros::Publisher pub_path, pub_pose;
@@ -27,6 +40,7 @@ extern ros::Publisher pub_ref_pose, pub_cur_pose;
 extern ros::Publisher pub_key;
 extern nav_msgs::Path path;
 extern ros::Publisher pub_pose_graph;
+extern ros::Publisher pub_depth_constraints;  // NEW: Depth constraint visualization
 extern int IMAGE_ROW, IMAGE_COL;
 
 void registerPub(ros::NodeHandle &n);
@@ -52,3 +66,11 @@ void pubKeyframe(const Estimator &estimator);
 void pubRelocalization(const Estimator &estimator);
 
 void pubDepthMap(const cv::Mat &depth_map, const std_msgs::Header &header);
+
+/**
+ * @brief Publish depth constraint visualization markers
+ * @param debug_info Vector of depth constraint information (feature pos, camera pos, status)
+ * @param header ROS message header with timestamp
+ */
+void pubDepthConstraints(const std::vector<DepthConstraintDebugInfo>& debug_info,
+                        const std_msgs::Header &header);

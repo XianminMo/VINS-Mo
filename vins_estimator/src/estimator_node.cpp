@@ -391,6 +391,9 @@ void process()
                 {
                     pubDepthMap(depth_map, header);
                 }
+
+                // 发布深度约束可视化（接受/拒绝的连线）
+                pubDepthConstraints(estimator_ptr->depth_constraint_debug_info, header);
             }
             //ROS_ERROR("end: %f, at %f", feature_msg->header.stamp.toSec(), ros::Time::now().toSec());
         }

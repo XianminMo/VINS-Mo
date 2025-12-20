@@ -126,7 +126,7 @@ void BRIEF::generateTestPoints()
 
   const int max_v = m_patch_size / 2;
 
-  DUtils::Random::SeedRandOnce();
+  DUtils::Random::SeedRandOnce(98765);
 
   for(int i = 0; i < m_bit_length; ++i)
   {
