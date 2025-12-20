@@ -241,7 +241,7 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__
     )
-    parser.add_argument('csv_file', type=str, help='CSV文件路径')
+    parser.add_argument('--csv_file', type=str, default='/home/linux/mxm/output/experiments_backend/V203_test/1210/o-d/test/depth_fusion_metrics.csv', help='CSV文件路径')
     parser.add_argument('--output', '-o', type=str, default=None,
                        help='输出目录（默认为CSV文件所在目录）')
 
