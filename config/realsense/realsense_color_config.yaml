@@ -2,26 +2,81 @@
 
 #common parameters
 imu_topic: "/camera/imu"
-image_topic: "/camera/infra1/image_rect_raw"
-output_path: "/home/linux/mxm/output/"
+image_topic: "/camera/color/image_raw"
+output_path: "/home/linux/mxm/output_VINS-Mo/realsense/test/1227/o-d/1"
 depth_model_path: "/home/linux/mxm/proj/VINS-Mo/src/VINS-Mo/vins_estimator/models/Midas-V2.onnx" # path to depth estimation model
 use_fast_init: 0     # 0: normal initialization; 1: use fast initialization with depth estimation
+
+# ========================================================================
+# Backend Depth Constraint Parameters (后端深度约束参数)
+# ========================================================================
+# 架构说明: Hierarchical Decoupling Depth Fusion (层次解耦深度融合)
+#   - 前端: SolveLinearAlignment() 每帧计算尺度s和偏移t
+#   - 后端: Ceres优化每帧独立的para_a_global[i] (初始值=1.0)
+#   - 约束: RandomWalkFactor 保证相邻帧的para_a平滑变化
+#   - 损失: 固定使用 HuberLoss(1.0), 不再使用动态权重
+#   - 优势: 消除全局参数漂移,提高鲁棒性
+#
+# 是否在后端优化中启用深度约束因子 (0: 关闭, 1: 开启)
+depth_constraint.estimate_scale_shift: 1
+
+# 深度尺度参数 (a) 的随机游走过程噪声 (Random Walk Process Noise for Scale)
+# 控制 para_depth_scale[i] 在相邻帧之间允许的最大变化量
+# 值越大: 参数变化越自由,能快速适应尺度跳变,但可能震荡
+# 值越小: 参数变化越保守,更加平滑,但响应较慢
+# 推荐范围: 1e-4 到 1e-3
+depth_constraint.random_walk_a: 5.0e-4
+
+# 深度偏移参数 (b) 的随机游走过程噪声 (Random Walk Process Noise for Shift)
+# 控制 para_depth_shift[i] 在相邻帧之间允许的最大变化量
+# 设计理念: "Lazy Buffer" - 使用极小噪声让b参数保持惰性,仅在必要时变化
+# 值越大: b 越活跃,可能引入不必要的自由度
+# 值越小: b 越惰性,保持接近零,提高系统稳定性
+# 推荐范围: 1e-6 到 1e-4 (应远小于 random_walk_a)
+depth_constraint.random_walk_b: 5.0e-6
+
+# ========================================================================
+# 深度权重调参系数 K (Depth Weight Tuning Parameter)
+# ========================================================================
+# K 用于深度因子权重公式: W = 1.0 / (K × σ + ε)²
+# 作用: 平衡视觉重投影误差和深度微调误差的贡献
+#
+# K 越大 → 权重越小 → 深度约束越弱 (更信任视觉)
+# K 越小 → 权重越大 → 深度约束越强 (更信任深度)
+#
+# 调参历史:
+#   - K=2.0 (配置值, 但实际运行 K=1.0 由于Bug):
+#       平均 Balance Ratio = 2.11 (接近目标,但波动大)
+#       分布: 35.8%太弱(<0.2), 55.6%合适, 8.6%太强(>5.0)
+#       极端值: 0.0001 ~ 34.48 (不稳定)
+#       结论: K=1.0效果尚可,需微调以减少"太弱"比例
+#   - K=1.0 (当前推荐): 基于实际测试结果
+#       说明: 修复Bug后,从实际生效的K=1.0开始调参
+#
+# 调参建议:
+#   - 如果 Balance Ratio < 0.2: K 太大,深度约束太弱,减小K
+#   - 如果 Balance Ratio > 5.0: K 太小,深度约束太强,增大K
+#   - 目标: Balance Ratio ≈ 1.0 (深度和视觉成本相当)
+#   - 追踪: 减少 <0.2 的比例 (当前35.8% → 目标<20%)
+#
+# 推荐范围: 0.5 ~ 2.0
+depth_constraint.weight_k: 2
 
 #camera calibration 
 model_type: PINHOLE
 camera_name: camera
 image_width: 640
 image_height: 480
-distortion_parameters:
-   k1: 9.2615504465028850e-02
-   k2: -1.8082438825995681e-01
-   p1: -6.5484100374765971e-04
-   p2: -3.5829351558557421e-04
 projection_parameters:
-   fx: 6.0970550296798035e+02
-   fy: 6.0909579671294716e+02
-   cx: 3.1916667152289227e+02
-   cy: 2.3558360480225772e+02
+   fx: 620.206070
+   fy: 618.113374
+   cx: 338.080697
+   cy: 237.330474
+distortion_parameters:
+   k1: 0.129285
+   k2: -0.272987
+   p1: -0.004642
+   p2: 0.003267
 
 # Extrinsic parameter between IMU and Camera.
 estimate_extrinsic: 0   # 0  Have an accurate extrinsic parameters. We will trust the following imu^R_cam, imu^T_cam, don't change it.
@@ -33,15 +88,15 @@ extrinsicRotation: !!opencv-matrix
    rows: 3
    cols: 3
    dt: d
-   data: [ 0.99964621,  0.01105994,  0.02418954,
-           -0.01088975,  0.9999151,  -0.00715601, 
-           -0.02426663,  0.00689006,  0.99968178]
+   data: [0.99999841,  0.00169453,  0.00056296,
+         -0.00169222,  0.99999022, -0.00408653,
+         -0.00056988,  0.00408557,  0.99999149]
 #Translation from camera frame to imu frame, imu^T_cam
 extrinsicTranslation: !!opencv-matrix
    rows: 3
    cols: 1
    dt: d
-   data: [0.07494282, -0.01077138, -0.00641822]
+   data: [-0.01718226, -0.0004726, 0.00328742]
 
 #feature traker paprameters
 max_cnt: 150            # max feature number in feature tracking
@@ -72,7 +127,7 @@ pose_graph_save_path: "/home/tony-ws1/output/pose_graph/" # save and load path
 
 #unsynchronization parameters
 estimate_td: 0                      # online estimate time offset between camera and imu
-td: 0.000                           # initial value of time offset. unit: s. readed image clock + td = real image clock (IMU clock)
+td: 0.005739                           # initial value of time offset. unit: s. readed image clock + td = real image clock (IMU clock)
 
 #rolling shutter parameters
 rolling_shutter: 0                      # 0: global shutter camera, 1: rolling shutter camera

@@ -16,13 +16,13 @@ from evo.core.geometry import umeyama_alignment
 # BASELINE_FILE = "/home/linux/mxm/output/experiments_backend/MH04_test/1216/new/o-o/0/vins_closed_loop.tum"
 # OURS_PATH = "/home/linux/mxm/output/experiments_backend/MH04_test/1216/new/o-d/k_15/0/"
 
-GT_FILE = "/home/linux/mxm/data/groundtruth/per-sequence/corridor1-2/groundtruth.txt"
-BASELINE_FILE = "/home/linux/mxm/output/experiments_backend/corridor1-2/1219/o-o/test/vins_closed_loop.tum"
-OURS_PATH = "/home/linux/mxm/output/experiments_backend/corridor1-2/1219/o-d/test/"
+# GT_FILE = "/home/linux/mxm/data/groundtruth/per-sequence/corridor1-2/groundtruth.txt"
+# BASELINE_FILE = "/home/linux/mxm/output/experiments_backend/corridor1-2/1219/o-o/test/vins_closed_loop.tum"
+# OURS_PATH = "/home/linux/mxm/output/experiments_backend/corridor1-2/1219/o-d/test/"
 
-# GT_FILE = "/home/linux/mxm/data/groundtruth/per-sequence/market1-1/groundtruth.txt"
-# BASELINE_FILE = "/home/linux/mxm/output/experiments_backend/market1-1/1219/o-o/0/vins_closed_loop.tum"
-# OURS_PATH = "/home/linux/mxm/output/experiments_backend/market1-1/1219/o-d/k_5/1/"
+# GT_FILE = "/home/linux/mxm/data/Openloris/groundtruth/per-sequence/market1-1/groundtruth.txt"
+# BASELINE_FILE = "/home/linux/mxm/output_VINS-Mo/experiments_backend/market1-1/1219/o-o/0/vins_closed_loop.tum"
+# OURS_PATH = "/home/linux/mxm/output_VINS-Mo/experiments_backend/market1-1/1219/o-d/k_5/1/"
 
 # GT_FILE = "/home/linux/mxm/data/groundtruth/per-sequence/office1-5/groundtruth.txt"
 # BASELINE_FILE = "/home/linux/mxm/output/experiments_backend/office1-5/1219/o-o/0/vins_closed_loop.tum"
@@ -32,7 +32,12 @@ OURS_PATH = "/home/linux/mxm/output/experiments_backend/corridor1-2/1219/o-d/tes
 # BASELINE_FILE = "/home/linux/mxm/output/experiments_backend/cafe1-2/1220/o-o/0/vins_closed_loop.tum"
 # OURS_PATH = "/home/linux/mxm/output/experiments_backend/cafe1-2/1220/o-d/k_5/0/"
 
-OURS_FILE = OURS_PATH + "vins_closed_loop.tum"
+GT_FILE = "/home/linux/mxm/output_FastLio/Log/1225/traj_xy.txt"
+BASELINE_FILE = "/home/linux/mxm/output_VINS-Mo/realsense/test/1225/o-o/vins_open_loop.tum"
+OURS_PATH = "/home/linux/mxm/output_VINS-Mo/realsense/test/1225/o-d/"
+
+
+OURS_FILE = OURS_PATH + "vins_open_loop.tum"
 
 # 输出配置
 OUTPUT_PATH = OURS_PATH  # 保存结果的路径
@@ -101,8 +106,17 @@ def check_files_existence():
 
 # ================= 3. 核心计算函数 =================
 
-def process_trajectory(gt_file, est_file, name, align=True):
-    """读取、同步、对齐并计算APE/RPE"""
+def process_trajectory(gt_file, est_file, name, align=True, transform_indices=None):
+    """
+    读取、同步、对齐并计算APE/RPE
+
+    参数:
+        gt_file: 真值轨迹文件路径
+        est_file: 估计轨迹文件路径
+        name: 方法名称
+        align: 是否进行对齐
+        transform_indices: 坐标轴映射，例如 [0, 1, 2] 或 [1, 0, 2] 用于调整坐标系
+    """
     # 1. 读取
     traj_est = file_interface.read_tum_trajectory_file(est_file)
 
@@ -115,7 +129,9 @@ def process_trajectory(gt_file, est_file, name, align=True):
         "ape_data": None,
         "rpe_stats": None,
         "rpe_data": None,
-        "timestamps": traj_est.timestamps - traj_est.timestamps[0]  # 相对时间
+        "timestamps": traj_est.timestamps - traj_est.timestamps[0],  # 相对时间
+        "alignment_params": None,  # 对齐参数
+        "scale_drift_detected": False  # 尺度漂移检测标志
     }
 
     # 如果没有 GT，直接返回估计轨迹
@@ -126,27 +142,112 @@ def process_trajectory(gt_file, est_file, name, align=True):
     # 2. 读取 GT
     traj_ref = file_interface.read_tum_trajectory_file(gt_file)
 
+    # 打印原始时间戳信息
+    print(f"\n  [{name}] 原始时间戳分析:")
+    print(f"    GT起始:  {traj_ref.timestamps[0]:.6f}s")
+    print(f"    EST起始: {traj_est.timestamps[0]:.6f}s")
+    print(f"    时间差:  {abs(traj_ref.timestamps[0] - traj_est.timestamps[0]):.6f}s")
+    print(f"    GT点数:  {len(traj_ref.timestamps)}")
+    print(f"    EST点数: {len(traj_est.timestamps)}")
+
     # 3. 同步 (基于时间戳)
+    traj_ref_original = traj_ref  # 保存原始GT用于统计
+    traj_est_original_len = len(traj_est.timestamps)
+
     try:
-        traj_ref, traj_est = sync.associate_trajectories(traj_ref, traj_est, max_diff=0.01)
+        traj_ref, traj_est = sync.associate_trajectories(traj_ref, traj_est, max_diff=0.02)  # 放宽到20ms
+
+        # 打印同步统计
+        sync_ratio = len(traj_est.timestamps) / traj_est_original_len * 100
+        print(f"    同步成功: {len(traj_est.timestamps)}/{traj_est_original_len} 点 ({sync_ratio:.1f}%)")
+
+        if sync_ratio < 50:
+            print(f"    ⚠️  警告: 同步点比例过低 ({sync_ratio:.1f}%), 可能存在时间戳对齐问题!")
+
     except Exception as e:
-        print(f"警告：{name} 时间同步失败: {e}")
+        print(f"    ✗ 时间同步失败: {e}")
         result["traj_est"] = traj_est
         return result
 
     result["traj_ref"] = traj_ref
 
-    # 4. SE(3) 对齐 (不改变尺度，符合 VIO 评估标准)
+    # 应用坐标轴变换（如果指定）
+    if transform_indices is not None:
+        print(f"    应用坐标轴变换: {transform_indices}")
+        traj_est_positions = traj_est.positions_xyz[:, transform_indices]
+    else:
+        traj_est_positions = traj_est.positions_xyz
+
+    # 4. 对齐分析: 同时计算 SE(3) 和 Sim(3)
     if align:
         try:
-            r_a, t_a, _ = umeyama_alignment(traj_est.positions_xyz.T, traj_ref.positions_xyz.T, with_scale=False)
-            traj_est_aligned = trajectory.Trajectory(
-                positions_xyz=np.dot(r_a, traj_est.positions_xyz.T).T + t_a.reshape(1, 3),
+            # 4.1 SE(3) 对齐 (without scale, 标准VIO评估)
+            r_a_se3, t_a_se3, _ = umeyama_alignment(
+                traj_est_positions.T, traj_ref.positions_xyz.T, with_scale=False
+            )
+            traj_est_aligned_se3 = trajectory.Trajectory(
+                positions_xyz=np.dot(r_a_se3, traj_est_positions.T).T + t_a_se3.reshape(1, 3),
                 orientations_quat_wxyz=traj_est.orientations_quat_wxyz,
                 timestamps=traj_est.timestamps
             )
+
+            # 计算 SE(3) 对齐后的 RMSE
+            ape_se3 = metrics.APE(metrics.PoseRelation.translation_part)
+            ape_se3.process_data((traj_ref, traj_est_aligned_se3))
+            rmse_se3 = ape_se3.get_all_statistics()['rmse']
+
+            # 4.2 Sim(3) 对齐 (with scale, 检测尺度漂移)
+            r_a_sim3, t_a_sim3, s_sim3 = umeyama_alignment(
+                traj_est_positions.T, traj_ref.positions_xyz.T, with_scale=True
+            )
+            traj_est_aligned_sim3 = trajectory.Trajectory(
+                positions_xyz=(s_sim3 * np.dot(r_a_sim3, traj_est_positions.T)).T + t_a_sim3.reshape(1, 3),
+                orientations_quat_wxyz=traj_est.orientations_quat_wxyz,
+                timestamps=traj_est.timestamps
+            )
+
+            # 计算 Sim(3) 对齐后的 RMSE
+            ape_sim3 = metrics.APE(metrics.PoseRelation.translation_part)
+            ape_sim3.process_data((traj_ref, traj_est_aligned_sim3))
+            rmse_sim3 = ape_sim3.get_all_statistics()['rmse']
+
+            # 4.3 尺度漂移检测
+            scale_improvement_ratio = rmse_se3 / rmse_sim3 if rmse_sim3 > 1e-6 else 1.0
+
+            print(f"\n  [{name}] 对齐分析:")
+            print(f"    SE(3) RMSE:  {rmse_se3:.6f} m (无尺度修正)")
+            print(f"    Sim(3) RMSE: {rmse_sim3:.6f} m (有尺度修正)")
+            print(f"    估计尺度:    {s_sim3:.6f}")
+            print(f"    改进比:      {scale_improvement_ratio:.2f}x")
+
+            if scale_improvement_ratio > 2.0:
+                print(f"    ⚠️  WARNING: Significant scale drift detected in [{name}]!")
+                print(f"        SE(3) vs Sim(3) RMSE差距: {scale_improvement_ratio:.2f}x")
+                print(f"        建议检查深度估计或IMU初始化!")
+                result["scale_drift_detected"] = True
+
+            # 保存对齐参数
+            result["alignment_params"] = {
+                "se3": {
+                    "rotation": r_a_se3,
+                    "translation": t_a_se3,
+                    "scale": 1.0,
+                    "rmse": rmse_se3
+                },
+                "sim3": {
+                    "rotation": r_a_sim3,
+                    "translation": t_a_sim3,
+                    "scale": s_sim3,
+                    "rmse": rmse_sim3
+                },
+                "scale_improvement_ratio": scale_improvement_ratio
+            }
+
+            # 默认使用 SE(3) 对齐结果（符合VIO标准评估）
+            traj_est_aligned = traj_est_aligned_se3
+
         except Exception as e:
-            print(f"警告：{name} 对齐失败: {e}")
+            print(f"    ✗ 对齐失败: {e}")
             traj_est_aligned = traj_est
     else:
         traj_est_aligned = traj_est
@@ -160,7 +261,7 @@ def process_trajectory(gt_file, est_file, name, align=True):
         result["ape_stats"] = ape_metric.get_all_statistics()
         result["ape_data"] = ape_metric.get_result().np_arrays['error_array']
     except Exception as e:
-        print(f"警告：{name} APE 计算失败: {e}")
+        print(f"    ✗ APE 计算失败: {e}")
 
     # 6. 计算 RPE (局部平滑度/漂移率) - delta=1 (逐帧)
     try:
@@ -170,7 +271,7 @@ def process_trajectory(gt_file, est_file, name, align=True):
         result["rpe_stats"] = rpe_metric.get_all_statistics()
         result["rpe_data"] = rpe_metric.get_result().np_arrays['error_array']
     except Exception as e:
-        print(f"警告：{name} RPE 计算失败: {e}")
+        print(f"    ✗ RPE 计算失败: {e}")
 
     return result
 
@@ -178,75 +279,139 @@ def process_trajectory(gt_file, est_file, name, align=True):
 
 def crop_to_common_time_range(results_dict, gt_ref):
     """将所有轨迹裁剪到共同时间范围"""
-    available_trajs = [v for v in results_dict.values() if v is not None and v['traj_est'] is not None]
+    # 使用原始轨迹（未同步的）来确定时间范围
+    available_trajs = []
+    for v in results_dict.values():
+        if v is not None and v['traj_est_original'] is not None:
+            available_trajs.append(v['traj_est_original'])
 
     if len(available_trajs) == 0:
-        return results_dict, gt_ref
+        return results_dict, gt_ref, None, None
 
-    # 找到共同时间范围
-    starts = [r['traj_est'].timestamps[0] for r in available_trajs]
-    ends = [r['traj_est'].timestamps[-1] for r in available_trajs]
+    # 读取原始完整的GT（如果存在）
+    gt_original = None
+    if GT_FILE and os.path.exists(GT_FILE):
+        try:
+            gt_original = file_interface.read_tum_trajectory_file(GT_FILE)
+        except Exception as e:
+            print(f"警告: 无法读取完整GT文件: {e}")
+            gt_original = gt_ref  # 回退到已同步的GT
+
+    # 找到共同时间范围（包括GT）
+    starts = [t.timestamps[0] for t in available_trajs]
+    ends = [t.timestamps[-1] for t in available_trajs]
+
+    # 如果有GT，使用原始完整GT的时间范围
+    if gt_original is not None:
+        starts.append(gt_original.timestamps[0])
+        ends.append(gt_original.timestamps[-1])
 
     common_start = max(starts)
     common_end = min(ends)
 
     print(f"\n时间范围分析:")
+    if gt_original is not None:
+        print(f"  {'GT':<12}: {gt_original.timestamps[0]:.3f}s - {gt_original.timestamps[-1]:.3f}s (duration: {gt_original.timestamps[-1]-gt_original.timestamps[0]:.3f}s)")
     for name, res in results_dict.items():
-        if res is not None and res['traj_est'] is not None:
-            start = res['traj_est'].timestamps[0]
-            end = res['traj_est'].timestamps[-1]
+        if res is not None and res['traj_est_original'] is not None:
+            start = res['traj_est_original'].timestamps[0]
+            end = res['traj_est_original'].timestamps[-1]
             print(f"  {name:<12}: {start:.3f}s - {end:.3f}s (duration: {end-start:.3f}s)")
     print(f"  {'Common':<12}: {common_start:.3f}s - {common_end:.3f}s (duration: {common_end-common_start:.3f}s)")
 
-    # 裁剪函数
-    def crop_single_result(result, start_time, end_time):
-        if result is None or result['traj_est'] is None:
+    # 裁剪函数 - 使用原始轨迹
+    def crop_single_result(result, start_time, end_time, gt_ref_cropped):
+        if result is None or result['traj_est_original'] is None:
             return result
 
-        traj = result['traj_est']
-        mask = (traj.timestamps >= start_time) & (traj.timestamps <= end_time)
+        # 使用原始轨迹进行裁剪
+        traj_orig = result['traj_est_original']
+        mask = (traj_orig.timestamps >= start_time) & (traj_orig.timestamps <= end_time)
 
         if np.sum(mask) == 0:
-            print(f"警告：{result['name']} 在共同时间范围内无数据")
+            print(f"  警告：{result['name']} 在共同时间范围内无数据")
             return result
 
-        # 裁剪轨迹
-        result['traj_est'] = trajectory.Trajectory(
-            positions_xyz=traj.positions_xyz[mask],
-            orientations_quat_wxyz=traj.orientations_quat_wxyz[mask],
-            timestamps=traj.timestamps[mask]
+        # 裁剪原始轨迹
+        traj_cropped = trajectory.Trajectory(
+            positions_xyz=traj_orig.positions_xyz[mask],
+            orientations_quat_wxyz=traj_orig.orientations_quat_wxyz[mask],
+            timestamps=traj_orig.timestamps[mask]
         )
 
         # 更新相对时间
-        result['timestamps'] = result['traj_est'].timestamps - result['traj_est'].timestamps[0]
+        result['timestamps'] = traj_cropped.timestamps - traj_cropped.timestamps[0]
 
-        # 裁剪误差数据
-        if result['ape_data'] is not None:
-            result['ape_data'] = result['ape_data'][mask]
-            result['ape_stats'] = compute_stats(result['ape_data'])
+        # 如果有GT，重新同步、对齐并计算误差
+        if gt_ref_cropped is not None:
+            try:
+                # 同步裁剪后的轨迹和GT
+                traj_ref_sync, traj_est_sync = sync.associate_trajectories(
+                    gt_ref_cropped, traj_cropped, max_diff=0.02)  # 放宽到20ms
 
-        if result['rpe_data'] is not None:
-            rpe_mask_len = min(len(result['rpe_data']), len(mask))
-            result['rpe_data'] = result['rpe_data'][mask[:rpe_mask_len]]
-            result['rpe_stats'] = compute_stats(result['rpe_data'])
+                # SE(3)对齐
+                r_a, t_a, _ = umeyama_alignment(traj_est_sync.positions_xyz.T, traj_ref_sync.positions_xyz.T, with_scale=False)
+                traj_est_aligned = trajectory.Trajectory(
+                    positions_xyz=np.dot(r_a, traj_est_sync.positions_xyz.T).T + t_a.reshape(1, 3),
+                    orientations_quat_wxyz=traj_est_sync.orientations_quat_wxyz,
+                    timestamps=traj_est_sync.timestamps
+                )
+
+                result['traj_est'] = traj_est_aligned
+                result['traj_ref'] = traj_ref_sync
+
+                # 重新计算APE
+                try:
+                    ape_metric = metrics.APE(metrics.PoseRelation.translation_part)
+                    ape_metric.process_data((traj_ref_sync, traj_est_aligned))
+                    result['ape_stats'] = ape_metric.get_all_statistics()
+                    result['ape_data'] = ape_metric.get_result().np_arrays['error_array']
+                except Exception as e:
+                    print(f"  警告：{result['name']} APE 重新计算失败: {e}")
+                    result['ape_data'] = None
+                    result['ape_stats'] = None
+
+                # 重新计算RPE
+                try:
+                    rpe_metric = metrics.RPE(metrics.PoseRelation.translation_part, delta=1.0,
+                                           delta_unit=metrics.Unit.frames, all_pairs=False)
+                    rpe_metric.process_data((traj_ref_sync, traj_est_aligned))
+                    result['rpe_stats'] = rpe_metric.get_all_statistics()
+                    result['rpe_data'] = rpe_metric.get_result().np_arrays['error_array']
+                except Exception as e:
+                    print(f"  警告：{result['name']} RPE 重新计算失败: {e}")
+                    result['rpe_data'] = None
+                    result['rpe_stats'] = None
+
+            except Exception as e:
+                print(f"  警告：{result['name']} 裁剪后同步失败: {e}")
+                result['traj_est'] = traj_cropped
+                result['ape_data'] = None
+                result['ape_stats'] = None
+                result['rpe_data'] = None
+                result['rpe_stats'] = None
+        else:
+            # 没有GT，直接使用裁剪后的轨迹
+            result['traj_est'] = traj_cropped
 
         return result
 
-    # 裁剪所有结果
-    for name in results_dict:
-        results_dict[name] = crop_single_result(results_dict[name], common_start, common_end)
-
-    # 裁剪 GT
-    if gt_ref is not None:
-        gt_mask = (gt_ref.timestamps >= common_start) & (gt_ref.timestamps <= common_end)
+    # 先裁剪 GT（使用原始完整GT）
+    gt_ref_cropped = None
+    if gt_original is not None:
+        gt_mask = (gt_original.timestamps >= common_start) & (gt_original.timestamps <= common_end)
         if np.sum(gt_mask) > 0:
-            gt_ref = trajectory.Trajectory(
-                positions_xyz=gt_ref.positions_xyz[gt_mask],
-                orientations_quat_wxyz=gt_ref.orientations_quat_wxyz[gt_mask],
-                timestamps=gt_ref.timestamps[gt_mask]
+            gt_ref_cropped = trajectory.Trajectory(
+                positions_xyz=gt_original.positions_xyz[gt_mask],
+                orientations_quat_wxyz=gt_original.orientations_quat_wxyz[gt_mask],
+                timestamps=gt_original.timestamps[gt_mask]
             )
 
-    return results_dict, gt_ref, common_start
+    # 裁剪所有结果（传入裁剪后的GT）
+    for name in results_dict:
+        results_dict[name] = crop_single_result(results_dict[name], common_start, common_end, gt_ref_cropped)
+
+    return results_dict, gt_ref_cropped, common_start, common_end
 
 def compute_stats(data):
     """计算统计数据"""
@@ -938,14 +1103,53 @@ def main():
 
     # 5. 时间对齐
     common_start = None
+    common_end = None
     if file_status['gt'] and (file_status['baseline'] or file_status['ours']):
         print("\n正在对齐时间范围...")
-        results, gt_ref, common_start = crop_to_common_time_range(results, gt_ref)
+        results, gt_ref, common_start, common_end = crop_to_common_time_range(results, gt_ref)
 
     # 6. 打印统计信息
     if file_status['gt'] and file_status['baseline'] and file_status['ours']:
-        print_statistics(results['baseline'], results['ours'], common_start,
-                        results['ours']['traj_est'].timestamps[-1] if results['ours'] else None)
+        print_statistics(results['baseline'], results['ours'], common_start, common_end)
+
+    # 6.5 打印尺度漂移诊断报告
+    if file_status['gt']:
+        print("\n" + "=" * 80)
+        print("尺度漂移诊断报告")
+        print("=" * 80)
+
+        for method_name, result in results.items():
+            if result is None or result['alignment_params'] is None:
+                continue
+
+            align_params = result['alignment_params']
+            method_display = method_name.capitalize()
+
+            print(f"\n[{method_display}]")
+            print(f"  SE(3) 对齐 (无尺度修正):")
+            print(f"    - RMSE: {align_params['se3']['rmse']:.6f} m")
+            print(f"    - 尺度: {align_params['se3']['scale']:.6f} (固定)")
+
+            print(f"  Sim(3) 对齐 (有尺度修正):")
+            print(f"    - RMSE: {align_params['sim3']['rmse']:.6f} m")
+            print(f"    - 估计尺度: {align_params['sim3']['scale']:.6f}")
+
+            improvement = align_params['scale_improvement_ratio']
+            print(f"  改进比: {improvement:.2f}x")
+
+            if result['scale_drift_detected']:
+                print(f"  状态: ⚠️  检测到显著尺度漂移!")
+                print(f"  建议:")
+                if abs(1.0 - align_params['sim3']['scale']) > 0.5:
+                    print(f"    - 尺度偏差过大 ({align_params['sim3']['scale']:.3f}), 检查深度初始化")
+                if improvement > 5.0:
+                    print(f"    - 改进比过高 ({improvement:.2f}x), 轨迹形状可能严重畸变")
+                print(f"    - 检查 IMU 预积分和深度融合策略")
+                print(f"    - 考虑增加关键帧约束或loop closure")
+            else:
+                print(f"  状态: ✓ 尺度稳定")
+
+        print("=" * 80)
 
     # 7. 绘图
     print("\n" + "=" * 80)
@@ -960,6 +1164,22 @@ def main():
     elif file_status['baseline'] and file_status['ours']:
         # 情况2：有GT + Baseline + Ours - 完整对比
         print("  模式: 完整对比 (GT + Baseline + Ours)")
+
+        # 先绘制裁剪前的完整轨迹对比（无GT）
+        print("\n  绘制完整轨迹对比（未裁剪）:")
+        full_results = {
+            'baseline': {'traj_est': results['baseline']['traj_est_original'], 'name': 'Baseline (Full)'},
+            'ours': {'traj_est': results['ours']['traj_est_original'], 'name': 'Ours (Full)'}
+        }
+        plot_trajectory_only(full_results, OUTPUT_PATH)
+        # 重命名为full版本
+        import shutil
+        shutil.move(os.path.join(OUTPUT_PATH, f"{OUTPUT_PREFIX}_trajectory.png"),
+                   os.path.join(OUTPUT_PATH, f"{OUTPUT_PREFIX}_full_trajectory.png"))
+        print(f"  ✓ 完整轨迹图: {OUTPUT_PREFIX}_full_trajectory.png")
+
+        # 再绘制裁剪后的对比（与GT对齐）
+        print("\n  绘制裁剪后轨迹对比（与GT对齐）:")
         plot_comparison_with_gt(results['baseline'], results['ours'], gt_ref,
                                OUTPUT_PATH, common_start)
 

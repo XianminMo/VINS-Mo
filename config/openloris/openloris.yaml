@@ -6,7 +6,7 @@ image_topic: "/cam0/image_raw"
 
 
 # output_path: "/home/linux/mxm/output/experiments_backend/market1-1/1219/o-d/k_5/1"
-output_path: "/home/linux/mxm/output/experiments_backend/corridor1-2/1219/o-d/test"
+output_path: "/home/linux/mxm/output_VINS-Mo/experiments_backend/corridor1-2/1219/o-d/test"
 # output_path: "/home/linux/mxm/output/experiments_backend/cafe1-2/1220/o-o/0"
 
 # depth_model_path: "/home/linux/mxm/proj/VINS-Mo/src/VINS-Mo/vins_estimator/models/Midas-V2.onnx" # path to depth estimation model

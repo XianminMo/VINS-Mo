@@ -23,3 +23,6 @@ vins_estimator/third_party/
 
 # Snyk Security Extension - AI Rules (auto-generated)
 .cursor/rules/snyk_rules.mdc
+
+# 忽略所有 markdown 文档
+*.md
